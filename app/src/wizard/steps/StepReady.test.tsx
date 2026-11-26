@@ -4,7 +4,7 @@
 // and contributes to P4-2 frontend coverage.
 
 import { describe, it, expect, vi, afterEach, beforeEach } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 
 // Mocks have to be declared before the component import so the
@@ -125,5 +125,73 @@ describe("StepReady (P2-11 + P4-2)", () => {
     );
 
     await waitFor(() => expect(screen.getByText(/love/i)).toBeInTheDocument());
+  });
+});
+
+// ── durable shortcut notice (#408, C29 a2) ─────────────────────────────
+
+describe("StepReady: durable nell shortcut notice", () => {
+  const NOTICE =
+    "nell shortcut not installed. This AppImage is running without FUSE. Install libfuse2 or use the .deb.";
+
+  beforeEach(() => {
+    ensureBridgeRunning.mockReset();
+    fetchPersonaState.mockReset();
+  });
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+  });
+
+  it("keeps the notice on screen, does not auto-advance, and Continue leaves", async () => {
+    vi.useFakeTimers();
+    ensureBridgeRunning.mockResolvedValue(undefined);
+    fetchPersonaState.mockResolvedValue(freshState({}));
+    const onDone = vi.fn();
+    render(
+      <StepReady
+        step={1}
+        totalSteps={1}
+        persona="test"
+        onDone={onDone}
+        avatar={<div />}
+        cliNotice={NOTICE}
+      />,
+    );
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(screen.getByRole("status")).toHaveTextContent(NOTICE);
+    expect(onDone).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /continue/i }));
+    expect(onDone).toHaveBeenCalledTimes(1);
+  });
+
+  it("Continue is visible from the start", () => {
+    ensureBridgeRunning.mockReturnValue(new Promise(() => undefined));
+    fetchPersonaState.mockResolvedValue(freshState({}));
+    render(
+      <StepReady
+        step={1}
+        totalSteps={1}
+        persona="test"
+        onDone={() => undefined}
+        avatar={<div />}
+        cliNotice={NOTICE}
+      />,
+    );
+    expect(screen.getByRole("button", { name: /continue/i })).toBeInTheDocument();
+  });
+
+  it("without a notice it still auto-advances and shows no status block or Continue button", async () => {
+    vi.useFakeTimers();
+    ensureBridgeRunning.mockResolvedValue(undefined);
+    fetchPersonaState.mockResolvedValue(freshState({}));
+    const onDone = vi.fn();
+    render(
+      <StepReady step={1} totalSteps={1} persona="test" onDone={onDone} avatar={<div />} cliNotice={null} />,
+    );
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(onDone).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^continue/i })).not.toBeInTheDocument();
   });
 });

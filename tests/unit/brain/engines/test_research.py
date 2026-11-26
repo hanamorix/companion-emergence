@@ -142,9 +142,10 @@ def test_run_tick_days_since_human_triggers(tmp_path: Path):
         store.close()
 
 
-def test_run_tick_emotion_high_triggers(tmp_path: Path):
+def test_run_tick_emotion_high_triggers(tmp_path: Path, emotion_engine_stub):
     from brain.emotion.state import EmotionalState
 
+    emotion_engine_stub.high = {"curiosity"}  # the engine calls curiosity high: the gate holds no level of its own
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
     store = MemoryStore(":memory:")
     try:
@@ -158,6 +159,31 @@ def test_run_tick_emotion_high_triggers(tmp_path: Path):
             emotion_state_override=es,
         )
         assert result.fired is not None
+    finally:
+        store.close()
+
+
+def test_run_tick_emotion_override_above_the_old_level_does_not_open_the_gate_unless_the_engine_says_high(
+    tmp_path: Path, emotion_engine_stub
+):
+    """The gate holds no level of its own: a high-looking override with no feeling the engine calls high stays closed."""
+    from brain.emotion.state import EmotionalState
+
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        engine = _build_engine(tmp_path, store)
+        es = EmotionalState()
+        es.set("curiosity", 9.0)
+        emotion_engine_stub.high = set()
+        result = engine.run_tick(
+            trigger="emotion_high",
+            dry_run=False,
+            days_since_human_override=0.0,
+            emotion_state_override=es,
+        )
+        assert result.fired is None
+        assert result.reason == "not_due"
     finally:
         store.close()
 
@@ -500,7 +526,7 @@ def test_memory_create_failure_does_not_abort_tick_burns_cooldown(
 
 def test_close_verdict_marks_dormant(tmp_path: Path):
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         provider = ScriptedProvider(
             [
@@ -522,7 +548,7 @@ def test_spawn_verdict_creates_capped_deduped_interests(tmp_path: Path):
     _write_interests(
         tmp_path / "interests.json", [_interest_dict(topic="Marine Bioluminescence")]
     )
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         provider = ScriptedProvider(
             [
@@ -543,7 +569,7 @@ def test_spawn_verdict_creates_capped_deduped_interests(tmp_path: Path):
 
 def test_select_parse_failure_falls_back_to_mechanical_winner(tmp_path: Path):
     _write_interests(tmp_path / "interests.json", [_interest_dict()])
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         provider = ScriptedProvider(
             [
@@ -587,16 +613,6 @@ def test_research_log_load_missing_returns_empty(tmp_path: Path) -> None:
     assert log.fires == ()
 
 
-def test_research_log_load_corrupt_returns_empty(tmp_path: Path) -> None:
-    """Corrupt file is healed to empty via attempt_heal; fires == ()."""
-    from brain.engines.research import ResearchLog
-
-    path = tmp_path / "research_log.json"
-    path.write_text("{{{not json", encoding="utf-8")
-    log = ResearchLog.load(path)
-    assert log.fires == ()
-
-
 def test_research_log_load_corrupt_quarantines_and_warns(tmp_path: Path, caplog) -> None:
     """Corrupt primary is quarantined and a WARNING is emitted."""
     import logging
@@ -606,7 +622,8 @@ def test_research_log_load_corrupt_quarantines_and_warns(tmp_path: Path, caplog)
     caplog.set_level(logging.WARNING)
     path = tmp_path / "research_log.json"
     path.write_text("{{{not json", encoding="utf-8")
-    ResearchLog.load(path)
+    log = ResearchLog.load(path)
+    assert log.fires == ()  # healed to an empty log
     corrupt_files = list(tmp_path.glob("research_log.json.corrupt-*"))
     assert len(corrupt_files) == 1
     warn_msgs = [r.getMessage() for r in caplog.records if "ResearchLog anomaly" in r.getMessage()]
@@ -661,7 +678,7 @@ def test_research_fire_emits_initiate_candidate_when_maturity_passes(
     )
 
     _write_interests(tmp_path / "interests.json", [_interest_dict(pull_score=8.0)])
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         # Scripted: select chooses i1, session returns a real MEMORY section —
         # candidate emission is gated on a memory existing (mem_id is not None).
@@ -716,7 +733,7 @@ def test_research_fire_does_not_emit_candidate_when_maturity_fails(
 
     # pull_score=6.0 → maturity_score=0.60, which is below the default 0.75 threshold
     _write_interests(tmp_path / "interests.json", [_interest_dict(pull_score=6.0)])
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     try:
         # Scripted: select chooses i1, session returns a real MEMORY section —
         # a memory must exist for the gate path (and its rejection write) to run.
@@ -832,3 +849,469 @@ def test_compute_topic_overlap_returns_zero_on_provider_error() -> None:
     )
 
     assert score == 0.0
+
+
+# ── #364: the raw reply survives a failed parse ───────────────────────────────
+def _pf_sites(persona_dir: Path) -> list[tuple[str, str]]:
+    import json as _json
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    path = persona_dir / PARSE_FAILURE_LOG
+    if not path.exists():
+        return []
+    return [(r["site"], r["raw"]) for r in map(_json.loads, path.read_text(encoding="utf-8").splitlines())]
+
+
+def test_compute_topic_overlap_records_a_malformed_reply(tmp_path: Path) -> None:
+    from brain.engines.research import _compute_topic_overlap_via_haiku
+
+    class P:
+        def generate(self, prompt, *, system=None):
+            return "not even close to JSON"
+
+    score = _compute_topic_overlap_via_haiku(
+        thread_topic="x", thread_summary="", recent_conversation_excerpt="",
+        provider=P(), user_name="Hana", persona_dir=tmp_path,
+    )
+    assert score == 0.0
+    assert _pf_sites(tmp_path) == [("research_topic_overlap", "not even close to JSON")]
+
+
+def test_compute_topic_overlap_provider_error_is_not_a_parse_failure(tmp_path: Path) -> None:
+    from brain.engines.research import _compute_topic_overlap_via_haiku
+
+    class P:
+        def generate(self, prompt, *, system=None):
+            raise OSError("cli gone")
+
+    assert _compute_topic_overlap_via_haiku(
+        thread_topic="x", thread_summary="", recent_conversation_excerpt="",
+        provider=P(), user_name="Hana", persona_dir=tmp_path,
+    ) == 0.0
+    assert _pf_sites(tmp_path) == []
+
+
+def test_select_parse_failure_is_recorded_in_the_persona_log(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        provider = ScriptedProvider(
+            [
+                "not json at all, just rambling prose",
+                "NOTES:\nfound stuff\n\nMEMORY:\nSession happened.\n\nVERDICT:\ncontinue",
+            ]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        engine.run_tick(trigger="manual", days_since_human_override=5.0)
+    finally:
+        store.close()
+    assert ("research_select", "not json at all, just rambling prose") in _pf_sites(tmp_path)
+
+
+def test_compute_topic_overlap_provider_keyerror_still_scores_zero(tmp_path: Path) -> None:
+    """#364 review: the old except covered KeyError/TypeError from the provider call too."""
+    from brain.engines.research import _compute_topic_overlap_via_haiku
+
+    class P:
+        def generate(self, prompt, *, system=None):
+            raise KeyError("model")
+
+    assert _compute_topic_overlap_via_haiku(
+        thread_topic="x", thread_summary="", recent_conversation_excerpt="",
+        provider=P(), user_name="Hana", persona_dir=tmp_path,
+    ) == 0.0
+    assert _pf_sites(tmp_path) == []
+
+
+# ── #591: a marker and its text on one line ─────────────────────────────────────────────────────────────────────────
+_SELECT_I1 = '{"choice": "i1", "why": "curious"}'
+
+
+def _fire_with_reply(tmp_path: Path, reply: str, *, interests: list[dict] | None = None):
+    _write_interests(tmp_path / "interests.json", interests or [_interest_dict()])
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        engine = _build_engine(tmp_path, store, provider=ScriptedProvider([_SELECT_I1, reply]))
+        result = engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        if result.fired is not None:
+            run_consolidation(store, persona_dir=store.persona_dir, classifier=_PROMOTE_ALL)
+        memory = store.get(result.fired.output_memory_id) if result.fired and result.fired.output_memory_id else None
+        return engine, result, memory
+    finally:
+        store.close()
+
+
+def _session_rows(persona_dir: Path) -> list[str]:
+    return [raw for site, raw in _pf_sites(persona_dir) if site == "research_session"]
+
+
+def _session_errors(persona_dir: Path) -> list[str]:
+    import json as _json
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    path = persona_dir / PARSE_FAILURE_LOG
+    if not path.exists():
+        return []
+    rows = map(_json.loads, path.read_text(encoding="utf-8").splitlines())
+    return [r["error"] for r in rows if r["site"] == "research_session"]
+
+
+def test_inline_reply_creates_the_memory_applies_close_and_saves_clean_notes(tmp_path: Path):
+    reply = (
+        "NOTES:\nread two papers about light\nsecond finding\n"
+        "MEMORY: It felt like watching the sea answer back.\nVERDICT: close\n"
+    )
+    engine, result, memory = _fire_with_reply(tmp_path, reply)
+    assert result.fired is not None and result.fired.output_memory_id is not None
+    assert memory is not None and memory.memory_type == "research"
+    assert memory.content == "It felt like watching the sea answer back."
+    saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
+    assert saved.interests[0].status == "dormant"
+    notes = read_notes_tail(tmp_path, "i1")
+    assert "read two papers about light" in notes and "second finding" in notes
+    assert "MEMORY:" not in notes and "VERDICT:" not in notes
+    assert _session_rows(tmp_path) == []
+
+
+def test_inline_spawn_verdict_creates_side_quest_interests(tmp_path: Path):
+    reply = "NOTES:\nfound stuff\nMEMORY: Good session.\nVERDICT: spawn: brand new topic; another new topic; a third topic\n"
+    engine, result, memory = _fire_with_reply(tmp_path, reply)
+    assert memory is not None and memory.content == "Good session."
+    saved = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH)
+    spawned = sorted(i.topic for i in saved.interests if i.origin == "side_quest")
+    assert spawned == ["another new topic", "brand new topic"]
+    assert saved.interests[0].status == "active"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "just some rambling prose with no markers at all",
+        "NOTES:\nfound stuff\n\nVERDICT:\ncontinue",
+        "NOTES:\nfound stuff\n\nMEMORY:\n\nVERDICT:\ncontinue",
+        "NOTES:\nfound stuff\n\nMEMORY:\nI explored it today.",
+        "NOTES:\nfound stuff\nMEMORY: I explored it today.\nVERDICT: maybe later\nand a closing remark\n",
+    ],
+    ids=["degraded", "no-memory", "empty-memory", "no-verdict", "inline-verdict-line-not-taken"],
+)
+def test_a_reply_the_parser_could_not_read_is_recorded_as_a_parse_failure(tmp_path: Path, reply: str):
+    _engine, result, _memory = _fire_with_reply(tmp_path, reply)
+    assert result.fired is not None  # the fire itself is unchanged
+    assert _session_rows(tmp_path) == [reply]
+    (error,) = _session_errors(tmp_path)
+    if "NOTES:" in reply:
+        assert error.startswith("no readable ") and error.endswith(" section in the reply")
+    else:
+        assert error == "no NOTES marker, reply kept as notes"
+
+
+def test_the_parse_failure_error_names_the_missing_section(tmp_path: Path):
+    _fire_with_reply(tmp_path, "NOTES:\nfound stuff\n\nVERDICT:\ncontinue")
+    assert _session_errors(tmp_path) == ["no readable MEMORY section in the reply"]
+
+
+@pytest.mark.no_base_failure(
+    reason="negative arm of the #591 parse-failure record: on the old code nothing is recorded for a well-formed reply "
+    "either, so it passes by design"
+)
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "NOTES:\nfound stuff\n\nMEMORY:\nI explored it today.\n\nVERDICT:\ncontinue",
+        "NOTES:\nfound stuff\n\nMEMORY:\nI explored it today.\n\nVERDICT:\nmaybe??",
+    ],
+    ids=["well-formed", "unknown-verdict-value"],
+)
+def test_a_readable_reply_records_no_parse_failure(tmp_path: Path, reply: str):
+    _engine, result, memory = _fire_with_reply(tmp_path, reply)
+    assert result.fired is not None and memory is not None
+    assert _session_rows(tmp_path) == []
+
+
+# ── the research gate asks the engine whether a feeling is high ──
+
+
+def _live_gate_reason(
+    tmp_path: Path,
+    stub,
+    readings: dict[str, float],
+    *,
+    stored: dict[str, float],
+    high: set[str] | None = None,
+) -> str | None:
+    from brain.emotion.engine import Reading
+
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    stub.live = True
+    stub.high = set(high or ())
+    stub.readings = {
+        n: Reading(short=v, long=0.0, difference=0.0, shift=0) for n, v in readings.items()
+    }
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        if stored:
+            store.create(Memory.create_new(content="x", memory_type="fact", domain="us", emotions=stored))
+        runner = _build_engine(tmp_path, store)
+        result = runner.run_tick(
+            trigger="manual", dry_run=True, days_since_human_override=0.0, emotion_state_override=None
+        )
+    finally:
+        store.close()
+    return result.reason
+
+
+def test_live_gate_opens_on_a_feeling_the_engine_calls_high_whatever_its_value_and_the_store(
+    tmp_path: Path, emotion_engine_stub
+):
+    reason = _live_gate_reason(tmp_path, emotion_engine_stub, {"awe": 0.5}, stored={}, high={"awe"})
+    assert reason != "not_due"
+
+
+def test_live_gate_stays_closed_while_the_engine_calls_nothing_high_at_any_value(
+    tmp_path: Path, emotion_engine_stub
+):
+    reason = _live_gate_reason(
+        tmp_path, emotion_engine_stub, {"awe": 10.0, "grief": 9.0}, stored={"awe": 9.5}
+    )
+    assert reason == "not_due"
+
+
+def test_live_gate_only_asks_about_feelings_the_read_returned(tmp_path: Path, emotion_engine_stub):
+    # stored grief at 9.5 would open the gate through the old peak test; the live gate must ignore the store
+    reason = _live_gate_reason(
+        tmp_path, emotion_engine_stub, {"awe": 10.0}, stored={"grief": 9.5}, high={"grief"}
+    )
+    assert reason == "not_due"
+
+
+def test_live_gate_with_an_empty_read_is_closed(tmp_path: Path, emotion_engine_stub):
+    reason = _live_gate_reason(tmp_path, emotion_engine_stub, {}, stored={"awe": 9.5}, high={"awe"})
+    assert reason == "not_due"
+
+
+# ---- B1 PR 4: a live fire carries its own feelings and rating ----
+
+_FELT_REPLY = 'NOTES:\nn\n\nMEMORY:\nm\n\nVERDICT:\nclose\n\nEMOTIONS: {"awe": 8}\nENGAGEMENT: 6/10'
+
+
+def _go_live(persona_dir: Path, store: MemoryStore) -> None:
+    """A live persona with no state file applies nothing, so seed a memory first, then record the switch-over in its state."""
+    from tests.unit.brain.emotion._engine_support import make_live
+
+    store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
+    make_live(persona_dir, datetime.now(UTC))
+
+
+def _fire_with(tmp_path: Path, store: MemoryStore, reply: str):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    provider = ScriptedProvider(['{"choice": "i1", "why": "it connects"}', reply])
+    result = _build_engine(tmp_path, store, provider=provider).run_tick(days_since_human_override=5.0)
+    memory = PendingQueue(tmp_path).read_recent("research", limit=1)[0]  # research is a gated type
+    return result, memory
+
+
+def test_live_fire_stores_feelings_and_rating(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        _go_live(tmp_path, store)
+        result, memory = _fire_with(tmp_path, store, _FELT_REPLY)
+    finally:
+        store.close()
+    assert result.fired is not None
+    assert memory._stored_emotions == {"awe": 8.0}
+    assert memory.metadata["engagement_rating"] == 6.0
+    interests = json.loads((tmp_path / "interests.json").read_text(encoding="utf-8"))["interests"]
+    assert interests[0]["status"] == "dormant"  # the verdict still reads "close" with the felt lines after it
+
+
+def test_live_fire_holds_a_negative_feeling_to_zero_and_keeps_zeros(tmp_path: Path):
+    """A 0 counts as an entry in the engine's averages and a dropped value doesn't, so a negative or a given 0 is kept."""
+    reply = 'NOTES:\nn\n\nMEMORY:\nm\n\nVERDICT:\nclose\n\nEMOTIONS: {"awe": 8, "fear": -2, "joy": 0}\nENGAGEMENT: 6'
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        _go_live(tmp_path, store)
+        result, memory = _fire_with(tmp_path, store, reply)
+    finally:
+        store.close()
+    assert result.fired is not None
+    assert memory._stored_emotions == {"awe": 8.0, "fear": 0.0, "joy": 0.0}
+
+
+def test_live_fire_with_only_the_three_markers_keeps_the_memory_and_logs(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        _go_live(tmp_path, store)
+        result, memory = _fire_with(tmp_path, store, "NOTES:\nn\n\nMEMORY:\nm\n\nVERDICT:\ncontinue")
+    finally:
+        store.close()
+    assert result.fired is not None and memory.content == "m"
+    assert memory._stored_emotions == {}
+    assert "engagement_rating" not in memory.metadata
+    rows = (tmp_path / "parse_failures.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(row)["site"] for row in rows] == ["research_felt"]
+
+
+def test_live_system_prompt_asks_for_the_felt_lines_and_off_does_not(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        engine = _build_engine(tmp_path, store)
+        live = engine._render_system_prompt(live=True)
+        off = engine._render_system_prompt()
+    finally:
+        store.close()
+    assert 'EMOTIONS: {"<emotion name>": <0-10>}' in live and "ENGAGEMENT: <0-10>" in live
+    assert "—" not in live.replace(off, "")  # new prompt text has no em-dashes
+    assert "ENGAGEMENT" not in off
+
+
+def test_live_fire_sends_both_prompts_asking_for_the_felt_lines(tmp_path: Path):
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        _go_live(tmp_path, store)
+        provider = ScriptedProvider(['{"choice": "i1", "why": "it connects"}', _FELT_REPLY])
+        _build_engine(tmp_path, store, provider=provider).run_tick(days_since_human_override=5.0)
+    finally:
+        store.close()
+    prompt, system = provider.calls[1]
+    assert "ENGAGEMENT: <0-10>" in system
+    assert prompt.rstrip().endswith("Write NOTES / MEMORY / VERDICT, then EMOTIONS and ENGAGEMENT, now.")
+
+
+@pytest.mark.no_base_failure(reason="pins today's path with the switch off, which this PR must not change")
+def test_off_fire_is_unchanged_and_leaves_felt_lines_to_the_old_parser(tmp_path: Path):
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        result, memory = _fire_with(tmp_path, store, _FELT_REPLY)
+    finally:
+        store.close()
+    assert result.fired is not None
+    assert memory._stored_emotions == {}
+    assert "engagement_rating" not in memory.metadata
+    assert not (tmp_path / "parse_failures.jsonl").exists()
+
+
+# ---- #587: only what research puts in front of her counts as a recall ----
+
+
+def test_a_declined_selection_ticks_no_memories(tmp_path: Path):
+    """#587: picking among interests reads each one's memories, but none is researched, so none ticks."""
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        mem_id = _seed_conversation_memory(store, "a marine creature glowing in the dark ocean")
+        provider = ScriptedProvider(['{"choice": null, "why": "nothing pulls"}'])
+        res = _build_engine(tmp_path, store, provider=provider).run_tick(
+            trigger="manual", days_since_human_override=5.0
+        )
+        assert res.reason == "declined"
+        row = store.get(mem_id, bump=False)
+        assert (row.recall_count, row.last_accessed_at) == (0.0, None)
+    finally:
+        store.close()
+
+
+def test_a_fire_ticks_each_memory_it_shows_once(tmp_path: Path):
+    """#587: a memory matched by two keywords is in the research prompt once, so it gains 1.0 once."""
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        mem_id = _seed_conversation_memory(store, "a marine creature glowing in the dark ocean")
+        provider = ScriptedProvider(
+            ['{"choice": "i1", "why": "it connects"}', "NOTES:\nfound X\n\nMEMORY:\nI liked it.\n\nVERDICT:\ncontinue"]
+        )
+        res = _build_engine(tmp_path, store, provider=provider).run_tick(
+            trigger="manual", days_since_human_override=5.0
+        )
+        assert res.fired is not None
+        assert "a marine creature glowing" in provider.calls[1][0]  # it really was in front of her
+        row = store.get(mem_id, bump=False)
+        assert row.recall_count == 1.0 and row.last_accessed_at is not None
+    finally:
+        store.close()
+
+
+def test_a_research_session_that_fails_ticks_no_memories(tmp_path: Path):
+    """#587: the memories tick once the session has run; a session that raises never reached her."""
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+
+    class SelectsThenFails(ScriptedProvider):
+        def generate(self, prompt, *, system=None):
+            if self.calls:
+                raise RuntimeError("simulated session failure")
+            return super().generate(prompt, system=system)
+
+    try:
+        mem_id = _seed_conversation_memory(store, "a marine creature glowing in the dark ocean")
+        engine = _build_engine(tmp_path, store, provider=SelectsThenFails(['{"choice": "i1", "why": "it connects"}']))
+        with pytest.raises(RuntimeError, match="simulated session failure"):
+            engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        row = store.get(mem_id, bump=False)
+        assert (row.recall_count, row.last_accessed_at) == (0.0, None)
+    finally:
+        store.close()
+
+
+def test_a_failed_recall_tick_does_not_cost_the_fire(tmp_path: Path, monkeypatch):
+    """#587: the tick comes after the fire's writes and is fail-soft, so a store error there loses nothing paid for."""
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        _seed_conversation_memory(store, "a marine creature glowing in the dark ocean")
+        real_get = store.get
+
+        def _get(memory_id, *, bump=True):
+            if bump is True:
+                raise RuntimeError("simulated tick failure")
+            return real_get(memory_id, bump=bump)
+
+        monkeypatch.setattr(store, "get", _get)
+        provider = ScriptedProvider(
+            ['{"choice": "i1", "why": "it connects"}', "NOTES:\nfound X\n\nMEMORY:\nI liked it.\n\nVERDICT:\ncontinue"]
+        )
+        engine = _build_engine(tmp_path, store, provider=provider)
+        res = engine.run_tick(trigger="manual", days_since_human_override=5.0)
+        assert res.fired is not None and res.fired.output_memory_id is not None
+        assert (tmp_path / "research_log.json").exists()
+    finally:
+        store.close()
+
+
+@pytest.mark.no_base_failure(
+    reason="keeps _build_memory_context's str return, which main already has, for the callers on open emotion-rework branches (#587)"
+)
+def test_build_memory_context_still_returns_text_and_ticks_nothing(tmp_path: Path):
+    """#587: open branches call ``_build_memory_context`` and format its str; a tuple would reach the prompt silently."""
+    _write_interests(tmp_path / "interests.json", [_interest_dict()])
+    store = MemoryStore(":memory:")
+    try:
+        mem_id = _seed_conversation_memory(store, "a marine creature glowing in the dark ocean")
+        engine = _build_engine(tmp_path, store)
+        interest = InterestSet.load(engine.interests_path, default_path=DEFAULT_INTERESTS_PATH).interests[0]
+        text = engine._build_memory_context(interest)
+        assert isinstance(text, str) and "a marine creature glowing" in text
+        row = store.get(mem_id, bump=False)
+        assert (row.recall_count, row.last_accessed_at) == (0.0, None)
+    finally:
+        store.close()
+
+
+def test_a_declined_selection_with_no_keywords_ticks_no_memories(tmp_path: Path):
+    """#587: an interest with no keywords is matched by its topic; that search shows her nothing either."""
+    _write_interests(tmp_path / "interests.json", [_interest_dict(related_keywords=[])])
+    store = MemoryStore(":memory:")
+    try:
+        mem_id = _seed_conversation_memory(store, "notes on marine bioluminescence at night")
+        provider = ScriptedProvider(['{"choice": null, "why": "nothing pulls"}'])
+        res = _build_engine(tmp_path, store, provider=provider).run_tick(
+            trigger="manual", days_since_human_override=5.0
+        )
+        assert res.reason == "declined"
+        assert "notes on marine bioluminescence" in provider.calls[0][0]  # the topic search did find it
+        row = store.get(mem_id, bump=False)
+        assert (row.recall_count, row.last_accessed_at) == (0.0, None)
+    finally:
+        store.close()

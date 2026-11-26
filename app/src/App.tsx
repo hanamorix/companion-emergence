@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, useRef } from "react";
+import { useCallback, useEffect, useState, useRef, type ReactNode } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   brainLoginStatus,
@@ -33,9 +33,13 @@ import { BrainLoginPrompt } from "./components/panels/BrainLoginPrompt";
 import { LeftPanel } from "./components/LeftPanel";
 import { useSoulFlash } from "./useSoulFlash";
 import { useRestartBridge } from "./hooks/useRestartBridge";
+import { useBridgeWatchdog } from "./hooks/useBridgeWatchdog";
+import { StopProgress } from "./components/panels/StopProgress";
 import { Wizard } from "./wizard/Wizard";
 import { PersonaPicker } from "./wizard/PersonaPicker";
 import { errString } from "./lib/errString";
+import { tunablesNoticeMessage } from "./lib/tunablesNotice";
+import { rebuildNoticeMessage } from "./lib/rebuildNotice";
 
 const STATE_POLL_MS = 5000;
 
@@ -166,9 +170,10 @@ export default function App() {
       );
     }
     return (
-      <BootScreen
-        subtitle={`Starting brain for ${phase.persona}…`}
-      />
+      <BootScreen subtitle={`Starting brain for ${phase.persona}…`}>
+        {/* #456 (C17 h): a bridge still stopping at launch is waited for, with the same display and offer */}
+        <StopProgress persona={phase.persona} currentMode="bridge_down" />
+      </BootScreen>
     );
   }
 
@@ -341,7 +346,7 @@ function BootButton(props: React.ButtonHTMLAttributes<HTMLButtonElement>) {
   );
 }
 
-function BootScreen({ subtitle }: { subtitle: string }) {
+function BootScreen({ subtitle, children }: { subtitle: string; children?: ReactNode }) {
   return (
     <div
       style={{
@@ -375,6 +380,7 @@ function BootScreen({ subtitle }: { subtitle: string }) {
       >
         {subtitle}
       </div>
+      {children}
     </div>
   );
 }
@@ -402,6 +408,8 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
   const [brainAuthorized, setBrainAuthorized] = useState<boolean | null>(null);
   const [brainPromptDismissed, setBrainPromptDismissed] = useState(false);
   const restartBridge = useRestartBridge(persona, state?.mode ?? "live");
+  // #456 (Q4): a bridge that crashed is started again with a growing wait (30 s, 1 min, 5 min, then 10 min).
+  useBridgeWatchdog(persona, stateError ? "bridge_down" : state?.mode);
 
   // #246: the bridge reports an expired CLI login via /persona/state. The offer
   // is DERIVED from that flag OR the Rust probe — never written into
@@ -543,6 +551,8 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
       }}
     >
       <GlobalStatusDot mode={state?.mode ?? "live"} stateError={stateError} />
+      {/* #456 (review S9): the stop display and the hard-exit offer of any restart, wherever the user is */}
+      <StopProgress persona={persona} currentMode={state?.mode ?? "live"} floating />
       <LeftPanel
         state={state}
         persona={persona}
@@ -561,8 +571,10 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
           in its own column. */}
       <div style={{ display: "flex", flexDirection: "column", alignItems: "center" }}>
         <div style={{ transform: "translateY(50px)" }}>
+          {/* Nothing coming in (the poll is failing) means no state: the avatar shows neutral, not the last
+              good snapshot. */}
           <NellAvatar
-            state={state}
+            state={stateError ? null : state}
             persona={persona}
             isSpeaking={isSpeaking}
             soulFlashing={soulFlashing}
@@ -609,6 +621,14 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
             />
           </div>
         )}
+        {state?.tunables_notice && (
+          <NoticeBox testId="tunables-notice">{tunablesNoticeMessage(state.tunables_notice)}</NoticeBox>
+        )}
+        {/* Shown while the persona state carries the notice and refreshed by the poll above. No way to close it: it goes when
+            a later attempt clears the brain's record. */}
+        {state?.rebuild_notice && (
+          <NoticeBox testId="rebuild-notice">{rebuildNoticeMessage(state.rebuild_notice, capitalize(persona))}</NoticeBox>
+        )}
         <ChatPanel
           persona={persona}
           onSpeakingChange={setIsSpeaking}
@@ -617,6 +637,29 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
           mode={stateError ? "bridge_down" : (state?.mode ?? "live")}
         />
       </div>
+    </div>
+  );
+}
+
+/** One small status box above the chat, for a notice the brain keeps for the window (the tunables notice, the rebuild notice).
+ *  It has no state and no button: a notice shown here cannot be closed, it goes when the brain stops sending it. */
+function NoticeBox({ testId, children }: { testId: string; children: ReactNode }) {
+  return (
+    <div
+      role="status"
+      data-testid={testId}
+      style={{
+        border: "1px solid var(--panel-border, rgba(234,222,218,0.18))",
+        borderRadius: 8,
+        padding: 10,
+        background: "var(--panel-bg)",
+        fontSize: 11,
+        lineHeight: 1.5,
+        color: "var(--text-mute)",
+        wordBreak: "break-word",
+      }}
+    >
+      {children}
     </div>
   );
 }
@@ -746,6 +789,10 @@ const JOB_DESCRIPTORS: Record<string, string> = {
   session_snapshot_prune: "conversation snapshot",
   emotion_backfill: "emotion tagging",
   embedding_backfill: "memory indexing",
+  rerank_width_remeasure: "re-scoring cost check",
+  cosine_floor_bootstrap: "similarity pass mark setup",
+  rerank_floor_bootstrap: "re-scoring pass mark setup",
+  extraction_backfill: "conversation memory backfill",
   maintenance: "maintenance",
   interest_sweep: "interest review",
   self_model_articulation: "self-description update",

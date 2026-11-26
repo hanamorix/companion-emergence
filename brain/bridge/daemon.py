@@ -1,22 +1,25 @@
-"""SP-7 bridge daemon orchestration — process spawn, stop, status, recovery.
+"""SP-7 bridge daemon orchestration — process spawn, stop, status.
 
 Public surface used by CLI handlers in brain.cli:
   cmd_start(args)    -> int
   cmd_run(args)      -> int
-  cmd_stop(args)     -> int
+  cmd_stop(args)     -> int  (kill_pre_pr=False: the start's stop before the rebuild never hard-kills a pre-PR bridge)
   cmd_restart(args)  -> int
   cmd_status(args)   -> int
   cmd_tail(args)     -> int
   cmd_tail_log(args) -> int
 
+Used by the commands that touch the engine:
+  run_rebuild_step(persona_dir) -> int | None  (None: go on; else the exit code)
+
 Internal:
-  run_recovery_if_needed(persona_dir) — snapshot orphan buffers (non-destructive)
-    if previous bridge exited dirty.
   spawn_detached(persona_dir, idle_shutdown_seconds, client_origin, log_path) -> pid
 """
 
 from __future__ import annotations
 
+import codecs
+import errno
 import logging
 import os
 import signal
@@ -25,16 +28,18 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 
-from brain.bridge import state_file
-from brain.bridge.model_tier import TIER_BACKGROUND_HOUSEKEEPING, build_tier_provider
-from brain.ingest.pipeline import snapshot_stale_sessions
-from brain.memory.hebbian import HebbianMatrix
-from brain.memory.store import MemoryStore
+from brain.bridge import respawn_guard, start_backoff, state_file
+from brain.bridge.shutdown import REASON_USER_STOP
+from brain.health.log_rotation import rotate_rolling_size
+from brain.paths import RUNTIME_LOG_BACKUPS, RUNTIME_LOG_MAX_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -67,40 +72,14 @@ else:
 # not release or move the lock (the lock is independent of current EOF).
 _WINDOWS_LOCK_OFFSET = 1 << 20  # 1 MiB
 
-
-def run_recovery_if_needed(persona_dir: Path) -> int | None:
-    """If previous bridge exited dirty, drain orphan buffers.
-
-    Returns:
-        None — recovery was not needed (clean previous shutdown or fresh start)
-        int  — recovery ran; value is the count of drained sessions (may be 0)
-    """
-    if not state_file.recovery_needed(persona_dir):
-        return None
-    prev = state_file.read(persona_dir)
-    logger.warning(
-        "previous bridge exited dirty (pid=%s started_at=%s) — running recovery",
-        prev.pid if prev else "?",
-        prev.started_at if prev else "?",
-    )
-    store = MemoryStore(persona_dir / "memories.db")
-    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-    provider = build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING)
-    try:
-        reports = snapshot_stale_sessions(
-            persona_dir,
-            silence_minutes=0,
-            store=store,
-            hebbian=hebbian,
-            provider=provider,
-        )
-        return len(reports)
-    finally:
-        store.close()
-        hebbian.close()
+# msvcrt.locking(LK_LOCK) raises OSError with this errno when the byte is still locked after its own 10 tries.
+_EDEADLOCK = getattr(errno, "EDEADLOCK", errno.EDEADLK)
 
 
-def acquire_lock(persona_dir: Path) -> int | None:
+_RELOCKS = 2  # #754: how many times acquire_lock locks again after finding the folder swapped under it
+
+
+def acquire_lock(persona_dir: Path, *, blocking: bool = False, _relocks_left: int = _RELOCKS) -> int | None:
     """Take the bridge's OS-level lock for the whole process life.
 
     Same pattern as brain.utils.file_lock: open with O_CREAT (never O_EXCL —
@@ -112,7 +91,10 @@ def acquire_lock(persona_dir: Path) -> int | None:
 
     Returns the open fd (the caller must keep it open for the lock's
     duration and pass it to release_lock) on success, or None if another
-    live process holds the lock.
+    live process holds the lock. With ``blocking=True`` it waits until the lock
+    is free instead (POSIX: a blocking flock; Windows: msvcrt's own 10 x 1 s
+    LK_LOCK retry, repeated while the lock is still held; any other lock error
+    returns None), as `nell supervisor run` does for OS services.
 
     The pid is written into the file for information only (S50) — never
     read back to make a decision here. It sits at offset 0 on BOTH
@@ -123,21 +105,99 @@ def acquire_lock(persona_dir: Path) -> int | None:
     blocked there either way.
     """
     path = persona_dir / LOCKFILE
-    fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+    try:
+        fd = os.open(str(path), os.O_CREAT | os.O_RDWR)
+    except FileNotFoundError:
+        # #754: every start path checks the persona folder exists before this, so a missing folder here is one a forced
+        # migrate install has moved aside and not yet replaced: it holds the lock for that swap, so answer "held".
+        return None
     try:
         if _IS_WINDOWS:
             os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            if blocking:
+                while True:
+                    try:
+                        msvcrt.locking(fd, msvcrt.LK_LOCK, 1)  # retries 10 x 1 s itself, then raises
+                        break
+                    except OSError as exc:
+                        # Only "still held after its 10 tries" (EDEADLOCK) is contention; any other error (a bad fd,
+                        # an access error) would repeat forever, so it ends the wait (review O-3).
+                        if exc.errno != _EDEADLOCK:
+                            raise
+                        os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
+            else:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         else:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError):
         os.close(fd)
         return None
+
+    if not _IS_WINDOWS and _relocks_left > 0 and not _is_file_at(fd, path):
+        # #754: the persona folder was swapped while this waited (a forced migrate install holds this lock across its
+        # two renames, so the file locked here is now the backup's). Let it go and lock the file now at the path, or
+        # this process would run the new persona holding the backup's lock while a later start locks the real one.
+        # Bounded: on a filesystem whose inode numbers never match, the last try keeps its lock, as before the check.
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+        return acquire_lock(persona_dir, blocking=blocking, _relocks_left=_relocks_left - 1)
 
     os.ftruncate(fd, 0)
     os.lseek(fd, 0, os.SEEK_SET)
     os.write(fd, str(os.getpid()).encode())
     return fd
+
+
+def _is_file_at(fd: int, path: Path) -> bool:
+    """True when the open `fd` is the file now at `path` (same device and inode), or when that can't be told (any
+    other error inspecting them): the caller then keeps its lock, as before this check existed."""
+    try:
+        here = os.stat(path)
+        held = os.fstat(fd)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return (held.st_dev, held.st_ino) == (here.st_dev, here.st_ino)
+
+
+def lock_holder(persona_dir: Path) -> int | None:
+    """The pid written in the bridge lock while another process holds it, else None (free, or a holder whose pid
+    cannot be read). A probe for the kill helper (C45 i): a non-blocking lock attempt on its own fd, released at
+    once; it never writes the file."""
+    path = persona_dir / LOCKFILE
+    try:
+        fd = os.open(str(path), os.O_RDWR)
+    except OSError:
+        return None
+    try:
+        try:
+            if _IS_WINDOWS:
+                os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                os.lseek(fd, _WINDOWS_LOCK_OFFSET, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            return None  # nobody holds it
+        except OSError:
+            pass  # held by another process
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = os.read(fd, 32)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        pid = int(raw.decode("ascii", "replace").strip())
+    except ValueError:
+        return None
+    from brain import process_identity
+
+    # #755: a hand-edited lock can hold a number no process can have; the kill helper passes the holder to
+    # psutil.pid_exists, which raises OverflowError on it.
+    return pid if process_identity.is_pid_number(pid) else None
 
 
 def release_lock(persona_dir: Path, fd: int) -> None:
@@ -175,7 +235,9 @@ def _kill_if_alive(pid: int, sig: int) -> bool:
     readiness-timeout orphan-kill path.)
     """
     try:
-        os.kill(pid, sig)
+        # windows-lint: ok -- the one hard-kill helper: an orphan after a failed start, or the
+        # fallback when the graceful shutdown endpoint failed. TerminateProcess is intended there.
+        os.kill(pid, sig)  # windows-lint: ok
         return True
     except ProcessLookupError:
         return False
@@ -255,6 +317,18 @@ def spawn_detached(
         log_fh.close()
 
 
+def _rotate_bridge_log(log_path: Path) -> None:
+    """Outside launchd nothing else bounds bridge-<persona>.log (#559). cmd_start calls this while it still holds the
+    bridge lock, so no running bridge (a runner holds that lock for its whole life) is writing the file. Not airtight:
+    another starter's child, spawned after that starter released the lock but before the child took it, can be writing.
+    Its stdout appends (O_APPEND), so the copy-then-truncate costs at most the lines it wrote between the two, and only
+    when the log is over the cap. A failed rotation never blocks a start."""
+    try:
+        rotate_rolling_size(log_path, RUNTIME_LOG_MAX_BYTES, RUNTIME_LOG_BACKUPS)
+    except Exception:  # noqa: BLE001
+        logger.warning("could not rotate %s; starting the bridge anyway", log_path, exc_info=True)
+
+
 # pid -> Popen for children spawn_detached started and cmd_start has not yet
 # finished waiting on (cmd_start pops its own entry). See spawn_detached.
 _spawned_children: dict[int, subprocess.Popen] = {}
@@ -276,6 +350,360 @@ def _runner_argv(
     if idle_shutdown_seconds is not None:
         argv += ["--idle-shutdown-seconds", str(idle_shutdown_seconds)]
     return argv
+
+
+# The owner's wording list (S101, S102): the same lines as the app's start-up screen (useRestartBridge.ts engineProgressLine).
+_REBUILD_STARTED_LINE = "Updating your memories. This can take a few minutes."
+
+# The short plain reasons the rebuild notice shows when the start process records a failure (Hana's 11-18b point 2; placeholders on
+# the owner's wording list; the window puts one after "could not be brought up to date: "). The raw error stays in the log line at
+# each site, never in the notice.
+_REASON_NOT_STARTED = "the update could not be started"
+_REASON_STOPPED = "the update stopped before it finished"
+_REASON_CHECK_FAILED = "the check for an update failed"
+_REBUILD_RESCALING_LINE = "Updating the scale of your memories."
+_REBUILD_PREPARING_LINE = "Getting ready to update your memories."
+
+
+def _say(line: str) -> None:
+    """One line to stderr. A stderr that is gone or a print that fails (a broken pipe) is ignored: a display line never
+    changes what the step does."""
+    try:
+        if sys.stderr is not None:
+            print(line, file=sys.stderr)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _stderr_is_terminal() -> bool:
+    try:
+        return bool(sys.stderr.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
+def _usable_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value == value and abs(value) != float("inf")
+
+
+def _rebuild_progress_line(record: dict | None) -> str | None:
+    """The window's line for a progress record: the scale update has no count, a record with no usable total is "getting ready",
+    a count is "N of M (P%)" (N held between 0 and M). None when there is no record. Same rule as the app's
+    ``engineProgressLine`` for the whole numbers the engine writes (a fractional count is cut to a whole number here)."""
+    if record is None:
+        return None
+    if record.get("phase") == "rescaling":
+        return _REBUILD_RESCALING_LINE
+    done, total = record.get("done"), record.get("total")
+    if not (_usable_number(done) and _usable_number(total)):
+        return _REBUILD_PREPARING_LINE
+    done, total = int(done), int(total)
+    if total <= 0:
+        return _REBUILD_PREPARING_LINE
+    counted = min(max(done, 0), total)
+    return f"Updating your memories: {counted} of {total} ({counted * 100 // total}%)."
+
+
+@contextmanager
+def _runtime_log(persona_dir: Path) -> Iterator[None]:
+    """Let the log lines written inside the ``with`` reach the runtime log (HS4, HS5 of #633, B59 HQD (iii)): the one place a start
+    attaches and detaches the transient handler. Used by the rebuild step, the need check's failure line and the failed-stop line.
+
+    The transient handler (no file held open) is attached only when no persistent handler for the log is attached, and removed
+    again on the way out, an exception included. ``runner`` is imported here, not at module level, so a start with no rebuild never
+    loads the bridge stack. The lines are best effort: when the import (or the attach) fails nothing is attached, the lines go
+    unlogged and the body runs as if the log were not there.
+    """
+    try:
+        from brain.bridge import runner
+
+        transient = None if runner._runtime_log_attached(persona_dir) else runner._attach_transient_runtime_log(persona_dir)  # noqa: SLF001
+        attached = True
+    except Exception:  # noqa: BLE001 - a log line must never stop a start or a rebuild step
+        attached = False
+    try:
+        yield
+    finally:
+        if attached:
+            runner._detach_runtime_log(transient)  # noqa: SLF001
+
+
+def _rebuild_under_lock(persona_dir: Path) -> int | None:
+    """The start's rebuild step (S107, HS5 of #633), run with the start lock held. Returns None to go on, or the exit code to
+    return: 1 when another running command could not be ended (nothing else ran).
+
+    (1) Every other running command (``engine_files.live_command_runs``) is ended with ``kill.kill_command``, which asks the
+    process for its identity first; a command that is not ended (survivors, an identity that could not be confirmed, an exception)
+    ends the step with one plain line naming its pid. The one case whose line also gives the record's path is a record with no token
+    that ``kill_command`` answers ``unknown_identity`` (a command that could not read its own identity left it, and its pid may have
+    been reused by an unrelated process): the line adds the file and the advice to delete it if that process is not a nell command
+    (B60 HQT). The step also ends for a record that cannot be read while the pid in its file name may be alive (no ``kill_command``
+    call; the line gives the file) and for a folder of records that cannot be listed (the line names the folder): either may hide a
+    live command (B58 HQB Q1). This is the one place a start acts on a running command.
+    (2) The rebuild is its own process, ``nell supervisor rebuild``, waited for with no limit (S101: the startup waits until the
+    rebuild is finished). It prints the lines below to stderr only when stderr is a terminal; the loop sleeps through
+    ``stop_watch._clock`` so the app's captured stderr of a failed start is not flooded. A return code other than 0, or an OSError
+    from the spawn, is one failed rebuild: one line, one log entry, and the step ends normally on the state saved before (S107). It
+    also records why in the rebuild notice (``engine_files.settle_rebuild_notice``, Hana's point 5 on #633), which the window shows while
+    the persona is not switched over: a short plain reason ("the update could not be started", or "the update stopped before it finished"),
+    unless the child wrote its own, more exact notice (told by the pid and token the notice names, read from the launched child
+    right after the spawn, not by a clock comparison); the raw error and the exit code stay in the log; a child that ends normally clears the notice itself once the
+    persona is switched over (this process does not). Any
+    BaseException (Ctrl-C included) kills and waits for the child and propagates, as ``subprocess.run`` does.
+
+    The runtime log is attached for the step (``_runtime_log``: transient, only when no persistent handler for the log is
+    attached, best effort), so the lines logged here reach it.
+
+    Accepted edges (P4, R2): a persona whose rebuild keeps failing or skipping (S61's unreadable state with a failing integrity
+    check) is needed at every start, so each start with no bridge running repeats the child (twice for a service-managed persona: the
+    start's step, then the service run's) and goes on with the saved state, and each such run first ends every other running command,
+    a ``nell chat --no-bridge`` session included; each run logs why. ``nell supervisor stop`` typed during the step finds no bridge,
+    returns 0, and the start then launches the bridge. A child left by a dropped start holds the engine lock, so the new child waits
+    for that lock in the existing lock wait and then finds the work done; a lock held by something that is not a rebuild makes the
+    start wait with no limit and no stop check (S101; the child shows its "rebuilding" record meanwhile). No console flag is added on
+    Windows (the real-child test runs on every leg). A command that goes on after a failed rebuild runs on an engine state that may
+    lag until the next start retries (REVIEW, as the bridge does).
+    """
+    from brain.bridge import kill
+    from brain.emotion import engine_files
+
+    with _runtime_log(persona_dir):
+        try:
+            records = engine_files.live_command_runs(persona_dir)
+        except OSError as exc:
+            folder = engine_files.command_runs_dir(persona_dir)
+            reason = f"{type(exc).__name__}: {exc}"
+            logger.warning("could not list the command run records in %s (%s); the step ends: a command may be running", folder, reason)
+            _say(
+                f"The commands that may be running could not be checked: the folder {folder} cannot be listed ({reason}). "
+                "Nothing was updated. Check that folder and try again."
+            )
+            return 1
+        for record in records:
+            pid, token = record.get("pid"), record.get("pid_token")
+            if record.get(engine_files.UNREADABLE_RUN_KEY):
+                # The record cannot be read and the process named by its file name may be alive: it is a command that was not ended
+                # (nothing is asked of kill_command, which needs a token), and the line gives the file so the user can remove a stale one.
+                path = record.get("path")
+                logger.warning("the run record %s of command %s is unreadable and that process may be alive; the step ends", path, pid)
+                _say(
+                    f"The record of another command (process {pid}) is unreadable, so that command was not stopped: {path}. "
+                    "Nothing was updated. If it is not running, delete that file and try again."
+                )
+                return 1
+            result = None
+            try:
+                result = kill.kill_command(pid, token if isinstance(token, str) else None)
+                ended = result.succeeded
+            except Exception as exc:  # noqa: BLE001 - a command that cannot be ended ends the step like a failed stop
+                logger.warning("could not end the running command %s: %s: %s", pid, type(exc).__name__, exc)
+                ended = False
+            else:
+                if ended and result.outcome == "killed":
+                    logger.info("ended the running command %s before the rebuild", pid)
+                elif not ended:
+                    logger.warning("could not end the running command %s: %s", pid, result.message)
+            if not ended:
+                if result is not None and result.outcome == "unknown_identity" and not (isinstance(token, str) and token):
+                    # A readable record with no token (written by a command that could not read its own identity, B60 HQT): its
+                    # identity cannot be checked, so it is not ended, and its pid may have been reused by an unrelated process. The
+                    # line gives the record so the user can clear it; every other failed stop keeps the plain line below.
+                    path = engine_files.command_run_path(persona_dir, pid)
+                    _say(
+                        f"Another command (process {pid}) is still running and could not be stopped: {path}. Nothing was updated. "
+                        "Try again when it has finished, or, if that process is not a nell command, delete that file and try again."
+                    )
+                else:
+                    _say(f"Another command (process {pid}) is still running and could not be stopped. Nothing was updated. Try again when it has finished.")
+                return 1
+        _run_rebuild_child(persona_dir)
+        return None
+
+
+def _run_rebuild_child(persona_dir: Path) -> None:
+    """Spawn ``nell supervisor rebuild`` and wait for it (HS5 (2)); see ``_rebuild_under_lock``. Never raises for a failed child."""
+    from brain import process_identity
+    from brain.bridge import stop_watch
+    from brain.emotion import engine_files
+
+    python, env = bridge_python()
+    # "-P" as _runner_argv has it; the persona by name, from the same home as ours (the environment is inherited).
+    argv = [python, "-P", "-m", "brain.cli", "supervisor", "rebuild", "--persona", persona_dir.name]
+    show = _stderr_is_terminal()
+    try:
+        child = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env
+        )
+    except OSError as exc:
+        reason = f"{type(exc).__name__}: {exc}"
+        logger.warning("the rebuild child for %s could not be started (%s); going on with the saved state", persona_dir.name, reason)
+        _say(f"Updating your memories could not be started ({reason}). Going on with your memories as they were saved.")
+        _settle_rebuild_notice(persona_dir, _REASON_NOT_STARTED)  # the raw text (`reason`) is in the log line and the line above
+        return
+    # The child's identity, read now while it runs (once it has exited its token reads GONE): the notice it writes at a failure
+    # inside it names this pid and token, and that is how a notice of its own is told from an older one (no clock is compared).
+    # A token that cannot be read means no notice can be told to be the child's, and the generic reason below is written. `bridge_python()`
+    # above already starts the interpreter itself, so `child.pid` is the pid the child writes: on the shipped Windows build (a standalone
+    # python.exe or pythonw.exe, no venv, from the app, `nell.bat` or the Task Scheduler run) it returns `sys.executable`, and on a Windows
+    # dev venv it returns the base interpreter, not the venv redirector. Accepted edge (P4): a child already gone at this read, or a
+    # setup that starts the child some other way than through `bridge_python()` (none in the product), gets the generic reason too;
+    # only a less specific message, the exact error is in the log.
+    child_token = process_identity.token_of(child.pid)
+    child_identity = (child.pid, child_token) if process_identity.is_token(child_token) else None
+    try:
+        if show:
+            _say(_REBUILD_STARTED_LINE)
+        last = _REBUILD_STARTED_LINE
+        while child.poll() is None:
+            if show:
+                try:
+                    line = _rebuild_progress_line(engine_files.read_engine_progress(persona_dir))
+                    if line is not None and line != last:
+                        last = line
+                        _say(line)
+                except Exception:  # noqa: BLE001 - a display glitch never touches the child
+                    pass
+            stop_watch._clock.sleep(stop_watch.POLL_S)  # noqa: SLF001
+    except BaseException:
+        try:
+            child.kill()
+        except OSError:  # the child is already going away; still wait for it, and let the original exception through
+            pass
+        child.wait()
+        raise
+    code = child.returncode
+    if code != 0:
+        logger.warning("the rebuild child for %s exited with code %s; going on with the saved state", persona_dir.name, code)
+        _say(f"Updating your memories did not finish (exit code {code}). Going on with your memories as they were saved.")
+        # Also a child killed by a signal or for memory, or one that crashed before the engine ran: no notice of its own exists, so
+        # this one tells the window; a notice the launched child wrote itself (it names the child's pid and token) is more exact and stands.
+        _settle_rebuild_notice(persona_dir, _REASON_STOPPED, keep_notice_of=child_identity)  # the exit code is in the log line above
+    # A child that exited 0 is not settled here: the child clears the notice itself when it ends normally (`cli._supervisor_rebuild_handler`).
+
+
+def _settle_rebuild_notice(persona_dir: Path, reason: str | None, *, keep_notice_of: tuple[int, str] | None = None) -> None:
+    """Call the one writer of the rebuild notice (`engine_files.settle_rebuild_notice`, Hana's 11-18 point 5 on #633).
+
+    The only reason this is a function and not a direct call: `engine_files` is imported here, at call time, and `_rebuild_needed`'s
+    failure branch runs when the engine stack itself failed to import, where a start must still go on. A failed import is logged
+    and ends the call; the writer itself never raises.
+    """
+    try:
+        from brain.emotion import engine_files
+
+        engine_files.settle_rebuild_notice(persona_dir, reason, keep_notice_of=keep_notice_of)
+    except Exception:  # noqa: BLE001 - a display record never stops a start
+        logger.warning("could not record the rebuild notice for %s", persona_dir.name, exc_info=True)
+
+
+def _rebuild_needed(persona_dir: Path, bridge_running: bool) -> bool:
+    """Does a start (or a command) have to run the rebuild step first (S107, HS4 of #633)?
+
+    With no bridge recorded running it is ``engine.start_rebuild_needed``: the persona is not switched over, or a roll-forward is due.
+    With a bridge running it is only "the persona is not live": while a bridge runs, the roll-forward detector cannot be read as a need,
+    because ``engine_rebuild.rolled_forward`` is true for any row above ``rows_through`` created after ``saved_at`` and nothing says who
+    wrote the row, and a running bridge's own writes meet it (the row is committed before the engine applies it, the window S99
+    accepted). A true roll-forward (rows an older brain wrote) is found at a start with no bridge running. REVIEW, the direction: this
+    departs from S107's words in one case, a roll-forward need under a running bridge; the alternative (stop the bridge on it too)
+    would stop and restart a healthy bridge, losing its in-flight work, whenever a start is typed over it inside that window.
+
+    A check that raises is logged (type and reason, to the runtime log), recorded in the rebuild notice (no child runs, so nothing else
+    would say it; Hana's point 5 on #633), and answers False: the start goes on. A check that answers "no rebuild needed" settles the
+    notice with no reason (``engine_files.settle_rebuild_notice``): a switched persona's old notice is deleted, one stat when there is
+    none; that runs after the try, on the normal path only, so the failure branch never clears. The bridge stack is
+    imported only in the failure branch (``_runtime_log``), so the no-rebuild path never loads it; its transient log handler is attached
+    only when no persistent one is, and always detached again. A log line that cannot be set up is skipped: the answer stays False.
+    """
+    try:
+        from brain.emotion import engine
+
+        if not bridge_running:
+            needed = engine.start_rebuild_needed(persona_dir)
+        else:
+            needed = not engine.engine_for(persona_dir).is_live()
+    except Exception as exc:  # noqa: BLE001 - a failed check never stops a start
+        with _runtime_log(persona_dir):
+            logger.warning(
+                "could not check whether the emotion engine needs a rebuild for %s (%s: %s); going on with the saved state",
+                persona_dir.name,
+                type(exc).__name__,
+                exc,
+            )
+        _settle_rebuild_notice(persona_dir, _REASON_CHECK_FAILED)  # case 5: no child runs, so nothing else records it; the error is logged above
+        return False
+    if not needed:
+        _settle_rebuild_notice(persona_dir, None)  # after the try, so the except above cannot catch it; the normal path only
+    return needed
+
+
+def _stop_for_rebuild(persona_dir: Path, args) -> int:  # noqa: ANN001
+    """Stop the running bridge so the rebuild can run (S107, HS4): the restart's stop (``cmd_restart``; reason None, so a queued
+    service run is not held back), with ``kill_pre_pr=False``: a bridge with no identity token is asked and waited for, but never
+    hard-killed (S110: no automatic hard kill; the app keeps its own hard-exit offer). A non-zero result ends the start before any
+    rebuild: one plain line on stderr and one line in the runtime log (``_runtime_log``), and the start returns the code. Nothing is hard-killed here: a failed request falls back to SIGTERM on
+    POSIX, the wait is the stop watch (which offers the hard exit after 180 s in a terminal and kills only on the user's "y"), and
+    on Windows an unreachable endpoint is refused unless the user runs ``nell supervisor stop --kill``.
+
+    Accepted edges (P4, R2): the app drops a start after 60 s with no rebuild record (lib.rs ``wait_for_start``, ``kill_on_drop``),
+    which ends this stop's watch too, because the stop runs inside the same ``nell supervisor start`` that ``kill_on_drop`` ends (the
+    stop writes no progress record, so the stop itself does not pause the 60 s; another live progress record, such as one a rebuild
+    child left by an earlier dropped start still shows, would pause it); a pre-PR or unhealthy bridge can be left half-stopped, with no
+    rebuild and no new bridge, until the next start repeats the stop. No data is lost, and at launch on an unconfirmed overlay a
+    failed start reaches ``recoverUnhealthyBrain`` and undoes the update (brainRecovery.ts), as HR5 (6) and (7) recorded. A stop that answers 0 while a
+    bridge is somehow still there is not caught here: a live bridge holds the start lock, so ``cmd_start``'s lock refuses with
+    exit 2. A failed stop can print two lines (the pre-PR stop's, then this one), accepted. A queued service run that wakes between the stop and ``cmd_start``'s lock takes it: this start then
+    returns 2 and that run does the rebuild (``cmd_run``).
+    """
+    rc = cmd_stop(args, reason=None, kill_pre_pr=False)
+    if rc != 0:
+        with _runtime_log(persona_dir):
+            logger.warning(
+                "the running bridge for %s did not stop before the rebuild (stop exit code %s); nothing was updated and no new bridge was started",
+                persona_dir.name,
+                rc,
+            )
+        _say(
+            "The running bridge did not stop, so nothing was updated and no new bridge was started. "
+            "A bridge from a previous version may still be stopping. "
+            f'If it is stuck, end it with "nell supervisor stop --persona {persona_dir.name} --kill", then start again.'
+        )
+    return rc
+
+
+def run_rebuild_step(persona_dir: Path) -> int | None:
+    """The rebuild step for the commands that touch the engine (S107, HS6 (c) of #633): None to go on, or the exit code to return.
+
+    With a bridge recorded running it does nothing (the command runs beside the bridge, as today). Otherwise, if a rebuild is needed
+    it takes the start lock WITHOUT waiting: a start or another rebuild holds it, so the command is refused at once with exit 2 and
+    one plain line (REVIEW, the reading: S102's "everything else waits" and S36's 5 s wait become "refused at once, retry"; a
+    blocking acquire would also wait for a bridge's whole life, because the runner holds this lock from before its state file
+    shows it). With the lock held it asks the need again (HQD (4), as ``cmd_start`` and ``cmd_run`` do) and runs
+    ``_rebuild_under_lock`` only if it still stands; it releases the lock and starts no bridge.
+
+    Accepted edge (P4, Hana's 11-18 point 4 on #633; trio 3-0; also a commit-log note): in the gap between ``cmd_start`` releasing
+    the lock (the comment there) and the new runner taking it, no bridge is recorded and the lock is free, so a command that still
+    needs the rebuild (an earlier one failed or was skipped) takes the lock, ends the other commands and runs a rebuild child. On
+    the ``spawn_detached`` path the runner then loses the lock, returns 2 and the start reports a failed bridge; at app launch on an
+    unconfirmed overlay that failed start reaches the undo (``recoverUnhealthyBrain``), a visible reversal the user can redo; no data
+    is lost. A service-managed start waits on ``cmd_run``'s blocking lock and does not fail. Accepted because it needs a failed or
+    skipped earlier rebuild and one of the six commands inside a gap the width of a process start (not measured; far below 1 in
+    10,000 starts; the product does not fire a command at a start), and the only fix, skipping here while the rebuild notice stands,
+    would stop every command retrying (S111, HSR item 4).
+    """
+    if state_file.is_running(persona_dir):
+        return None
+    if not _rebuild_needed(persona_dir, False):
+        return None
+    fd = acquire_lock(persona_dir)
+    if fd is None:
+        _say("A start or an update of your memories is under way. Try again when it has finished.")
+        return 2
+    try:
+        if not _rebuild_needed(persona_dir, False):
+            return None  # the need went away while this command reached the lock (HQD (4)): end no other command for nothing
+        return _rebuild_under_lock(persona_dir)
+    finally:
+        release_lock(persona_dir, fd)
 
 
 # S57: cmd_start's refusal paths keep their existing wording, byte-identical.
@@ -316,6 +744,13 @@ def cmd_start(args, *, out: dict | None = None) -> int:
     `out["readiness"]` with a BridgeReadiness carrying the verified
     pid/port/auth_token. Callers that need an immediate WS/HTTP connection
     should use that instead of re-reading state_file.
+
+    The one-shot rebuild (S107, HS6 (a) of #633) runs here, before the bridge: a bridge recorded running is first stopped when a
+    rebuild is needed (``_stop_for_rebuild``; a stop that does not finish returns its code and starts nothing), then, under the start
+    lock and after asking the need again there, ``_rebuild_under_lock``; a step that returns a code releases the lock and returns it
+    (the lock has one release, in a ``finally`` that also covers a raise from any start-up step). A start over a running bridge with no
+    rebuild needed, and an ``attach`` start (``nell chat``'s already-running branch: ``args.attach``) over a running bridge, are
+    refused with exit 2 as before, an attach start before any need check.
     """
     from brain.paths import get_log_dir, get_persona_dir
 
@@ -324,13 +759,22 @@ def cmd_start(args, *, out: dict | None = None) -> int:
         print(f"persona directory not found: {persona_dir}", file=sys.stderr)
         return 1
 
-    if state_file.is_running(persona_dir):
+    running = state_file.is_running(persona_dir)
+    if running and getattr(args, "attach", False):
+        return _refuse_already_running(persona_dir, out)
+    needed = _rebuild_needed(persona_dir, running)
+    if needed and running:
+        stop_rc = _stop_for_rebuild(persona_dir, args)
+        if stop_rc != 0:
+            return stop_rc
+    elif running:
         return _refuse_already_running(persona_dir, out)
 
-    # Hold the lock through recovery (so two concurrent starters can't both
-    # recover), then RELEASE it right before spawning. The bridge PROCESS — the
-    # detached runner (see runner.main) — re-acquires it and holds it for its
-    # lifetime, so pid-based stale recovery works. cmd_start must NOT hold the
+    # Hold the lock through the start-up steps below (so a concurrent starter
+    # gets "lock held" instead of starting a second bridge), then RELEASE it
+    # right before spawning. The bridge PROCESS (the detached runner, see
+    # runner.main) re-acquires it and holds it for its lifetime, so a stale
+    # record is told apart from a live bridge. cmd_start must NOT hold the
     # lock across the spawn, or the child can't acquire it and dies (Bug 2a,
     # v0.0.36). The runner's lifetime lock is the real guard against two bridges.
     fd = acquire_lock(persona_dir)
@@ -338,25 +782,76 @@ def cmd_start(args, *, out: dict | None = None) -> int:
         print(_LOCK_HELD_MSG, file=sys.stderr)
         return 2
 
-    client_origin = getattr(args, "client_origin", "cli")
-    if client_origin == "launchd":
+    # ONE release of the lock, whichever way this block ends (HQD (i)): a step's code, an exception (Ctrl-C in the chat REPL's
+    # in-process start included) or one from the clean-up below. On the normal path it runs right after the log rotation, which is
+    # the hand-off to the child runner (the spawn and the service start come after it). release_lock is not idempotent: no other
+    # release exists in this function.
+    try:
+        # The need is asked again under the lock (HQD (4), as cmd_run does): another starter's rebuild may have finished while this
+        # one reached the lock, and a step for nothing would end other commands (a nell chat --no-bridge session) first.
+        if needed and _rebuild_needed(persona_dir, False):
+            # The rebuild runs as its own process under this lock, before the bridge (S107). It comes before the stop intent is
+            # cleared and the start back-off is reset below: a start that fails here never got going, so a kill's intent and the
+            # back-off stay.
+            step_rc = _rebuild_under_lock(persona_dir)
+            if step_rc is not None:
+                return step_rc
+
+        client_origin = getattr(args, "client_origin", "cli")
+        if client_origin == "launchd":
+            try:
+                from brain.service.launchd import truncate_launchd_logs_if_large
+
+                truncate_launchd_logs_if_large(args.persona)
+            except Exception:
+                logger.debug("launchd log truncation skipped", exc_info=True)
+
+        # #456 (D12, Q-B): no synchronous recovery here. The bridge's first idle pass saves every open session through
+        # the gated job session_snapshot_prune (inside the background slot), whatever ended the last bridge.
+
+        # #456 (D25, S6-f): an explicit start clears a kill's stop intent, only now (after the already-running refusal or
+        # the stop above, so a launch check during an in-flight kill leaves it alone).
+        from brain.bridge import shutdown_progress
+
+        shutdown_progress.delete_record(persona_dir, shutdown_progress.INTENT_FILENAME)
+        # D26: an explicit start does not wait and starts the start back-off over (a service run already waiting ends its
+        # wait at once, and the service run this start causes is the first of a new series).
+        start_backoff.reset(persona_dir)
+
+        log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
+        idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
+        _rotate_bridge_log(log_path)  # under the lock: see _rotate_bridge_log
+    finally:
+        # Hand the lock to the child runner on the normal path. Accepted edge (P4, Hana's 11-18 point 4 on #633; trio 3-0): between
+        # this release and the runner's non-blocking take (`runner.main`) nothing records that a start is under way (no "starting"
+        # phase in bridge.json, no file), so one of the six commands (`run_rebuild_step`) that still needs the rebuild, after one that
+        # failed or was skipped, finds no bridge and a free lock, takes it and runs a rebuild child. On the `spawn_detached` path the
+        # runner then loses the lock and returns 2, the readiness wait reports a failed bridge, and at app launch on an unconfirmed
+        # overlay that failed start reaches the undo (`recoverUnhealthyBrain`): a visible reversal the user can redo; no data is
+        # lost (the child runs under the engine lock). The service path (`_start_service`) waits on `cmd_run`'s blocking lock and
+        # does not fail. Why it is accepted: it needs an earlier failed or skipped rebuild AND one of the six commands inside a
+        # gap the width of a process start (not measured; far below 1 in 10,000 starts). A persona whose rebuild keeps failing has
+        # the gap at every start, so the rarity rests on the product never firing one of the six commands at a start (they are typed
+        # or run by the user's own scheduler); the only fix, reading the rebuild notice in `run_rebuild_step`, would stop every
+        # command retrying while it stands (departing from HSR item 4, S111), and holding the lock across the spawn is ruled out
+        # by the comment above (the runner could not take it). The same gap already exists for a second `cmd_start`
+        # (`_rotate_bridge_log`).
+        release_lock(persona_dir, fd)
+    # #456 (D20, S-h): a persona whose service is installed starts through its manager, so the manager owns the bridge
+    # (and a later stop goes the service way); the readiness wait gets what is left of the same 50 s budget.
+    if _service_installed(args.persona):
+        t0 = time.monotonic()
         try:
-            from brain.service.launchd import truncate_launchd_logs_if_large
-
-            truncate_launchd_logs_if_large(args.persona)
-        except Exception:
-            logger.debug("launchd log truncation skipped", exc_info=True)
-
-    drained = run_recovery_if_needed(persona_dir)
-    if drained is not None:
-        if drained > 0:
-            print(f"recovered from interrupted shutdown - snapshotted {drained} active sessions")
-        else:
-            print("recovered from dirty shutdown (no orphan sessions to drain)")
-
-    log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
-    idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
-    release_lock(persona_dir, fd)  # hand the lock to the child runner
+            started = _start_service(args.persona)
+        except Exception as exc:  # noqa: BLE001 - reported like any failed start
+            print(f"service start failed: {exc}", file=sys.stderr)
+            return 1
+        if started is not None and started.returncode != 0:
+            # Review S12: the manager refused the start; say so now, not after the readiness wait.
+            detail = (started.stderr or started.stdout or "").strip()
+            print(f"service start failed (exit {started.returncode}): {detail}", file=sys.stderr)
+            return 1
+        return _await_service_readiness(persona_dir, _READINESS_BUDGET_S - (time.monotonic() - t0), out)
     pid = spawn_detached(persona_dir, idle, client_origin, log_path)
     try:
         return _await_readiness(persona_dir, pid, log_path, out)
@@ -364,15 +859,87 @@ def cmd_start(args, *, out: dict | None = None) -> int:
         _spawned_children.pop(pid, None)
 
 
+# Readiness window: Windows cold-boot (persona load + soul review; before #456 also recovery) routinely exceeds 5s; the old 5s deadline
+# killed a healthy-but-slow bridge. (Bug 2b, v0.0.36.)
+# The wait can outlast it: a service run rebuilds (the rebuild child, S107) before it becomes the bridge, and ``cmd_start``'s wait
+# after ``_start_service`` and ``cmd_restart``'s exit-2 wait are waits on such a run (the direct spawn shares the one helper, P1).
+# The budget therefore pauses while an engine progress record names a live writer (``_ReadinessBudget``); with no record it is
+# this plain 50 s. The Rust caller's wait for ``nell supervisor start`` (lib.rs ``wait_for_start``) pauses on the same record.
+_READINESS_BUDGET_S = 50.0
+
+
+class _ReadinessBudget:
+    """A readiness wait's deadline, paused while an engine progress record names a live writer (Engine 6, HR5 part 4).
+
+    ``expired()`` is asked once per 0.1 s poll. It reads the record through ``engine_files.read_engine_progress`` (liveness
+    by ``holder_alive``; the reader never raises, and a missing or unreadable record counts as absent for that poll). A poll
+    that finds a record pushes the deadline out by the time since the previous poll, so the clock stands still while the
+    record shows; time before the record appears, and after it is gone, counts as ordinary budget. With no record ever it is
+    exactly ``start + budget_s``.
+    """
+
+    def __init__(self, persona_dir: Path, budget_s: float) -> None:
+        self._persona_dir = persona_dir
+        self._last = time.time()
+        self._deadline = self._last + max(0.0, budget_s)
+
+    def expired(self) -> bool:
+        from brain.emotion import engine_files
+
+        now = time.time()
+        if engine_files.read_engine_progress(self._persona_dir) is not None:
+            self._deadline += now - self._last
+        self._last = now
+        return now >= self._deadline
+
+
+def _service_installed(persona: str) -> bool:
+    from brain.bridge import kill
+
+    return kill.service_installed(persona)
+
+
+def _start_service(persona: str) -> subprocess.CompletedProcess[str] | None:
+    """The manager's start call; its result carries the manager's return code and message."""
+    from brain.service import current_backend
+
+    return current_backend().start_service(persona=persona)
+
+
+def _await_service_readiness(persona_dir: Path, budget_s: float, out: dict | None) -> int:
+    """Readiness of a bridge the service manager started (#456 D20): a record of a live bridge (by its token) whose
+    /health answers, within what is left of the 50 s budget (which pauses while a rebuild's progress record shows)."""
+    budget = _ReadinessBudget(persona_dir, budget_s)
+    while not budget.expired():
+        time.sleep(0.1)
+        s = state_file.read(persona_dir)
+        if s is None or not s.port or state_file.bridge_liveness(s, persona_dir) != state_file.ALIVE:
+            continue
+        try:
+            headers = {"Authorization": f"Bearer {s.auth_token}"} if s.auth_token else {}
+            r = httpx.get(
+                f"http://127.0.0.1:{s.port}/health",
+                headers=headers,
+                timeout=1.0,
+                trust_env=False,  # never through a proxy (#475)
+            )
+        except httpx.HTTPError:
+            continue
+        if r.status_code == 200:
+            print(f"bridge started by the service on port {s.port} (pid {s.pid})")
+            if out is not None:
+                out["readiness"] = BridgeReadiness(pid=s.pid, port=s.port, auth_token=s.auth_token)
+            return 0
+    print("the service did not bring the bridge up in time; see `nell service status`", file=sys.stderr)
+    return 1
+
+
 def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | None) -> int:
     """cmd_start's readiness wait for the child it just spawned (see cmd_start)."""
     proc = _spawned_children.get(pid)
 
-    # Readiness window: Windows cold-boot (recovery + persona load + soul review)
-    # routinely exceeds 5s; the old 5s deadline killed a healthy-but-slow bridge.
-    # 50s stays inside the Rust caller's 60s outer timeout. (Bug 2b, v0.0.36.)
-    deadline = time.time() + 50.0
-    while time.time() < deadline:
+    budget = _ReadinessBudget(persona_dir, _READINESS_BUDGET_S)
+    while not budget.expired():
         time.sleep(0.1)
         s = state_file.read(persona_dir)
         if s is not None and s.pid == pid and s.port:
@@ -382,6 +949,7 @@ def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | No
                     f"http://127.0.0.1:{s.port}/health",
                     headers=headers,
                     timeout=1.0,
+                    trust_env=False,  # the loopback bridge is never reached through a proxy (#475)
                 )
                 if r.status_code == 200:
                     print(f"bridge started on port {s.port} (pid {pid})")
@@ -416,11 +984,21 @@ def _await_readiness(persona_dir: Path, pid: int, log_path: Path, out: dict | No
     # Readiness failed — kill the orphan child and tell the user where to look.
     _kill_if_alive(pid, signal.SIGTERM)  # already-dead is fine either way
     print(
-        f"bridge spawned (pid {pid}) but /health did not respond in 50s — "
+        f"bridge spawned (pid {pid}) but /health did not respond within its readiness budget (50s, not counting a rebuild in progress) — "
         f"killed orphan child. Inspect log at {log_path}",
         file=sys.stderr,
     )
     return 1
+
+
+def _ended_on_a_plain_stop(st: state_file.BridgeState | None) -> bool:
+    """The record says its bridge ended on a plain ``nell supervisor stop`` (user_stop): a person asked for no bridge.
+    Not a restart's stop (app_restart; manual_restart, which ``nell supervisor restart`` records) nor a hard exit
+    (it may end a restart): a start follows those, and a queued service run that skipped would leave the restart's
+    own start facing a held lock or an exiting service job, so no bridge (maintainer's Q1). Not an idle stop (nobody
+    asked for anything), not an OS signal (it cannot tell a user's kill from a logout or a service manager's stop),
+    not a crash. A kill is the respawn guard's (D25), not this."""
+    return st is not None and st.phase != "running" and st.stop_reason == REASON_USER_STOP
 
 
 def cmd_run(args) -> int:
@@ -428,8 +1006,19 @@ def cmd_run(args) -> int:
 
     Unlike ``cmd_start``, this does not fork or detach. The current process is
     the bridge process until uvicorn exits, which is exactly what launchd wants
-    to supervise. A per-persona lock is held for the lifetime of the process so
-    parallel starts fail cleanly and stale locks can be recovered by pid.
+    to supervise. A per-persona lock is held for the lifetime of the process; a
+    run that finds it held waits for it (D4). A service run that waited for a
+    running bridge does not start when that bridge ended on a plain ``nell
+    supervisor stop`` (see ``_ended_on_a_plain_stop``); after a restart's
+    stop, a hard exit, an idle stop, an OS signal or a crash it starts.
+
+    A service run that follows starts which never proved themselves first waits out the next step of the start
+    back-off (``start_backoff``, D26), before the lock and without holding anything; a start it makes is noted under
+    the lock, right before the bridge runs.
+
+    With the lock held and the guard checks passed, a run for a persona that needs the rebuild runs it first
+    (``_rebuild_under_lock``, S107); a step that fails returns its code, and a step that raises propagates, each noting a start
+    when guarded.
     """
     from brain.paths import get_persona_dir
 
@@ -438,18 +1027,92 @@ def cmd_run(args) -> int:
         print(f"persona directory not found: {persona_dir}", file=sys.stderr)
         return 1
 
-    if state_file.is_running(persona_dir):
-        cur = state_file.read(persona_dir)
-        print(f"bridge already running on port {cur.port} (pid {cur.pid})", file=sys.stderr)
-        return 2
+    client_origin = getattr(args, "client_origin", "cli")
+    guarded = client_origin in respawn_guard.SERVICE_ORIGINS
+    # #456 (D25): a service respawn after a user kill of this boot does not start (checked before the lock and again
+    # right after acquiring it). An app / CLI run never applies the guard.
+    if guarded and respawn_guard.guard_fires(persona_dir):
+        print("not starting: stopped on request", file=sys.stderr)
+        logger.info("not starting: stopped on request (user kill of this boot)")
+        return 0
+    if guarded:
+        # D26: spaced restarts of a bridge that keeps failing to start. Before the lock (nothing held, no watcher file
+        # written, so every other command sees no bridge and no starter) and interruptible: an explicit start deletes
+        # the record, a user kill fires the guard. SIGTERM and Task Scheduler's end act at once (no handler yet).
+        # The wait's log lines reach the runtime log through a handler that keeps no file open (a run that waits or is
+        # queued must not block the running bridge's log rotation); the persistent handler comes after the lock.
+        try:
+            with _runtime_log(persona_dir):
+                go_on = start_backoff.wait_before_start(
+                    persona_dir, interrupted=lambda: respawn_guard.guard_fires(persona_dir)
+                )
+        except KeyboardInterrupt:
+            return 0
+        if not go_on:
+            print("not starting: stopped on request", file=sys.stderr)
+            logger.info("not starting: stopped on request (user kill of this boot)")
+            return 0
 
+    # D4 (#177 S3): an OS service must not exit 2 here (systemd / launchd / Task Scheduler read it as a failure and
+    # respawn forever). Whether a live bridge or a starter holds the lock, wait for it, then run.
     fd = acquire_lock(persona_dir)
+    waited_for_a_bridge = False
     if fd is None:
-        print("bridge already starting (lockfile held)", file=sys.stderr)
-        return 2
+        cur = state_file.read(persona_dir)
+        if cur is not None and state_file.bridge_liveness(cur, persona_dir) == state_file.ALIVE:
+            waited_for_a_bridge = True
+            print(f"waiting for the running bridge (pid {cur.pid}) to exit", file=sys.stderr)
+        else:
+            print("waiting for the bridge lock (another start is in progress)", file=sys.stderr)
+        fd = acquire_lock(persona_dir, blocking=True)
+        if fd is None:
+            print("bridge lock unavailable", file=sys.stderr)
+            return 1
 
     try:
-        client_origin = getattr(args, "client_origin", "cli")
+        if guarded:
+            # The persistent runtime log, now that the lock is held (so the unit refresh below logs to it too;
+            # run_bridge_foreground sets it up again later and adds nothing).
+            from brain.bridge import runner
+
+            runner._setup_runtime_logging(persona_dir)  # noqa: SLF001 - shared with run_bridge_foreground
+        if guarded and respawn_guard.guard_fires(persona_dir):
+            # Re-checked under the lock, BEFORE run_bridge_foreground deletes the watcher files (S6-a, S7-g).
+            print("not starting: stopped on request", file=sys.stderr)
+            logger.info("not starting: stopped on request (user kill of this boot)")
+            return 0
+        if guarded and waited_for_a_bridge and _ended_on_a_plain_stop(state_file.read(persona_dir)):
+            # Pre-merge review O-2: a service run queued behind a running bridge does not undo a plain `nell
+            # supervisor stop` (exit 0: success to every service manager, so nothing restarts it).
+            print("not starting: the running bridge was stopped on request", file=sys.stderr)
+            logger.info("not starting: the bridge this run waited for was stopped on request")
+            return 0
+        if _rebuild_needed(persona_dir, False):
+            # The rebuild step (S107, HS6 (b)), the one a service start makes because it does not pass through cmd_start. A failed
+            # step counts as a start the back-off must see: start_backoff counts only noted starts, and without this systemd's
+            # RestartSec=2 would trip its start limit on a step that fails at once. The lock is released by the finally below.
+            try:
+                step_rc = _rebuild_under_lock(persona_dir)
+            except Exception:
+                # An exception out of the step (only an unforeseen bug raises; every expected failure is a returned code) is a failed
+                # start for the back-off too. A note that itself fails is logged and never hides the step's exception.
+                if guarded:
+                    try:
+                        start_backoff.note_start(persona_dir)
+                    except Exception:  # noqa: BLE001
+                        logger.warning("could not note the failed start for the back-off", exc_info=True)
+                raise
+            if step_rc is not None:
+                if guarded:
+                    start_backoff.note_start(persona_dir)
+                return step_rc
+        if client_origin == "systemd":
+            try:
+                from brain.service.systemd import refresh_installed_unit
+
+                refresh_installed_unit(args.persona)
+            except Exception:  # noqa: BLE001 - best effort; the unit keeps working without the line
+                logger.warning("systemd unit refresh failed", exc_info=True)
         if client_origin == "launchd":
             try:
                 from brain.service.launchd import truncate_launchd_logs_if_large
@@ -458,14 +1121,11 @@ def cmd_run(args) -> int:
             except Exception:
                 logger.debug("launchd log truncation skipped", exc_info=True)
 
-        drained = run_recovery_if_needed(persona_dir)
-        if drained is not None:
-            if drained > 0:
-                print(f"recovered from interrupted shutdown - snapshotted {drained} active sessions")
-            else:
-                print("recovered from dirty shutdown (no orphan sessions to drain)")
-
+        # #456 (D12): no synchronous recovery; the first idle pass saves the sessions (see cmd_start).
         from brain.bridge.runner import run_bridge_foreground
+
+        if guarded:
+            start_backoff.note_start(persona_dir)  # D26: stays until a recorded stop; SuccessWatch restarts the ladder
 
         idle = float(args.idle_shutdown) * 60 if args.idle_shutdown > 0 else None
         return run_bridge_foreground(
@@ -477,60 +1137,257 @@ def cmd_run(args) -> int:
         release_lock(persona_dir, fd)
 
 
-def _request_shutdown_via_http(s: state_file.BridgeState, *, timeout: float = 3.0) -> None:
+def _request_shutdown_via_http(
+    s: state_file.BridgeState, *, timeout: float = 3.0, reason: str | None = None
+) -> httpx.Response:
+    """POST /supervisor/shutdown. Returns the response (202 = the stop began; 503 ``bridge_stopping`` = it had begun
+    already); raises on a transport failure (the listener closes once a stop is under way)."""
     if s.port is None:
         raise RuntimeError("bridge state missing port")
     headers = {"Authorization": f"Bearer {s.auth_token}"} if s.auth_token else {}
-    r = httpx.post(
+    return httpx.post(
         f"http://127.0.0.1:{s.port}/supervisor/shutdown",
         headers=headers,
+        json={"reason": reason} if reason else None,
         timeout=timeout,
+        trust_env=False,  # never through a proxy (#475)
     )
-    r.raise_for_status()
 
 
-def cmd_stop(args) -> int:
+# A pre-PR bridge (no identity token, proven by its command line) gets the old request and this long to go before the
+# kill helper ends it with its tree (D22). The value is the app's existing request budget before its kill
+# (TIMEOUT_SHUTDOWN_MS, app/src/hooks/useRestartBridge.ts), so a pre-PR bridge is treated exactly as the app treats it.
+_PRE_PR_REQUEST_BUDGET_S = 3.0
+
+
+def _stop_began(s: state_file.BridgeState, persona_dir: Path, response: httpx.Response | None) -> bool:
+    from brain import process_identity
+    from brain.bridge import shutdown_progress
+
+    if response is not None:
+        if response.status_code == 202:
+            return True
+        try:
+            if response.status_code == 503 and response.json().get("code") == "bridge_stopping":
+                return True
+        except ValueError:
+            pass
+    rec = shutdown_progress.read_record(persona_dir, shutdown_progress.PROGRESS_FILENAME)
+    if process_identity.names_this_bridge(rec, s.pid, s.pid_token):
+        return True
+    cur = state_file.read(persona_dir)
+    return bool(cur is not None and cur.pid == s.pid and cur.phase == "stopping")
+
+
+def _print_kill_result(result) -> int:  # noqa: ANN001
+    print(result.message)
+    return 0 if result.succeeded else 1
+
+
+def cmd_stop(args, *, reason: str | None = REASON_USER_STOP, kill_pre_pr: bool = True) -> int:
+    """`nell supervisor stop` (#456 Q-A, D16, D22): ask the bridge to stop, then watch until it is gone.
+
+    ``reason`` is what the stop request tells the bridge to record: ``"user_stop"`` for a plain stop, ``None`` for a
+    restart's stop (recorded as ``manual_restart``). ``kill_pre_pr`` False (the start's stop before a rebuild, S110: no
+    automatic hard kill) leaves a pre-PR bridge that does not stop in time running: the stop reports it and returns 1
+    instead of calling the kill helper; stop and restart keep the default (True).
+
+    ``--kill``: the kill helper (a bridge run by an OS service first gets the hard-exit request and up to
+    ``--timeout`` to go, then its service manager's stop; any other bridge is killed at once). A kill that leaves a
+    process running exits 1 (``KillResult.succeeded``). A pre-PR bridge (no identity token): the old request, then
+    the kill helper after a few seconds. A stale record: "not running". If the request fails and no stop is recorded:
+    POSIX sends SIGTERM when the identity holds; Windows refuses unless ``--force`` (then the kill helper).
+    """
+    from brain.bridge import kill as kill_mod
+    from brain.bridge import stop_watch
     from brain.paths import get_persona_dir
 
     persona_dir = get_persona_dir(args.persona)
+    timeout = float(getattr(args, "timeout", stop_watch.HARD_EXIT_OFFER_AFTER_S))
     s = state_file.read(persona_dir)
-    if s is None or s.pid is None or not state_file.pid_is_alive(s.pid):
+    if s is None or s.pid is None:
         print("bridge not running")
         return 0
+    live = state_file.bridge_liveness(s, persona_dir)
+    if live == state_file.GONE:
+        # A stale record (dead pid, a reused pid, or a pre-PR pid that is not a bridge for this persona): never signal.
+        print("bridge not running (stale record)")
+        _clear_stale_record(persona_dir, s)
+        return 0
+    if getattr(args, "kill", False):
+        if live != state_file.ALIVE:
+            print("bridge identity could not be confirmed; not killing", file=sys.stderr)
+            return 1
+        return _print_kill_result(
+            kill_mod.kill_bridge(
+                persona_dir,
+                timeout=timeout,
+                skip_hard_exit_request=bool(getattr(args, "skip_hard_exit_request", False)),
+                expect_pid=getattr(args, "expect_pid", None),
+                expect_token=getattr(args, "expect_token", None),
+            )
+        )
+    if state_file.is_legacy(s):
+        return _stop_pre_pr(persona_dir, s, timeout, kill_pre_pr=kill_pre_pr)
+
+    response = None
     try:
-        _request_shutdown_via_http(s)
-    except Exception as exc:
+        response = _request_shutdown_via_http(s, reason=reason)
+    except Exception as exc:  # noqa: BLE001 - a closed listener: the stop may have begun already (attach)
+        failure = exc
+    else:
+        failure = None
+    if not _stop_began(s, persona_dir, response):
+        if live != state_file.ALIVE:
+            print(f"bridge identity could not be confirmed; not signalling pid {s.pid}: {failure}", file=sys.stderr)
+            return 1
         if os.name == "nt":
             if getattr(args, "force", False):
-                print(
-                    "WARNING: forcing Windows termination; Python cleanup will NOT run. "
-                    "Recovery will snapshot active sessions non-destructively on next start.",
-                    file=sys.stderr,
-                )
-                if not _kill_if_alive(s.pid, signal.SIGTERM):  # TerminateProcess on Windows — explicit, logged, dirty by design
-                    print("bridge not running")
-                    return 0
-            else:
-                print(
-                    f"bridge shutdown endpoint unreachable; refusing Windows hard kill because it would bypass cleanup: {exc}\n"
-                    "If the bridge is wedged, re-run with --force to terminate it (recovery will snapshot sessions on next start).",
-                    file=sys.stderr,
-                )
-                return 1
-        else:
-            logger.warning("shutdown endpoint failed; falling back to SIGTERM on POSIX", exc_info=True)
-            if not _kill_if_alive(s.pid, signal.SIGTERM):
-                print("bridge not running")
-                return 0
-
-    deadline = time.time() + args.timeout
-    while time.time() < deadline:
-        time.sleep(0.2)
-        if not state_file.pid_is_alive(s.pid):
-            print(f"bridge stopped (was pid {s.pid})")
+                print("WARNING: forcing termination of a bridge that does not answer.", file=sys.stderr)
+                return _print_kill_result(kill_mod.kill_bridge(persona_dir, timeout=timeout))
+            print(
+                f"bridge shutdown endpoint unreachable; not killing it: {failure}\n"
+                "If the bridge is wedged, re-run with --force (or --kill) to end it.",
+                file=sys.stderr,
+            )
+            return 1
+        logger.warning("shutdown endpoint failed; falling back to SIGTERM on POSIX: %s", failure)
+        if not _kill_if_alive(s.pid, signal.SIGTERM):
+            print("bridge not running")
             return 0
-    print(f"bridge did not stop within {args.timeout}s", file=sys.stderr)
-    return 1
+    return stop_watch.watch_stop(
+        persona_dir,
+        pid=s.pid,
+        token=s.pid_token,
+        timeout=timeout,
+        interactive=stop_watch._interactive(),
+        now=stop_watch._clock.now,
+        sleep=stop_watch._clock.sleep,
+        prompt=stop_watch._prompt,
+    )
+
+
+def _stop_pre_pr(persona_dir: Path, s: state_file.BridgeState, timeout: float, *, kill_pre_pr: bool = True) -> int:
+    """A proven pre-PR bridge (D22): the old request (skipped when its listener is closed), up to the app's budget,
+    then the kill helper (with its tree). No display, no offer. With ``kill_pre_pr`` False the kill helper is not called: a
+    bridge still running after the budget is reported and the result is 1."""
+    from brain.bridge import kill as kill_mod
+
+    try:
+        _request_shutdown_via_http(s)
+    except Exception:  # noqa: BLE001 - listener already closed: go straight to the wait
+        pass
+    deadline = time.time() + _PRE_PR_REQUEST_BUDGET_S
+    while time.time() < deadline:
+        if state_file.bridge_liveness(s, persona_dir) == state_file.GONE:
+            break
+        time.sleep(0.2)
+    if state_file.bridge_liveness(s, persona_dir) == state_file.ALIVE:
+        if not kill_pre_pr:
+            print("The previous version of the bridge did not stop.", file=sys.stderr)
+            return 1
+        result = kill_mod.kill_bridge(persona_dir, timeout=timeout)
+        if not result.succeeded:
+            print(result.message, file=sys.stderr)
+            return 1
+    print("Stopped the previous version of the bridge. The next start will pick up anything left unfinished.")
+    return 0
+
+
+def _stop_before_service_change(persona: str, timeout: float) -> bool:
+    """Stop a running bridge before a service uninstall / install (C54, C58 d): the shutdown request and the watcher.
+    True once it has stopped; False when it is still stopping (no terminal, after ``timeout``)."""
+    rc = cmd_stop(SimpleNamespace(persona=persona, timeout=timeout, force=False, kill=False,
+                                  skip_hard_exit_request=False))
+    from brain.paths import get_persona_dir
+
+    return rc == 0 and state_file.liveness(get_persona_dir(persona)) != state_file.ALIVE
+
+
+def _clear_stale_record(persona_dir: Path, s: state_file.BridgeState) -> None:
+    """Clear a stale record's pid/port, only while holding the bridge lock (so no bridge is running or starting)."""
+    fd = acquire_lock(persona_dir)
+    if fd is None:
+        return
+    try:
+        cur = state_file.read(persona_dir)
+        if cur is not None and cur.pid == s.pid:
+            cur.pid = None
+            cur.port = None
+            state_file.write(persona_dir, cur)
+    except Exception:  # noqa: BLE001 - best effort; the record stays stale, which readers already handle
+        logger.warning("could not clear the stale bridge record", exc_info=True)
+    finally:
+        release_lock(persona_dir, fd)
+
+
+def status_dict(persona_dir: Path) -> dict:
+    """The machine-readable bridge status (`nell supervisor status --json`): files and process checks only."""
+    from brain.emotion import engine_files
+
+    s = state_file.read(persona_dir)
+    live = state_file.bridge_liveness(s, persona_dir) if s is not None else state_file.GONE
+    proven = bool(
+        s is not None
+        and s.pid is not None
+        and not s.pid_token
+        and state_file.prove_bridge_cmdline(s.pid, persona_dir, s.persona or persona_dir.name)
+    )
+    return {
+        "alive": live,
+        "legacy": state_file.is_legacy(s),
+        "proven": proven,
+        "pid": s.pid if s else None,
+        "pid_token": s.pid_token if s else None,
+        "identity": s.identity if s else None,
+        "phase": s.phase if s else None,
+        "stop_reason": s.stop_reason if s else None,
+        "stop_requested_at": s.stop_requested_at if s else None,
+        "client_origin": s.client_origin if s else None,
+        "recovery_needed": state_file.recovery_needed(persona_dir),
+        # #456 (plan I9, S7-g, C48): the stop intent with its state, what is still running in a stop of THIS bridge,
+        # the service install state, the supervisor's state and the kill helper's stated bound.
+        "stop_intent": _status_intent(persona_dir),
+        "remaining": _status_remaining(persona_dir, s),
+        # HR5 of #633 (owner S101, S102): the start-up step in progress (the x10 fix or the first rebuild), only while the process
+        # that writes it is alive; None otherwise. Written by `brain.emotion.engine_files.EngineProgress`.
+        "engine_progress": engine_files.read_engine_progress(persona_dir),
+        "service_installed": _status_service_installed(s.persona if s and s.persona else persona_dir.name),
+        "supervisor": s.supervisor if s else None,
+        "kill_bound_s": _kill_bound(),
+    }
+
+
+def _status_intent(persona_dir: Path) -> dict | None:
+    from brain.bridge import kill
+
+    return kill.read_intent(persona_dir)
+
+
+def _status_remaining(persona_dir: Path, s: state_file.BridgeState | None) -> dict | None:
+    from brain import process_identity
+    from brain.bridge import shutdown_progress
+
+    rec = shutdown_progress.read_record(persona_dir, shutdown_progress.PROGRESS_FILENAME)
+    if s is None or not process_identity.names_this_bridge(rec, s.pid, s.pid_token):
+        return None
+    return {"count": rec.get("count"), "tasks": rec.get("tasks"), "phase": rec.get("phase"),
+            "requested_at": rec.get("requested_at"), "reason": rec.get("reason"), "updated_at": rec.get("updated_at")}
+
+
+def _status_service_installed(persona: str) -> bool:
+    from brain.bridge import kill
+
+    try:
+        return kill.service_installed(persona)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _kill_bound() -> float:
+    from brain.bridge import kill
+
+    return kill.kill_bound_s()
 
 
 def cmd_status(args) -> int:
@@ -548,6 +1405,7 @@ def cmd_status(args) -> int:
                 f"http://127.0.0.1:{s.port}/health",
                 headers=headers,
                 timeout=1.0,
+                trust_env=False,  # never through a proxy (#475)
             )
             health = r.json()
             print(f"bridge: running pid={s.pid} port={s.port}")
@@ -559,7 +1417,8 @@ def cmd_status(args) -> int:
             print(f"bridge: pid {s.pid} alive but /health unreachable: {e}", file=sys.stderr)
             return 1
     elif state_file.recovery_needed(persona_dir):
-        print(f"bridge: previous process crashed dirty (pid {s.pid}) — next start will recover")
+        pid_note = f" (pid {s.pid})" if s.pid is not None else ""
+        print(f"bridge: previous process crashed dirty{pid_note}. The next start will recover.")
     else:
         print(f"bridge: stopped cleanly at {s.stopped_at}")
     return 0
@@ -574,8 +1433,7 @@ def cmd_tail(args) -> int:
     config with auth enabled, and (b) leaks the bearer token through
     process listings and proxy logs.
     """
-    from websockets.sync.client import connect
-
+    from brain.bridge.loopback import direct_ws_connect as connect  # never through a proxy (#475)
     from brain.paths import get_persona_dir
 
     persona_dir = get_persona_dir(args.persona)
@@ -595,28 +1453,28 @@ def cmd_tail(args) -> int:
 
 
 def cmd_restart(args) -> int:
-    """Stop the bridge, then start it again. Two-phase, gated on stop success.
+    """Stop the bridge, then start it again, only after the old bridge is gone (#456 C16 h).
 
-    `cmd_stop` uses an endpoint-first stop (POST /supervisor/shutdown) with
-    a POSIX SIGTERM fallback on non-Windows platforms. On Windows, if the
-    shutdown endpoint is unreachable, `--force` is required as an explicit
-    escape hatch (dirty termination via TerminateProcess; recovery will
-    snapshot active sessions non-destructively on next start).
-
-    `cmd_stop` collapses "no bridge was running" and "clean endpoint stop"
-    into exit code 0; it returns 1 only when the bridge could not be stopped
-    (endpoint unreachable on Windows without --force, or poll timeout). Restart
-    proceeds to start ONLY when stop returned 0 — never over a wedged bridge.
-    Restart's exit code is whatever `cmd_start` returned (0/1/2) on the
-    success path, or stop's exit code on the bail path.
+    ``cmd_stop`` returns 0 only once the old bridge (its pid + token) is gone, or when none was running; restart then
+    starts. Any other result (still stopping without a terminal, a refused stop) aborts the restart with that code. A
+    start that finds another one already under way (exit 2) waits for that bridge to answer.
     """
     print("stopping bridge...")
-    stop_rc = cmd_stop(args)
+    # No reason: the bridge records "manual_restart", so a service run queued behind it starts (see
+    # _ended_on_a_plain_stop); a plain stop records "user_stop".
+    stop_rc = cmd_stop(args, reason=None)
     if stop_rc != 0:
         print(f"restart aborted: stop failed (exit {stop_rc})", file=sys.stderr)
         return stop_rc
     print("starting bridge...")
-    return cmd_start(args)
+    rc = cmd_start(args)
+    if rc == 2:
+        # A start is already under way: a service run queued behind the old bridge woke at its death and holds the
+        # lock, so its bridge is coming up. Wait for that bridge, as the app does (exit 2 is its "start under way").
+        from brain.paths import get_persona_dir
+
+        return _await_service_readiness(get_persona_dir(args.persona), _READINESS_BUDGET_S, None)
+    return rc
 
 
 # Test seam: setting this Event from a test allows the follow-mode loop
@@ -627,21 +1485,22 @@ _follow_should_stop: threading.Event | None = None
 
 
 def cmd_tail_log(args) -> int:
-    """Print the last N lines of the bridge log; -f to follow.
+    """Print the last N lines of the runtime log; -f to follow.
 
     Cross-platform: pure Python loop, no shell `tail` (Windows CI lacks it).
     Follow mode polls every 200ms. KeyboardInterrupt is treated as a clean
     exit (returns 0). Tests can interrupt the loop by setting the module-level
     `_follow_should_stop` Event before the call.
     """
-    from brain.paths import get_log_dir, get_persona_dir
+    from brain.paths import get_persona_dir, runtime_log_path
 
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         print(f"persona directory not found: {persona_dir}", file=sys.stderr)
         return 1
 
-    log_path = get_log_dir() / f"bridge-{persona_dir.name}.log"
+    # The runtime log, where logging goes (#558); bridge-<persona>.log only has the child's raw stdout/stderr.
+    log_path = runtime_log_path(persona_dir.name)
     if not log_path.exists():
         print(
             f"bridge log not found at {log_path} — has the supervisor ever started?",
@@ -660,19 +1519,33 @@ def cmd_tail_log(args) -> int:
                     print(line, end="")
             if not getattr(args, "follow", False):
                 return 0
-            # Follow mode: seek to end, poll for new content
-            f.seek(0, 2)  # SEEK_END
-            stop = _follow_should_stop or threading.Event()
-            try:
-                while not stop.is_set():
-                    chunk = f.read()
-                    if chunk:
-                        print(chunk, end="")
-                    else:
-                        time.sleep(0.2)
-            except KeyboardInterrupt:
-                return 0
+            st = os.fstat(f.fileno())
+        # Follow mode polls by path and never holds the file open between polls: the runtime log rolls over by
+        # rename (RotatingFileHandler), so a kept handle would go on reading the renamed file, and on Windows it
+        # would make that rename fail.
+        ident, pos = st.st_ino, st.st_size
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        stop = _follow_should_stop or threading.Event()
+        try:
+            while not stop.is_set():
+                try:
+                    st = log_path.stat()
+                except FileNotFoundError:  # between the rename and the new file
+                    st = None
+                if st is not None and (st.st_ino != ident or st.st_size < pos):  # rolled over or truncated
+                    ident, pos = st.st_ino, 0
+                    decoder.reset()
+                if st is not None and st.st_size > pos:
+                    with log_path.open("rb") as fb:
+                        fb.seek(pos)
+                        chunk = fb.read()
+                    pos += len(chunk)
+                    print(decoder.decode(chunk), end="")
+                else:
+                    time.sleep(0.2)
+        except KeyboardInterrupt:
             return 0
+        return 0
     except OSError as e:
         print(f"error reading {log_path}: {e}", file=sys.stderr)
         return 1

@@ -68,15 +68,17 @@ def test_format_transcript_joins_turns_as_speaker_colon_text() -> None:
     assert result == "Hana: hello there\nNell: hey love"
 
 
-def test_format_transcript_caps_long_transcript_keeps_tail() -> None:
-    """format_transcript caps at max_tokens*4 chars and keeps the tail (recent context)."""
-    # Create a transcript that exceeds the cap.
-    long_text = "x" * 100
-    turns = [{"speaker": "A", "text": long_text} for _ in range(10)]
-    result = format_transcript(turns, max_tokens=50)  # cap = 200 chars
-    assert len(result) <= 200
-    # The tail should end with the last turn.
-    assert result.endswith(f"A: {long_text}"[:200]) or result.endswith(long_text[-10:])
+def test_format_transcript_keeps_every_turn_no_cap() -> None:
+    """#523: format_transcript formats only; it never cuts (the chunker bounds each call's size, ingest_utils.chunk_turns).
+    The old tail cut dropped the head of a long span and left a fragment with no speaker label at the start."""
+    import inspect
+
+    turns = [{"speaker": "A", "text": f"row{i} " + "x" * 100} for i in range(400)]
+    result = format_transcript(turns)
+    assert result.startswith("A: row0 ")
+    assert result.count("\n") == 399
+    assert len(result) > 24_000
+    assert "max_tokens" not in inspect.signature(format_transcript).parameters
 
 
 # ---------------------------------------------------------------------------

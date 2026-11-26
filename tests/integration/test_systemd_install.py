@@ -20,7 +20,17 @@ When the test runs it verifies:
      (#160).
 
 Teardown via ``nell service uninstall --persona ci_test`` runs in a
-``try/finally`` so a mid-test assertion failure still cleans up.
+``try/finally`` so a mid-test assertion failure still cleans up. A KILLED run skips that
+``finally`` (#454), and the unit it leaves behind is enabled and restarts every two seconds, so
+the whole module also runs inside ``systemd_cleanup.unit_guard``: a sweep of any leftover at the
+start, a fail-safe systemd timer that removes the unit after a delay even if this process is
+killed, and the same sweep again at the end.
+
+NEVER run this module against a machine whose real user units matter without that guard: it
+installs a real unit under ``~/.config/systemd/user``. It therefore runs only on GitHub Actions
+(``GITHUB_ACTIONS=true``) or when you opt in with ``KINDLED_ALLOW_REAL_SERVICE_INSTALL=1``; anywhere
+else every test here skips before the sweep, the fail-safe or the install. When you do opt in, check
+``systemctl --user list-units 'companion-emergence-*'`` before and after.
 """
 
 from __future__ import annotations
@@ -33,11 +43,35 @@ from pathlib import Path
 
 import pytest
 
-# The entire module is Linux-only.
-pytestmark = pytest.mark.skipif(
-    sys.platform != "linux",
-    reason="systemd integration test is Linux-only",
+from tests.integration.systemd_cleanup import (
+    FailsafeNotArmedError,
+    real_install_blocked_reason,
+    unit_guard,
 )
+
+# The entire module is Linux-only.
+# One fixed unit name in the one real user manager: run on one xdist worker (--dist loadgroup).
+pytestmark = [
+    pytest.mark.skipif(sys.platform != "linux", reason="systemd integration test is Linux-only"),
+    pytest.mark.xdist_group("systemd"),
+]
+
+
+@pytest.fixture(autouse=True)
+def _systemd_unit_guard():
+    """Opt-in gate, then sweep a leftover unit, arm the fail-safe timer, and always clean up (#454). Skipped hosts never reach the install."""
+    blocked = real_install_blocked_reason()
+    if blocked is not None:
+        pytest.skip(blocked)
+    if sys.platform != "linux" or not _systemd_user_available():
+        yield
+        return
+    try:
+        with unit_guard():
+            yield
+    except FailsafeNotArmedError as exc:
+        # raised before the body: nothing was installed. Without the fail-safe timer a killed run could leave a restarting unit.
+        pytest.skip(str(exc))
 
 
 def _systemd_user_available() -> bool:
@@ -89,7 +123,10 @@ def _poll_unit_property(
 def test_install_creates_unit_file_and_systemd_loads_it(tmp_path: Path) -> None:
     """Round-trip: install → assert unit file + systemd loaded it → uninstall."""
     if not _systemd_user_available():
-        pytest.skip("systemd --user not available on this host (expected in CI containers)")
+        pytest.skip(
+            "systemd --user not available on this host (expected in CI containers); "
+            "real-machine run tracked in docs/releases/cross-platform-validation.md"
+        )
 
     # KINDLED_HOME → data dir. The systemd backend writes unit files to
     # the real ~/.config/systemd/user/, not under KINDLED_HOME, so the

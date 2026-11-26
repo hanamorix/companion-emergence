@@ -18,7 +18,13 @@ import {
 } from "./appConfig";
 import { fetchHealth } from "./bridge";
 import { ensureBridgeCurrent } from "./bridgeVersionCheck";
-import { clearRestartState, restartBridge } from "./hooks/useRestartBridge";
+import {
+  awaitStoppingBridge,
+  clearRestartState,
+  endEngineProgress,
+  restartBridge,
+  showEngineProgress,
+} from "./hooks/useRestartBridge";
 import { errString } from "./lib/errString";
 
 export type UndoKind = BrainOverlayStatus["undo"];
@@ -171,7 +177,21 @@ async function ready(persona: string, notice: string | null): Promise<LaunchResu
 export async function launchBrain(persona: string): Promise<LaunchResult> {
   const quickP = quickStatus(); // runs alongside the start
   try {
-    await ensureBridgeRunning(persona);
+    // #456 (C17 h, l): a bridge still stopping (an idle stop with a long task, say) is waited for with the same
+    // display and hard-exit offer; a proven pre-PR bridge whose /health is closed is ended. Then the normal start.
+    try {
+      await awaitStoppingBridge(persona);
+    } finally {
+      clearRestartState();
+    }
+    // The start can include the engine's first rebuild: its progress is shown on the boot screen meanwhile (HR5).
+    let started = false;
+    try {
+      await ensureBridgeRunning(persona, showEngineProgress);
+      started = true;
+    } finally {
+      endEngineProgress(started); // a restart that joined the launch's hold is told how the start went
+    }
   } catch (e) {
     const error = errString(e) || "the bridge didn't start";
     const status = (await quickP) ?? (await patientStatus());

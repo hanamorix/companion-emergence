@@ -7,7 +7,7 @@
 // update available, error, download, and ready states.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, fireEvent, waitFor } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
 
 // ── mocks ──────────────────────────────────────────────────────────
@@ -24,7 +24,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("../../platform", () => ({
   getClientPlatform: vi.fn(() => "macos"),
   platformLabel: (platform: string) => platform === "macos" ? "macOS" : platform === "windows" ? "Windows" : platform === "linux" ? "Linux" : "this platform",
-  supportsMacOnlyInstallActions: (platform: string) => platform === "macos",
+  supportsNellCliShortcut: (platform: string) => platform === "macos" || platform === "linux" || platform === "windows",
   detectInstallShape: vi.fn(async () => "native"),
 }));
 
@@ -53,6 +53,7 @@ import type { PersonaState } from "../../bridge";
 import { getClientPlatform, detectInstallShape } from "../../platform";
 import type { Update } from "@tauri-apps/plugin-updater";
 import { invoke } from "@tauri-apps/api/core";
+import * as restartModule from "../../hooks/useRestartBridge";
 import { getVersion } from "@tauri-apps/api/app";
 
 function baseState(overrides: Partial<PersonaState> = {}): PersonaState {
@@ -125,6 +126,57 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     expect(banner.textContent).toMatch(/provider unreachable/i);
   });
 
+  it("(#456 C25) says the background work restarted, with the error", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({
+          supervisor: {
+            state: "restarted",
+            restarts: 1,
+            last_error: "RuntimeError: tick failed",
+            last_error_at: "2026-10-19T12:00:00+00:00",
+          },
+        })}
+        persona="test"
+      />,
+    );
+    const banner = screen.getByRole("alert");
+    expect(banner.textContent).toMatch(/background work restarted/i);
+    expect(banner.textContent).toMatch(/RuntimeError: tick failed/);
+  });
+
+  it("(#456 C25) says the background work stopped after repeated errors, chat still works", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({
+          supervisor: {
+            state: "failed",
+            restarts: 1,
+            last_error: "RuntimeError: again",
+            last_error_at: "2026-10-19T12:00:00+00:00",
+          },
+        })}
+        persona="test"
+      />,
+    );
+    const banner = screen.getByRole("alert");
+    expect(banner.textContent).toMatch(/background work stopped/i);
+    expect(banner.textContent).toMatch(/chat still works/i);
+    expect(banner.textContent).toMatch(/RuntimeError: again/);
+  });
+
+  it("(#456 C25) shows no banner while the background work runs normally", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({
+          supervisor: { state: "running", restarts: 0, last_error: null, last_error_at: null },
+        })}
+        persona="test"
+      />,
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("surfaces stateError even when mode is live", () => {
     render(
       <ConnectionPanel
@@ -145,7 +197,7 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows the Task Scheduler supervisor button (not launchd) and a calm Terminal unsupported note on Windows", () => {
+  it("shows the Task Scheduler supervisor button (not launchd) and the nell shortcut button on Windows", () => {
     vi.mocked(getClientPlatform).mockReturnValue("windows");
     render(<ConnectionPanel state={baseState()} persona="test" />);
 
@@ -153,9 +205,10 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     // but the Windows supervisor button IS present.
     expect(screen.queryByRole("button", { name: /install launchd supervisor/i })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /install Task Scheduler supervisor/i })).toBeInTheDocument();
-    // Terminal shortcut installer is still macOS-only.
-    expect(screen.queryByRole("button", { name: /install nell to/i })).not.toBeInTheDocument();
+    // The Terminal shortcut now exists on Windows too (#408).
+    expect(screen.getByRole("button", { name: /install nell to your PATH/i })).toBeInTheDocument();
     expect(screen.queryByText(/macOS-only right now/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/No action needed for normal app use/i)).not.toBeInTheDocument();
   });
 
   it("shows calm unsupported notes instead of macOS install buttons on Linux (supervisor now supported on Linux — this test updated in Phase 3.2)", () => {
@@ -166,6 +219,10 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     expect(screen.queryByRole("button", { name: /install launchd supervisor/i })).not.toBeInTheDocument();
     // But the systemd button IS present
     expect(screen.getByRole("button", { name: /install systemd supervisor/i })).toBeInTheDocument();
+    // And so is the nell shortcut button, enabled (#408)
+    const cli = screen.getByRole("button", { name: /install nell to ~\/\.local\/bin/i });
+    expect(cli).toBeEnabled();
+    expect(screen.queryByText(/No action needed for normal app use/i)).not.toBeInTheDocument();
   });
 
   it("renders the privacy row marked accent (local-only)", () => {
@@ -182,13 +239,14 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
       <ConnectionPanel state={baseState({ mode: "bridge_down" })} persona="test" />,
     );
     const banner = screen.getByRole("alert");
-    expect(banner).toHaveTextContent(/end conversation and restart/i);
+    // #456 (Q-A): the button's idle label is now "Restart the brain" (no session is ended by a restart).
+    expect(banner).toHaveTextContent(/restart the brain/i);
   });
 
   it("does not render RestartBridgeButton when mode is healthy", () => {
     render(<ConnectionPanel state={baseState()} persona="test" />);
     expect(
-      screen.queryByText(/end conversation and restart/i),
+      screen.queryByRole("button", { name: /restart the brain/i }),
     ).not.toBeInTheDocument();
   });
 
@@ -202,7 +260,7 @@ describe("ConnectionPanel — StatusBanner (P3-6 + P4-2)", () => {
     const banner = screen.getByRole("alert");
     expect(banner).toBeInTheDocument();
     expect(
-      screen.queryByText(/end conversation and restart/i),
+      screen.queryByRole("button", { name: /restart the brain/i }),
     ).not.toBeInTheDocument();
   });
 
@@ -353,9 +411,25 @@ describe("ConnectionPanel — install shape gating (Phase 2)", () => {
 // ── Model section (Phase 8.3) ─────────────────────────────────────
 
 vi.mock("./ModelPicker", () => ({
-  ModelPicker: ({ onClose }: { onClose: (m?: string) => void }) => (
-    <div data-testid="model-picker">
+  ModelPicker: ({
+    onClose,
+    allowReapply,
+    current,
+    choice,
+  }: {
+    allowReapply?: boolean;
+    current: string;
+    choice: string | null;
+    onClose: (m?: string, info?: { checked?: false }) => void;
+  }) => (
+    <div
+      data-testid="model-picker"
+      data-allow-reapply={String(allowReapply === true)}
+      data-current={current}
+      data-choice={String(choice)}
+    >
       <button onClick={() => onClose("opus")}>Apply opus</button>
+      <button onClick={() => onClose("claude-sonnet-5", { checked: false })}>Apply unchecked</button>
       <button onClick={() => onClose()}>Cancel</button>
     </div>
   ),
@@ -401,6 +475,190 @@ describe("ConnectionPanel — Model section (Phase 8.3)", () => {
   });
 });
 
+// ── Rejected / unchecked model (#440) ─────────────────────────────
+
+describe("ConnectionPanel — rejected and unchecked models (#440)", () => {
+  const rec = (model: string) => ({
+    model,
+    since: "2026-10-17T12:00:00+00:00",
+    last_at: "2026-10-17T12:05:00+00:00",
+    count: 3,
+  });
+  const sonnetState = (extra: Partial<PersonaState> = {}) =>
+    baseState({
+      connection: { provider: "claude-cli", model: "sonnet", last_heartbeat_at: null },
+      ...extra,
+    });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getClientPlatform).mockReturnValue("macos");
+  });
+  afterEach(() => {
+    cleanup();
+  });
+
+  const CHAT_FALLBACK = { job: "interactive-chat", configured: "claude-sonet-5", using: "claude-sonnet-5" };
+  const BG_FALLBACK = { job: "background-classifier", configured: "claude-haiku-5", using: "haiku" };
+  const effective = (extra: Partial<PersonaState> = {}) =>
+    baseState({
+      connection: { provider: "claude-cli", model: "claude-sonnet-5", model_choice: "sonnet", last_heartbeat_at: null },
+      ...extra,
+    });
+
+  it("names the chat model Claude rejected, says chat runs the default now, and what to do", () => {
+    render(
+      <ConnectionPanel
+        state={effective({ model_rejections: [rec("claude-sonet-5")], model_fallbacks: [CHAT_FALLBACK] })}
+        persona="test"
+      />,
+    );
+    const line = screen.getByText(/Claude rejected the model "claude-sonet-5"/);
+    expect(line).toHaveTextContent(/may not exist/i);
+    expect(line).toHaveTextContent(/Chat now runs the default model instead/);
+    expect(line).toHaveTextContent(/use change to pick another model/i);
+    expect(line.textContent).not.toContain("—");
+    expect(screen.getByText(/The interactive chat job is using "claude-sonnet-5" instead of "claude-sonet-5"/)).toBeInTheDocument();
+  });
+
+  it("says the job keeps failing when the rejected id is the default itself (nothing to fall back to)", () => {
+    render(<ConnectionPanel state={effective({ model_rejections: [rec("claude-sonnet-5")] })} persona="test" />);
+    const line = screen.getByText(/Claude rejected the model "claude-sonnet-5", which is the default model/);
+    expect(line).toHaveTextContent(/Chat keeps failing until Claude Code is updated/);
+    expect(line.textContent).not.toContain("—");
+  });
+
+  it("shows nothing when there are no rejections (or the field is missing)", () => {
+    const { rerender } = render(<ConnectionPanel state={sonnetState({ model_rejections: [] })} persona="test" />);
+    expect(screen.queryByText(/Claude rejected/)).not.toBeInTheDocument();
+    rerender(<ConnectionPanel state={sonnetState()} persona="test" />);
+    expect(screen.queryByText(/Claude rejected/)).not.toBeInTheDocument();
+  });
+
+  it("words a rejected background-only model differently and names the job that fell back", () => {
+    render(
+      <ConnectionPanel
+        state={effective({ model_rejections: [rec("claude-haiku-5")], model_fallbacks: [BG_FALLBACK] })}
+        persona="test"
+      />,
+    );
+    const line = screen.getByText(/Claude rejected the model "claude-haiku-5"/);
+    expect(line).toHaveTextContent(/Some background jobs now run the default model instead/);
+    expect(line).not.toHaveTextContent(/pick another model/i);
+    expect(screen.getByText(/The background classifier job is using "haiku" instead of "claude-haiku-5"/)).toBeInTheDocument();
+  });
+
+  it("renders nothing for fallbacks when there are none", () => {
+    render(<ConnectionPanel state={sonnetState({ model_fallbacks: [] })} persona="test" />);
+    expect(screen.queryByText(/job is using/)).not.toBeInTheDocument();
+  });
+
+  it("drops the line as soon as the user changes the model", async () => {
+    render(<ConnectionPanel state={sonnetState({ model_rejections: [rec("sonnet")] })} persona="test" />);
+    expect(screen.getByText(/Claude rejected the model "sonnet"/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    fireEvent.click(screen.getByRole("button", { name: /apply opus/i }));
+    await waitFor(() => expect(screen.queryByTestId("model-picker")).not.toBeInTheDocument());
+    expect(screen.queryByText(/Claude rejected/)).not.toBeInTheDocument();
+  });
+
+  it("keeps the unconfirmed notice while the bridge lists the model, and clears it when a clean reply arrives", () => {
+    const unconfirmed = (models: string[]) =>
+      baseState({
+        connection: { provider: "claude-cli", model: "claude-sonnet-5", last_heartbeat_at: null },
+        model_unconfirmed: models,
+      });
+    const { rerender } = render(<ConnectionPanel state={unconfirmed(["claude-sonnet-5"])} persona="test" />);
+    expect(screen.getByText(/Couldn't check that model right now/)).toBeInTheDocument();
+
+    // a clean reply for the model arrives: the bridge's next state no longer lists it
+    rerender(<ConnectionPanel state={unconfirmed([])} persona="test" />);
+    expect(screen.queryByText(/Couldn't check that model/)).not.toBeInTheDocument();
+  });
+
+  it("does not show the unconfirmed notice for a model that is not the displayed one", () => {
+    render(
+      <ConnectionPanel
+        state={sonnetState({ model_unconfirmed: ["claude-sonnet-5"] })}
+        persona="test"
+      />,
+    );
+    expect(screen.queryByText(/Couldn't check that model/)).not.toBeInTheDocument();
+  });
+
+  it("tells the user plainly when a custom model was saved without being checked, and clears it on the next change", async () => {
+    render(<ConnectionPanel state={sonnetState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    fireEvent.click(screen.getByRole("button", { name: /apply unchecked/i }));
+    const notice = await screen.findByText(/Couldn't check that model right now/);
+    expect(notice).toHaveTextContent(/saved anyway, and any problem will show here/);
+    expect(notice.textContent).not.toContain("—");
+
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    fireEvent.click(screen.getByRole("button", { name: /apply opus/i }));
+    await waitFor(() => expect(screen.queryByText(/Couldn't check that model/)).not.toBeInTheDocument());
+  });
+
+  it("holds the unchecked notice against a stale poll until the bounded time ends", () => {
+    vi.useFakeTimers();
+    try {
+      const same = effective();
+      const { rerender } = render(<ConnectionPanel state={same} persona="test" />);
+      fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+      fireEvent.click(screen.getByRole("button", { name: /apply unchecked/i })); // re-applies claude-sonnet-5
+      expect(screen.getByText(/Couldn't check that model right now/)).toBeInTheDocument();
+      rerender(<ConnectionPanel state={{ ...same }} persona="test" />); // a poll that left before the Apply
+      expect(screen.getByText(/Couldn't check that model right now/)).toBeInTheDocument(); // still the Apply's answer
+      act(() => {
+        vi.advanceTimersByTime(15_000);
+      });
+      expect(screen.queryByText(/Couldn't check that model/)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("hands the picker the effective id and the word the bridge says it means", () => {
+    render(<ConnectionPanel state={effective()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    const picker = screen.getByTestId("model-picker");
+    expect(picker).toHaveAttribute("data-current", "claude-sonnet-5");
+    expect(picker).toHaveAttribute("data-choice", "sonnet");
+  });
+
+  it("opens the picker on the custom option when the model means no word", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({ connection: { provider: "claude-cli", model: "claude-sonnet-4-6", model_choice: null, last_heartbeat_at: null } })}
+        persona="test"
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    expect(screen.getByTestId("model-picker")).toHaveAttribute("data-choice", "null");
+  });
+
+  it("does not show the model picker for a persona that does not use Claude", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({ connection: { provider: "ollama", model: null, model_choice: null, last_heartbeat_at: null } })}
+        persona="test"
+      />,
+    );
+    expect(screen.queryByRole("button", { name: /change model/i })).not.toBeInTheDocument();
+  });
+
+  it("does not offer a model change until the bridge has reported the model (no invented default)", () => {
+    render(
+      <ConnectionPanel
+        state={baseState({ connection: { provider: "claude-cli", model: null, last_heartbeat_at: null } })}
+        persona="test"
+      />,
+    );
+    expect(screen.getByRole("button", { name: /change model/i })).toBeDisabled();
+    expect(screen.getAllByText(/loading/).length).toBeGreaterThan(0);
+  });
+});
+
 // ── Supervisor install (Phase 3.2) ────────────────────────────────
 
 describe("ConnectionPanel — supervisor install (Phase 3.2)", () => {
@@ -439,6 +697,45 @@ describe("ConnectionPanel — supervisor install (Phase 3.2)", () => {
     vi.mocked(getClientPlatform).mockReturnValue("windows");
     render(<ConnectionPanel state={baseState()} persona="test" />);
     expect(screen.getByText(/install Task Scheduler supervisor/i)).toBeInTheDocument();
+  });
+
+  it("(#456 C58 d, review M4) install stops the bridge through the stop flow, installs on the stopped bridge, then starts it", async () => {
+    vi.mocked(getClientPlatform).mockReturnValue("linux");
+    const order: string[] = [];
+    const spy = vi.spyOn(restartModule, "stopBridgeThen").mockImplementation(async (_p, action, opts) => {
+      order.push("stop");
+      await action();
+      order.push(opts.start ? "start" : "no start");
+      return { stopped: true, error: null };
+    });
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "install_supervisor_service") order.push("install");
+      return { success: true, stdout: "service installed", stderr: "", exit_code: 0 };
+    });
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /install systemd supervisor/i }));
+    await waitFor(() => expect(screen.getByText(/supervisor installed/i)).toBeInTheDocument());
+    expect(order).toEqual(["stop", "install", "start"]);
+    expect(spy).toHaveBeenCalledWith("test", expect.any(Function), { start: true });
+    spy.mockRestore();
+  });
+
+  it("(#456 C58 d, review M4) a bridge the stop flow could not stop is not installed over", async () => {
+    vi.mocked(getClientPlatform).mockReturnValue("linux");
+    const spy = vi.spyOn(restartModule, "stopBridgeThen").mockResolvedValue({
+      stopped: false,
+      error: "Restart failed. Try `nell service status` from terminal, or restart Companion Emergence.",
+    });
+    const installs: string[] = [];
+    vi.mocked(invoke).mockImplementation(async (cmd: string) => {
+      if (cmd === "install_supervisor_service") installs.push(cmd);
+      return { success: true, stdout: "", stderr: "", exit_code: 0 };
+    });
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /install systemd supervisor/i }));
+    await waitFor(() => expect(screen.getByText(/could not be stopped for the install/i)).toBeInTheDocument());
+    expect(installs).toEqual([]);
+    spy.mockRestore();
   });
 });
 
@@ -521,3 +818,99 @@ describe("ConnectionPanel — app version in the update-available text", () => {
 
 
 
+
+
+// ── nell shortcut button on every supported platform (#408, C14 / C29b) ──────────
+
+const NO_FUSE_TEXT =
+  "This AppImage is running without FUSE (in extract-and-run mode), so the nell shortcut was not installed. A shortcut would re-extract the whole app on every nell command and delete the running app's files when the command ends. To get the shortcut, install FUSE for your distribution (on Debian and Ubuntu the package is libfuse2, called libfuse2t64 on Ubuntu 24.04), start the AppImage normally, and try again. Or install the .deb package instead, which does not need FUSE.";
+
+describe("ConnectionPanel: nell shortcut button", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+  afterEach(() => {
+    cleanup();
+  });
+
+  it.each([
+    ["linux", /install nell to ~\/\.local\/bin/i],
+    ["windows", /install nell to your PATH/i],
+    ["macos", /install nell to ~\/\.local\/bin/i],
+  ] as Array<[string, RegExp]>)("%s: button is shown, enabled and clicking invokes the command once", async (platform, name) => {
+    vi.mocked(getClientPlatform).mockReturnValue(platform as never);
+    vi.mocked(invoke).mockImplementation((async (cmd: string) =>
+      cmd === "install_nell_cli_symlink"
+        ? { success: true, stdout: "nell shortcut installed", stderr: "", exit_code: 0 }
+        : { success: true, stdout: "service installed", stderr: "", exit_code: 0 }) as never);
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    const btn = screen.getByRole("button", { name });
+    expect(btn).toBeEnabled();
+    fireEvent.click(btn);
+    await waitFor(() => expect(screen.getByText(/nell shortcut installed/i)).toBeInTheDocument());
+    const calls = vi.mocked(invoke).mock.calls.filter((c) => c[0] === "install_nell_cli_symlink");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("other platforms keep the calm note and have no button", () => {
+    vi.mocked(getClientPlatform).mockReturnValue("other" as never);
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    expect(screen.queryByRole("button", { name: /install nell to/i })).not.toBeInTheDocument();
+    expect(screen.getByText(/No action needed for normal app use/i)).toBeInTheDocument();
+  });
+
+  it("linux: the no-FUSE explanation is shown in full as the error detail", async () => {
+    vi.mocked(getClientPlatform).mockReturnValue("linux" as never);
+    vi.mocked(invoke).mockImplementation((async (cmd: string) =>
+      cmd === "install_nell_cli_symlink"
+        ? { success: false, stdout: "", stderr: NO_FUSE_TEXT, exit_code: 78 }
+        : { success: true, stdout: "", stderr: "", exit_code: 0 }) as never);
+    render(<ConnectionPanel state={baseState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /install nell to ~\/\.local\/bin/i }));
+    await waitFor(() => expect(screen.getByText(NO_FUSE_TEXT)).toBeInTheDocument());
+  });
+});
+
+// ── Unsupported model setting (#446) ──────────────────────────────
+
+describe("ConnectionPanel — unsupported model setting (#446)", () => {
+  const sonnetState = (extra: Partial<PersonaState> = {}) =>
+    baseState({
+      connection: { provider: "claude-cli", model: "sonnet", last_heartbeat_at: null },
+      ...extra,
+    });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(getClientPlatform).mockReturnValue("macos");
+  });
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("shows a plain line for an unsupported model setting, naming the value and Sonnet", () => {
+    render(<ConnectionPanel state={sonnetState({ model_unsupported: "fable" })} persona="test" />);
+    const line = screen.getByText(/The model "fable" in your settings is not supported/);
+    expect(line).toHaveTextContent(/Sonnet is being used instead/);
+    expect(line).toHaveAttribute("role", "status");
+    expect(line.textContent).not.toContain("—");
+  });
+
+  it("shows no unsupported-model line when the field is null or missing", () => {
+    const { rerender } = render(<ConnectionPanel state={sonnetState({ model_unsupported: null })} persona="test" />);
+    expect(screen.queryByText(/is not supported/)).not.toBeInTheDocument();
+    rerender(<ConnectionPanel state={sonnetState()} persona="test" />);
+    expect(screen.queryByText(/is not supported/)).not.toBeInTheDocument();
+  });
+
+  it("tells the picker to allow re-applying the current model only while the unsupported line is shown", () => {
+    // ModelPicker is mocked in this file; its own allowReapply behaviour is tested in ModelPicker.test.tsx.
+    const { unmount } = render(<ConnectionPanel state={sonnetState({ model_unsupported: "fable" })} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    expect(screen.getByTestId("model-picker")).toHaveAttribute("data-allow-reapply", "true");
+    unmount();
+    render(<ConnectionPanel state={sonnetState()} persona="test" />);
+    fireEvent.click(screen.getByRole("button", { name: /change model/i }));
+    expect(screen.getByTestId("model-picker")).toHaveAttribute("data-allow-reapply", "false");
+  });
+});

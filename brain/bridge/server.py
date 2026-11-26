@@ -21,13 +21,17 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
+import io
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
 import threading
-from collections.abc import AsyncIterator
+import time
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -35,20 +39,23 @@ from pathlib import Path
 from typing import Any, Literal
 
 from fastapi import (
+    BackgroundTasks,
     Depends,
     FastAPI,
     HTTPException,
+    Request,
     Response,
     UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.routing import APIRoute
 from pydantic import BaseModel, Field, StrictBool
 
 from brain import __version__ as _brain_version
-from brain import prompt_strings, tunables
-from brain.bridge import events, provider_auth
+from brain import tunables
+from brain.bridge import cli_throttle, events, model_error, provider_auth, shutdown_progress
 from brain.bridge.chat import (
     ChatMessage,
     ChatResponse,
@@ -59,33 +66,42 @@ from brain.bridge.chat import (
 from brain.bridge.events import EventBus
 from brain.bridge.model_tier import (
     TIER_BACKGROUND_HOUSEKEEPING,
-    build_interactive_chat_provider,
+    TIER_INTERACTIVE_CHAT,
     build_tier_provider,
 )
-from brain.bridge.provider import LLMProvider, ProviderError, _claude_work_dir
-from brain.bridge.shutdown import BridgeShutdownController
+from brain.bridge.provider import ClaudeCliProvider, LLMProvider, ProviderError, _claude_work_dir
+from brain.bridge.shutdown import POLL_S as _STOP_POLL_S
+from brain.bridge.shutdown import (
+    REASON_APP_RESTART,
+    REASON_IDLE,
+    REASON_MANUAL_RESTART,
+    REASON_USER_STOP,
+    BridgeShutdownController,
+)
+from brain.bridge.shutdown import REASON_UNKNOWN as _STOP_REASON_UNKNOWN
+from brain.bridge.shutdown_progress import tracked_to_thread
 from brain.chat.session import (
     all_sessions,
     create_session,
     get_or_hydrate_session,
 )
+from brain.emotion import engine as emotion_engine
 from brain.health.alarm import compute_pending_alarms
-from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, iter_jsonl, read_json
+from brain.health.parse_failures import count_recent as count_recent_parse_failures
 from brain.health.walker import walk_persona
 from brain.ingest.buffer import _SESSION_ID_RE as _BUFFER_SESSION_ID_RE
+from brain.memory import cost_series
 from brain.memory.db_health import run_fts_health_check_once
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.persona_config import PersonaConfig
 from brain.tools.dispatch import dispatch
 from brain.update.overlay import loaded_overlay
+from brain.utils.atomic_write import save_with_backup_text
+from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
-
-# Text externalized to prompt_strings.toml [bridge.server] (issue #129 stage 2b).
-_HEARTBEAT_CLOSE_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments(
-    "bridge.server.heartbeat_close_system_prompt_segments"
-)
 
 # Browser/WebView origins that are allowed to call the localhost bridge.
 # HTTP routes are still bearer-token protected; CORS is only the browser's
@@ -135,7 +151,7 @@ def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -
 
     Idempotent — re-registering emotions is a no-op. Mirrors the supervisor tick
     load (brain/bridge/supervisor.py ~line 639), but called at bridge startup so
-    the chat path never aggregates with an empty vocab during the ~15-min window
+    the chat path never reads emotions with an empty vocab during the ~15-min window
     before the first supervisor tick fires.
 
     Missing file → silent no-op (fresh personas have no vocabulary file yet).
@@ -147,6 +163,23 @@ def ensure_persona_vocabulary_loaded(persona_dir: Path, *, store: MemoryStore) -
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
     except Exception:
         logger.exception("startup persona-vocabulary load skipped")
+
+
+async def _drain_emotion_engine(persona_dir: Path) -> None:
+    """Run the emotion engine's drain and day close (`note_active`) off the event loop, after a reply was sent.
+
+    `tracked_to_thread` counts the work for the shutdown and refuses it with `ShutdownDeferred` once the bridge has begun to
+    stop. That refusal is not an error here: the reply is already sent, nothing is lost (the queue stays on disk and the next
+    start or the supervisor's next pass drains it), and an unhandled one would reach the app's handler as a 503 for a reply the
+    client already has. So it is logged at info, as `start_tracked_thread` does for the work it does not start, and nothing else is
+    caught: `note_active` never raises.
+    """
+    try:
+        await tracked_to_thread(
+            "emotion drain", emotion_engine.engine_for(persona_dir).note_active, datetime.now(UTC)
+        )
+    except cli_throttle.ShutdownDeferred:
+        logger.info("emotion drain not run: the bridge is stopping; the queue is left for the next drain")
 
 
 def _now() -> str:
@@ -196,7 +229,10 @@ async def _idle_watcher(state: BridgeAppState, idle_shutdown_seconds: float) -> 
         await asyncio.sleep(min(idle_shutdown_seconds, 60))
         if _check_idle(state, idle_shutdown_seconds):
             logger.info("idle shutdown firing — no traffic for >%ss", idle_shutdown_seconds)
-            if state.shutdown_controller is None or not state.shutdown_controller.request("idle_timeout"):
+            # Off the event loop: the request writes the bridge.json "stopping" mark (review O-6).
+            if state.shutdown_controller is None or not await asyncio.to_thread(
+                state.shutdown_controller.request, REASON_IDLE
+            ):
                 logger.error("idle shutdown could not request controller shutdown")
             return
 
@@ -210,10 +246,9 @@ def _check_idle(state: Any, idle_shutdown_seconds: float) -> bool:
 
     Bridge startup counts as activity so a freshly launched app has the
     full idle window before the watcher fires. Without that fallback,
-    ``last_chat_at is None`` collapsed to "idle" and the bridge SIGTERM'd
-    itself ~60s after every launch — which then triggered the
-    close-heartbeat (decay + dream + reflex + growth) on every relaunch,
-    looking from the UI like the brain was 'flooding'.
+    ``last_chat_at is None`` collapsed to "idle" and the bridge stopped
+    itself ~60s after every launch, so every relaunch was followed by an
+    idle stop.
     """
     now = datetime.now(UTC)
     last_activity = state.last_chat_at or state.started_at
@@ -229,15 +264,7 @@ def _read_jsonl_lines(path: Path):
     """Yield parsed JSON objects from a JSONL file, skipping corrupt lines."""
     if not path.is_file():
         return
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                yield json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    yield from iter_jsonl(path, recover=Recovery.RAISE)
 
 
 def _resolve_image_ext(images_dir: Path, sha: str) -> str | None:
@@ -249,6 +276,30 @@ def _resolve_image_ext(images_dir: Path, sha: str) -> str | None:
         if (images_dir / f"{sha}.{ext}").exists():
             return ext
     return None
+
+
+async def _read_upload_capped(file: UploadFile, max_bytes: int) -> bytes:
+    """Read an upload, at most ``max_bytes + 1`` bytes: one over the cap, so the caller can tell the body overran it.
+
+    Never asks the file for more than it holds. A read of a spooled file converts its size argument to a C ``Py_ssize_t``
+    (an ``OverflowError`` above ``sys.maxsize``) and, for a body that rolled to a disk file, allocates that many bytes up
+    front (a ``MemoryError`` for a large one), so reading ``max_bytes + 1`` straight away would make a large
+    ``files.upload_max_bytes`` fail every upload however small the body. ``UploadFile.size`` is the bytes written to the file
+    (starlette's multipart parser creates it with ``size=0`` and ``write`` counts); when it is None the file is read in pieces
+    of at most ``io.DEFAULT_BUFFER_SIZE`` until ``max_bytes + 1`` bytes were read or the file ends.
+    """
+    limit = max_bytes + 1
+    if file.size is not None:
+        return await file.read(min(limit, file.size))
+    pieces: list[bytes] = []
+    remaining = limit
+    while remaining > 0:
+        piece = await file.read(min(remaining, io.DEFAULT_BUFFER_SIZE))
+        if not piece:
+            break
+        pieces.append(piece)
+        remaining -= len(piece)
+    return b"".join(pieces)
 
 
 def _respond_blocking(
@@ -315,6 +366,20 @@ def _search_memories_blocking(persona_dir: Path, req: SearchMemoriesReq) -> dict
         )
 
 
+def _end_chunk_stream(loop: asyncio.AbstractEventLoop, chunk_q: asyncio.Queue) -> None:
+    """Queue the end-of-reply sentinel BEHIND every chunk the worker thread pushed.
+
+    `_StreamingProxy` pushes chunks with `loop.call_soon_threadsafe(put_nowait, ...)`.
+    When the worker finishes before the loop thread resumes its `await asyncio.to_thread(...)`
+    (a short reply), the await returns without yielding, so those callbacks are still
+    pending in the loop's ready queue. A direct `chunk_q.put_nowait(None)` would overtake
+    them: the forwarder would stop before the last chunk(s), and the client, which builds
+    the reply only from reply_chunk frames, would show a truncated reply. `call_soon`
+    appends behind them (FIFO), whatever the timing.
+    """
+    loop.call_soon(chunk_q.put_nowait, None)
+
+
 class _StreamingProxy:
     """Thin provider wrapper that intercepts chat() to forward TextDelta chunks.
 
@@ -324,9 +389,13 @@ class _StreamingProxy:
     send reply_chunk frames in real time — while memory recall, tool dispatch,
     and buffer persistence still go through the full engine pipeline.
 
-    If the real provider does not implement chat_stream() (e.g. OllamaProvider,
-    FakeProvider), chat() falls back to the real provider's chat() unchanged and
-    no chunks are forwarded (the None sentinel is still sent so the WS loop exits).
+    If the real provider has no chat_stream() (e.g. FakeProvider), or has one
+    that does not speak the TextDelta/StreamDone event protocol — marked by
+    ``chat_stream_speaks_events = False``, as OllamaProvider is, whose
+    chat_stream() yields plain str chunks and takes no tools (#810) — chat()
+    calls the real provider's blocking chat() with the turn's tools and
+    forwards the reply as word chunks via _word_chunks. Tool calls come back
+    on that ChatResponse unchanged.
     """
 
     def __init__(
@@ -338,6 +407,10 @@ class _StreamingProxy:
         self._real = real
         self._q = chunk_q
         self._loop = loop
+
+    @property
+    def tool_name_prefix(self) -> str:
+        return self._real.tool_name_prefix
 
     def name(self) -> str:
         return self._real.name()
@@ -387,8 +460,10 @@ class _StreamingProxy:
                 audit_offset_before = 0
 
         chat_stream = getattr(self._real, "chat_stream", None)
-        if chat_stream is None:
-            # Provider has no streaming support; call chat() and forward the
+        if chat_stream is None or not getattr(self._real, "chat_stream_speaks_events", True):
+            # Provider has no chat_stream, or one that yields plain text and
+            # takes no tools (OllamaProvider, #810); call chat() — the only
+            # path that carries tools out and tool calls back — and forward the
             # full content as word tokens so the WS still emits reply_chunk frames.
             resp = self._real.chat(messages, tools=tools, options=options)
             if not suppress:
@@ -512,19 +587,25 @@ def _close_session_blocking(
     from contextlib import ExitStack
 
     from brain.ingest.pipeline import close_session
+    from brain.ingest.types import IngestReport
 
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        return close_session(
-            persona_dir,
-            session_id,
-            store=store,
-            hebbian=hebbian,
-            provider=provider,
-        )
+        try:
+            return close_session(
+                persona_dir,
+                session_id,
+                store=store,
+                hebbian=hebbian,
+                provider=provider,
+            )
+        except cli_throttle.ShutdownDeferred:
+            # #456 x #473: the bridge began stopping after this close was admitted; its extraction call was refused
+            # (raised so the background sweeps end). "Not now": the buffer and the session stay, like any deferral.
+            return IngestReport(session_id=session_id, deferred=True)
 
 
 def _snapshot_session_blocking(
@@ -536,46 +617,32 @@ def _snapshot_session_blocking(
 
     Non-destructive: the replay buffer is NOT deleted after extraction.
     Uses a cursor sidecar to extract only turns added since the last snapshot.
+    One chunk per call (#523, ``max_chunks=1``): this request holds the session's in-flight lock and uses the chat-tier
+    provider, so it makes no more model calls than before chunking; the snapshot sweep takes the rest at the next lull.
     Same per-call store pattern as _close_session_blocking.
     """
     from contextlib import ExitStack
 
     from brain.ingest.pipeline import extract_session_snapshot
+    from brain.ingest.types import IngestReport
 
     with ExitStack() as stack:
         store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
         stack.callback(store.close)
         hebbian = HebbianMatrix(persona_dir / "hebbian.db")
         stack.callback(hebbian.close)
-        return extract_session_snapshot(
-            persona_dir,
-            session_id,
-            store=store,
-            hebbian=hebbian,
-            provider=provider,
-        )
+        try:
+            return extract_session_snapshot(
+                persona_dir,
+                session_id,
+                store=store,
+                hebbian=hebbian,
+                provider=provider,
+                max_chunks=1,
+            )
+        except cli_throttle.ShutdownDeferred:
+            return IngestReport(session_id=session_id, deferred=True)  # #456 x #473: see _close_session_blocking
 
-
-async def _wait_for_in_flight_drain(state: BridgeAppState, *, timeout: float = 30.0) -> None:
-    """Wait for all per-session in_flight locks to release, up to `timeout` seconds.
-
-    Spec §7 step 2: graceful shutdown waits up to 30s for active chat turns
-    to finish before proceeding to the close-and-stop steps. We poll every
-    100ms — locks are asyncio.Lock so this stays on the loop.
-    """
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
-        if not any(lock.locked() for lock in state.in_flight_locks.values()):
-            return
-        await asyncio.sleep(0.1)
-    held = sum(1 for lock in state.in_flight_locks.values() if lock.locked())
-    if held:
-        logger.warning(
-            "shutdown drain: %d in-flight chat(s) did not release in %.0fs", held, timeout
-        )
-
-
-_CLOSE_HEARTBEAT_DEBOUNCE_S = 300.0
 
 # Stream keepalive: while a chat turn is in flight, the provider can go silent
 # for long stretches — first-token latency on a large persona prompt, or a
@@ -583,131 +650,383 @@ _CLOSE_HEARTBEAT_DEBOUNCE_S = 300.0
 # The client (app/src/streamChat.ts) kills the WS after 60s with no frame, so
 # the forward loop emits a `keepalive` frame on each silent interval to reset
 # that idle timer. 15s gives a 4x margin under the client's 60s budget.
-_STREAM_KEEPALIVE_SECONDS = tunables.register("bridge.stream_keepalive_seconds", 15.0)
+_STREAM_KEEPALIVE_SECONDS = tunables.register(
+    "bridge.stream_keepalive_seconds", 15.0,
+    description="Seconds of silence in a chat reply before the app is sent a keep-alive signal.",
+)
+
+
+# The smallest keepalive interval an override may set: a frame or a space more often than once a second only keeps the event
+# loop busy, and the idle cuts it guards against are about a minute (the client's 60 s WS budget, WKWebView's ~60 s idle cut).
+_STREAM_KEEPALIVE_FLOOR_SECONDS = 1.0
 
 
 def _stream_keepalive_seconds() -> float:
-    return tunables.get_tunable("bridge.stream_keepalive_seconds", _STREAM_KEEPALIVE_SECONDS)
+    """The keepalive interval: a ``tunables.toml`` override when usable, else the default. Zero, a negative or a non-finite override would make
+    the streams send frames or spaces in a tight loop: it is ignored (one warning) for the default; a positive value below
+    ``_STREAM_KEEPALIVE_FLOOR_SECONDS`` is raised to it. A bool is rejected by ``get_tunable`` (wrong type)."""
+    default = _STREAM_KEEPALIVE_SECONDS
+    value = float(tunables.get_tunable("bridge.stream_keepalive_seconds", default))
+    if value == default:
+        return default  # the code's own value (tests may set it smaller to run fast); the checks below are for overrides
+    if not math.isfinite(value) or value <= 0:
+        warn_throttled(
+            logger,
+            "bridge.stream_keepalive_seconds",
+            "tunables: override 'bridge.stream_keepalive_seconds'=%r is not a positive number; using %s",
+            value,
+            default,
+            exc_info=False,
+        )
+        return default
+    return max(value, _STREAM_KEEPALIVE_FLOOR_SECONDS)
+
+
+# GET /sessions/active: a session whose last turn is younger than this is attach-eligible. 24 hours mirrors the supervisor's
+# ``finalize_after_hours`` default (deliberately hardcoded rather than wired through a config knob): an older buffer is rolled
+# over instead of attached, so the renderer never attaches to a session the finalize tick is about to act on.
+_ATTACH_MAX_AGE_HOURS = 24.0
+
+
+def _sessions_active_blocking(persona_dir: Path, persona: str, provider: LLMProvider) -> dict[str, str | None]:
+    """The whole launch decision of ``GET /sessions/active`` (#523): blocks; run in a worker thread.
+
+    Returns ``{"session_id": <the most-recent-turn session that is still attach-eligible>}``. When there is none but a stale
+    buffer exists (its last turn is older than ``_ATTACH_MAX_AGE_HOURS``), the most-recently-active stale buffer (tie-break:
+    the lexicographically-largest sid, so the choice is deterministic) is rolled over (1c-A): its extraction runs to the end,
+    chunk by chunk (a launch after a long never-extracted evening is slower, so that the new session still opens with the
+    summary of the old one), then everything is folded and archived, the old buffer is
+    deleted, and the NEW session id (seeded with the summary alone) is returned. Otherwise ``{"session_id": None}``.
+
+    Everything that reads a file or opens SQLite happens here, off the event loop; the memory store and Hebbian matrix are
+    opened and closed in this thread (no SQLite object crosses threads). Any exception, ``ShutdownDeferred`` and
+    ``ThrottleDeferred`` included, is answered ``{"session_id": None}``: the app then starts a fresh session.
+    """
+    from contextlib import ExitStack
+
+    from brain.chat.rollover import perform_rollover
+    from brain.ingest.buffer import list_active_sessions, read_session
+
+    stale_sid: str | None = None
+    try:
+        now = datetime.now(UTC)
+        best_sid: str | None = None
+        best_ts: datetime | None = None
+        stale_ts: datetime | None = None
+        for sid in list_active_sessions(persona_dir):
+            try:
+                turns = read_session(persona_dir, sid)
+            except (ValueError, OSError):
+                # Defensive: a malformed session_id on disk or unreadable
+                # file shouldn't take the endpoint down. Skip and move on.
+                continue
+            if not turns:
+                continue
+            raw_ts = turns[-1].get("ts")
+            if not raw_ts:
+                # Defensive — ingest_turn always writes a ts, so this
+                # should not happen in practice. Skip.
+                continue
+            try:
+                last = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=UTC)
+            except (ValueError, TypeError):
+                continue
+            age_hours = (now - last).total_seconds() / 3600.0
+            if age_hours >= _ATTACH_MAX_AGE_HOURS:
+                if stale_ts is None or last > stale_ts or (last == stale_ts and sid > (stale_sid or "")):
+                    stale_ts = last
+                    stale_sid = sid
+                continue
+            if best_ts is None or last > best_ts:
+                best_ts = last
+                best_sid = sid
+
+        if best_sid is not None:
+            return {"session_id": best_sid}
+        if stale_sid is None:
+            return {"session_id": None}
+        with ExitStack() as stack:
+            store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+            stack.callback(store.close)
+            hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+            stack.callback(hebbian.close)
+            new_sid = perform_rollover(
+                persona_dir, stale_sid, persona,
+                seed_mode="summary_only", now=now, provider=provider,
+                store=store, hebbian=hebbian,
+            )
+        return {"session_id": new_sid}
+    except Exception:
+        logger.exception("sessions_active: launch decision failed stale_sid=%s", stale_sid)
+        return {"session_id": None}
+
+
+def _sessions_active_task_done(state: BridgeAppState, task: asyncio.Future) -> None:
+    """Done-callback of the shared launch-decision task: frees the slot (only if it still holds this task) and always
+    retrieves the task's exception, so a task whose every client went away never logs "exception was never retrieved"."""
+    if state.sessions_active_task is task:
+        state.sessions_active_task = None
+    if not task.cancelled():
+        task.exception()
+
+
+def _shared_sessions_active_task(state: BridgeAppState) -> asyncio.Future:
+    """The ONE in-flight launch decision for this persona: the running task, or a new one (#523).
+
+    A second ``GET /sessions/active`` while a rollover runs (the app's one replay after a cut connection, the panel's
+    send-time call, a second panel) awaits the same task and gets the same answer instead of finding the extraction lock
+    held and answering null. The task is not any request's own, so a client that goes away does not cancel the work;
+    ``tracked_to_thread`` counts it for the shutdown (#456/#458). Runs on the event loop with no ``await`` between the lookup
+    and the create, so two requests cannot both create one. A done task counts as absent (its done-callback is scheduled with
+    ``call_soon``, so it may not have cleared the slot yet); the slot is cleared only by that callback.
+    """
+    task = state.sessions_active_task
+    if task is not None and not task.done():
+        return task
+    task = asyncio.ensure_future(
+        tracked_to_thread(
+            "sessions active", _sessions_active_blocking, state.persona_dir, state.persona, state.provider
+        )
+    )
+    state.sessions_active_task = task
+    task.add_done_callback(lambda t: _sessions_active_task_done(state, t))
+    return task
+
+
+async def _sessions_active_body(task: asyncio.Future) -> AsyncIterator[bytes]:
+    """The streamed body of ``GET /sessions/active``: one space every ``bridge.stream_keepalive_seconds`` while the launch
+    decision runs, then its JSON (leading whitespace is valid JSON, so ``r.json()`` parses it unchanged). The spaces keep a
+    long launch rollover from being cut as idle (WKWebView cuts an idle request at about 60 s; see ``_MODEL_CHECK_TIMEOUT_S``).
+    A fast decision's JSON is the first and only body message. The status (200) is sent before the first byte, so a failure
+    after that, including a refused ``tracked_to_thread`` registration landing on the task, is answered with
+    ``{"session_id": null}`` here, never a cut body."""
+    interval = _stream_keepalive_seconds()
+    while True:
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=interval)
+            break
+        except TimeoutError:
+            yield b" "
+        except Exception:
+            logger.warning("sessions_active: the launch decision raised; answering null", exc_info=True)
+            result = {"session_id": None}
+            break
+    yield json.dumps(result).encode()
 
 
 def _chat_error_code(exc: BaseException) -> str:
     """Stable client code for a failed chat turn (#246): ``auth_expired`` when the
-    failing call's own text is an auth failure, else the generic ``provider_failed``."""
-    return "auth_expired" if provider_auth.is_auth_failure(str(exc)) else "provider_failed"
+    failing call's own text is an auth failure, ``model_unavailable`` (#440) when the
+    CLI rejected the model, else the generic ``provider_failed``. Auth wins."""
+    text = str(exc)
+    if provider_auth.is_auth_failure(text):
+        return "auth_expired"
+    if model_error.is_model_rejection(text):
+        return "model_unavailable"
+    return "provider_failed"
 
 
-def _run_heartbeat_close(persona_dir: Path, provider: LLMProvider) -> None:
-    """Fire HeartbeatEngine.run_tick(trigger='close') in-process.
+def _chat_error_model(exc: BaseException, provider: Any = None) -> str | None:
+    """The model to name in a ``model_unavailable`` error: the one the CLI said it rejected, else the one the
+    subprocess was run with (the ``model=`` token the provider added). Never a fresh lookup of the configured
+    model: a settings change can land while a call runs, and the user must not be told the model they just chose
+    is unavailable (#448).
+    None for any other error. Always valid model grammar. ``provider`` is accepted for the existing callers."""
+    text = str(exc)
+    if provider_auth.is_auth_failure(text) or not model_error.is_model_rejection(text):
+        return None
+    return model_error.rejected_model_name(text, None)
 
-    Per SP-7 spec §7 step 5 + Reflex Phase 2's anchor for weekly growth.
-    Best-effort: any exception is logged by the caller; we don't block
-    shutdown on heartbeat issues.
 
-    Debounced: when a close-heartbeat fired within the last 5 minutes
-    (e.g. during a dev cycle of repeated rebuild+relaunch), skip the
-    decay/dream/reflex/growth tail and exit. The session-drain step
-    above this call already saved everything; the tail is what causes
-    the 'flooding' perception when the bridge restarts often.
+def _chat_error_detail(exc: BaseException, provider: Any) -> str:
+    """HTTP ``detail`` for a failed /chat: the code, plus ``:<model>`` for ``model_unavailable``."""
+    code = _chat_error_code(exc)
+    model = _chat_error_model(exc, provider)
+    return f"{code}:{model}" if model else code
 
-    Per H-A: opens its own per-call stores inside the worker thread.
-    Constructor pattern mirrors brain/cli.py:_heartbeat_handler.
+
+# Modules the bridge loads lazily that register settings (see the boot pass in the lifespan).
+_SETTING_MODULES: tuple[str, ...] = (
+    "brain.file_store",
+    "brain.memory.embedding_backfill",
+    "brain.memory.judge_eval",
+    "brain.memory.judge_full_ft",
+    "brain.memory.judge_lora",
+    "brain.memory.judge_selftune",
+    "brain.memory.relevance_judge",
+)
+
+
+def _import_setting_modules() -> list[str]:
+    """Import every module of ``_SETTING_MODULES`` one at a time and return the names that failed.
+
+    Each import is its own ``try``: one module that cannot be imported (a missing optional dependency, a broken file) must
+    not stop the others from registering their settings, nor the boot pass from running. The failure is logged here.
     """
-    from contextlib import ExitStack
+    import importlib
 
-    from brain.engines.heartbeat import HeartbeatEngine
-    from brain.persona_config import PersonaConfig
-    from brain.search.factory import get_searcher
-
-    state_path = persona_dir / "heartbeat_state.json"
-    if state_path.exists():
+    failed: list[str] = []
+    for name in _SETTING_MODULES:
         try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-            last_run = state.get("last_close_at") or state.get("last_run")
-            if last_run:
-                if last_run.endswith("Z"):
-                    last_run = last_run[:-1] + "+00:00"
-                last_dt = datetime.fromisoformat(last_run)
-                if last_dt.tzinfo is None:
-                    last_dt = last_dt.replace(tzinfo=UTC)
-                age = (datetime.now(UTC) - last_dt).total_seconds()
-                if age < _CLOSE_HEARTBEAT_DEBOUNCE_S:
-                    logger.info(
-                        "close-heartbeat debounced (last fire %.0fs ago < %.0fs)",
-                        age,
-                        _CLOSE_HEARTBEAT_DEBOUNCE_S,
-                    )
-                    return
-        except Exception:  # noqa: BLE001
-            logger.debug("close-heartbeat debounce check failed", exc_info=True)
+            importlib.import_module(name)
+        except Exception as exc:  # noqa: BLE001 - any failure of one import; the rest still load
+            failed.append(name)
+            logger.warning(
+                "tunables boot pass: could not import %s (%s); its settings are not in the file until a process that imports it syncs",
+                name, exc,
+            )
+    return failed
 
-    config = PersonaConfig.load(persona_dir / "persona_config.json")
-    searcher = get_searcher(config.searcher)
-    default_arcs_path = Path(__file__).parent.parent / "engines" / "default_reflex_arcs.json"
-
-    with ExitStack() as stack:
-        store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
-        stack.callback(store.close)
-        hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-        stack.callback(hebbian.close)
-
-        engine = HeartbeatEngine(
-            store=store,
-            hebbian=hebbian,
-            provider=provider,
-            state_path=persona_dir / "heartbeat_state.json",
-            config_path=persona_dir / "heartbeat_config.json",
-            dream_log_path=persona_dir / "dreams.log.jsonl",
-            heartbeat_log_path=persona_dir / "heartbeats.log.jsonl",
-            reflex_arcs_path=persona_dir / "reflex_arcs.json",
-            reflex_log_path=persona_dir / "reflex_log.json",
-            reflex_default_arcs_path=default_arcs_path,
-            searcher=searcher,
-            interests_path=persona_dir / "interests.json",
-            research_log_path=persona_dir / "research_log.json",
-            default_interests_path=Path(__file__).parent.parent
-            / "engines"
-            / "default_interests.json",
-            persona_name=persona_dir.name,
-            persona_system_prompt=(
-                _HEARTBEAT_CLOSE_SYSTEM_PROMPT_SEGMENTS[0] + persona_dir.name
-                + _HEARTBEAT_CLOSE_SYSTEM_PROMPT_SEGMENTS[1]
-            ),
-        )
-        engine.run_tick(trigger="close", dry_run=False)
+# Save-time check of a newly chosen model id (#440): one tiny real call, so a typo is refused with a specific
+# message instead of failing later inside the jobs that use it. The budget is for the whole save. The app's request has no timeout of its own (bridge.ts
+# `bridgeFetch` sets no AbortSignal), so the limit that applies is the webview's network stack: WKWebView
+# (macOS) cuts an idle request at about 60 s; WebView2 and WebKitGTK are not known to cut earlier. A custom id
+# is also not replayed, so a cut request would show an error while the bridge still saves. 30 s keeps the
+# worst case (a hanging CLI) at half of that; a rejected id answers in seconds.
+_MODEL_CHECK_TIMEOUT_S = tunables.register(
+    "provider.model_check_timeout_seconds", 30.0,
+    description="Seconds to wait when checking that a newly chosen model works.",
+)
+_MODEL_CHECK_PROMPT = "Reply with the single word OK."
+_MIN_PROBE_S = 1  # a probe given less than this is not started
 
 
-def _drain_sessions_blocking(
-    persona_dir: Path,
-    provider: LLMProvider,
-    silence_minutes: float = 0,
-) -> Any:
-    """Wrap brain.ingest.pipeline.snapshot_stale_sessions — used by shutdown.
+def _check_budget_s() -> float:
+    return float(tunables.get_tunable("provider.model_check_timeout_seconds", _MODEL_CHECK_TIMEOUT_S))
 
-    Non-destructive — buffers + cursors survive across shutdown so the next
-    bridge start can resume sticky sessions. Memories still extract
-    durably here (the data-saving step on Cmd-Q). The 24h
-    finalize_stale_sessions cadence picks up genuinely-stale buffers on
-    the next bridge run.
 
-    Same per-call store pattern. Silence_minutes=0 (default) snapshots
-    EVERY live session, which is what graceful shutdown wants.
+def _check_model_blocking(model_id: str, timeout_s: float | None = None) -> tuple[str, str]:
+    """Run ONE ``probe()`` with ``model_id``. Returns ``("ok", "")``, ``("rejected", "")`` or
+    ``("inconclusive", <reason>)``. Never raises. The probe uses the stream-json output chat uses, so a rejection
+    is classified from the CLI's ``model_not_found`` code and not only from its sentence (#448, owner decision
+    on D8a). No ``persona_dir`` is passed, so no usage row is written, and the call is suppressed in
+    ``model_error`` so a refused id leaves no record or WARNING.
+    ``timeout_s`` is the time this probe may use (default: the whole Apply budget)."""
+    timeout = max(_MIN_PROBE_S, int(_check_budget_s() if timeout_s is None else timeout_s))
+    try:
+        with model_error.suppressed():
+            ClaudeCliProvider(probe_model=model_id, timeout_seconds=timeout).probe(_MODEL_CHECK_PROMPT)
+        return "ok", ""
+    except provider_auth.ProviderAuthDeferred:
+        return "inconclusive", "auth_deferred"
+    except cli_throttle.ShutdownDeferred:
+        return "inconclusive", "stopping"
+    except TimeoutError:
+        return "inconclusive", "timeout"
+    except Exception as exc:  # noqa: BLE001 - any other failure only means "could not check"
+        if getattr(exc, "stage", None) == "claude_cli_timeout":
+            return "inconclusive", "timeout"
+        if provider_auth.is_auth_failure(str(exc)):  # auth wins over a model signal, as in _chat_error_code
+            return "inconclusive", "auth_failed"
+        if model_error.is_model_rejection(str(exc)):
+            return "rejected", ""
+        return "inconclusive", "failed"
+
+
+# Time source for the save-time check's budget arithmetic (a seam so tests can move time without touching
+# the global ``time.monotonic`` that asyncio's own scheduler uses).
+_clock = time.monotonic
+
+
+async def _apply_chat_model(model: str, *, check: bool, lock: asyncio.Lock) -> tuple[int, dict[str, Any]]:
+    """Set the chat model: validate, check it, write the install's settings file. Returns ``(status, body)``.
+
+    The ONE implementation behind the picker's ``POST /persona/config/model`` and ``nell model set``. The chat model
+    is the install-wide ``model.interactive_chat`` entry of ``tunables.toml`` (every bridge reads it on every call, so
+    there is no live provider to switch). ``model`` is what the user chose, a word (sonnet / opus / haiku) or a
+    full id, applied with the one write rule of ``brain.bridge.model_tier.set_job_models``: the pick WRITES its id as
+    the entry's value (``sonnet`` the chat job's shipped default id, ``opus`` the Opus id, ``haiku`` the alias, a full
+    id exactly as typed). The words ``sonnet`` and ``haiku`` are not probed (the shipped ids were verified); ``opus``
+    and any full id, including one equal to the default, are first checked with one real stream-json call (#440, #448)
+    when ``check`` is true: if Claude rejects it nothing is written; any other check failure (timeout, expired login,
+    rate limit) saves it unchecked. ``lock`` is the single-flight lock all checks share.
+
+    Returns (200, {ok: true, model: <the id the chat job runs after the write>, checked?}),
+            (400, {ok: false, error: "unknown_model", valid: [...]}),
+            (400, {ok: false, error: "model_unavailable", model: <id>}) or
+            (500, {ok: false, error: "tunables_unwritable", detail}).
     """
-    from contextlib import ExitStack
+    from brain.bridge.model_tier import (
+        KNOWN_MODELS,
+        configured_job_models,
+        is_valid_model,
+        model_for_tier,
+        needs_probe,
+        resolve_choice,
+        set_job_models,
+    )
+    from brain.tunables import TunablesWriteError
 
-    from brain.ingest.pipeline import snapshot_stale_sessions
+    if not is_valid_model(model):
+        return 400, {"ok": False, "error": "unknown_model", "valid": sorted(KNOWN_MODELS)}
+    to_write = resolve_choice(model)
+    checked: bool | None = None
+    if check and to_write is not None and needs_probe(model):
+        budget = _check_budget_s()
+        contended = lock.locked()  # another check is running
+        waiting_since = _clock()  # a wait for the lock counts against the budget, so a save stays inside it
+        async with lock:
+            waited = (_clock() - waiting_since) if contended else 0.0
+            remaining = budget - waited
+            if remaining >= _MIN_PROBE_S:
+                outcome, reason = await tracked_to_thread("model check", _check_model_blocking, to_write, remaining)
+            else:  # the wait behind another check used the budget: save unchecked, as for any inconclusive check
+                outcome, reason = "inconclusive", "budget"
+        if outcome == "rejected":
+            return 400, {"ok": False, "error": "model_unavailable", "model": to_write}
+        checked = outcome == "ok"
+        if not checked:
+            logger.info("model check for %s was inconclusive, saved unchecked: reason=%s", to_write, reason)
+        if checked:
+            # An id the probe just proved usable is no longer rejected: drop any earlier runtime record.
+            model_error.note_success(to_write)
+    old_chat = configured_job_models()[TIER_INTERACTIVE_CHAT]
+    try:
+        await asyncio.to_thread(set_job_models, {TIER_INTERACTIVE_CHAT: model})
+    except TunablesWriteError as exc:
+        return 500, {"ok": False, "error": "tunables_unwritable", "detail": str(exc)}
+    after = configured_job_models()
+    new_chat = after[TIER_INTERACTIVE_CHAT]
+    model_error.switch(old_chat, new_chat, keep=after.values())
+    if checked is False:
+        model_error.note_unconfirmed(new_chat)  # shown in /persona/state until a clean reply
+    else:
+        model_error.clear_unconfirmed(new_chat)
+    body: dict[str, Any] = {"ok": True, "model": model_for_tier(TIER_INTERACTIVE_CHAT)}
+    if checked is not None:
+        body["checked"] = checked
+    return 200, body
 
-    with ExitStack() as stack:
+
+async def _flush_cost_series_at_stop(persona_dir: Path) -> None:
+    """The bridge's clean stop saves the cost-series samples still buffered in
+    memory (name-recall fix S146, S164: only a crash may lose them; a normal
+    stop must not, or a restart would not continue from the saved timings).
+    Opens its own short-lived store in a worker thread; never raises."""
+
+    def _flush() -> None:
         store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
-        stack.callback(store.close)
-        hebbian = HebbianMatrix(persona_dir / "hebbian.db")
-        stack.callback(hebbian.close)
-        return snapshot_stale_sessions(
-            persona_dir,
-            silence_minutes=silence_minutes,
-            store=store,
-            hebbian=hebbian,
-            provider=provider,
+        try:
+            cost_series.flush(store)
+        finally:
+            store.close()
+
+    try:
+        await asyncio.to_thread(_flush)
+    except Exception:
+        logger.exception("cost-series flush failed during shutdown")
+    # Name-recall fix S189: the recall diagnostics records buffered while the log's
+    # lock was held are written at a clean stop too (never waits, never raises).
+    try:
+        from brain.memory import recall_diagnostics
+
+        await asyncio.to_thread(
+            recall_diagnostics.flush_pending, recall_diagnostics.diagnostics_path(persona_dir)
         )
+    except Exception:
+        logger.exception("recall diagnostics flush failed during shutdown")
 
 
 # ---------------------------------------------------------------------------
@@ -860,9 +1179,13 @@ class BridgeAppState:
     in_flight_locks: dict[str, asyncio.Lock]
     last_chat_at: datetime | None = None
     supervisor_thread: Any | None = None
+    # #456 (Q6): the supervisor's state ("running" / "restarted" / "failed" ...), shown on /health and /persona/state.
+    supervisor_status: Any | None = None
     migration_thread: Any | None = None  # compaction-backlog-migration (None when background threads are off)
     auth_token: str | None = None
     shutdown_controller: BridgeShutdownController | None = None
+    # #523: the one in-flight launch decision of GET /sessions/active (``_shared_sessions_active_task``); None when idle.
+    sessions_active_task: asyncio.Future | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -879,10 +1202,50 @@ class BridgeAppState:
 _background_threads_inhibited: bool = False
 
 
+# #456 test seam for the real-process stop tests (spec section 8: test-only hooks). Set ONLY in-process, by the test
+# launcher ``tests/bridge/_hooked_bridge.py`` before the runner starts; never from an environment variable, so nothing
+# outside a test can start a bridge with a stub supervisor (pre-merge review O-5). None in production. When set:
+# ``supervisor(stop_event)`` runs in place of the supervisor loop, ``start_tasks(persona_dir)`` starts the test's
+# counted tasks, and no other background thread starts.
+_lifespan_test_hooks: dict[str, Any] | None = None
+
+
+class _TrackedSyncRoute(APIRoute):
+    """Every synchronous endpoint but ``GET /health`` is a counted stop task while its worker thread runs (review of
+    #458).
+
+    The count is taken inside the thread, so uvicorn cancelling the request task after its 30 s graceful window does
+    not uncount work that is still running (the same rule as ``tracked_to_thread``). A GET is not always a read:
+    ``GET /sessions/active`` rolls a stale buffer over (a final extraction, memory writes, the buffer's deletion) and
+    ``GET /kindled-link/my-code`` writes its identity files. Only ``/health``, which a stop must keep answering, is
+    left uncounted."""
+
+    def __init__(self, path: str, endpoint: Callable[..., Any], **kwargs: Any) -> None:
+        is_health = path == "/health" and set(kwargs.get("methods") or ()) == {"GET"}
+        if not inspect.iscoroutinefunction(endpoint) and not is_health:
+            endpoint = _tracked_sync(f"request {path}", endpoint)
+        super().__init__(path, endpoint, **kwargs)
+
+
+def _tracked_sync(label: str, fn: Callable[..., Any]) -> Callable[..., Any]:
+    import functools
+
+    @functools.wraps(fn)  # FastAPI reads the endpoint's signature through __wrapped__
+    def _run(*args: Any, **kwargs: Any) -> Any:
+        # Sealed: ShutdownDeferred, which the app's handler answers with the admission middleware's 503 body.
+        handle = shutdown_progress.registry.register(label)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            shutdown_progress.registry.unregister(handle)
+
+    return _run
+
+
 def build_app(
     persona_dir: Path,
     client_origin: str = "cli",
-    tick_interval_s: float = 60.0,
+    tick_interval_s: float | None = None,
     idle_shutdown_seconds: float | None = None,
     auth_token: str | None = None,
     shutdown_controller: BridgeShutdownController | None = None,
@@ -900,6 +1263,9 @@ def build_app(
     against browser-based attacks if someone proxies localhost). "null"
     matches CLI/non-browser clients; "tauri://localhost" matches SP-8.
 
+    tick_interval_s: the supervisor's tick in seconds. None (default) leaves it to
+    ``run_folded``, which reads the ``embedding_backfill.tick_interval_seconds`` setting.
+
     background_threads: start the supervisor + compaction-backlog-migration
     threads in the lifespan. None (default) → ``not _background_threads_inhibited``,
     resolved at lifespan-enter so a test may flip the flag after constructing the
@@ -913,6 +1279,9 @@ def build_app(
             if background_threads is not None
             else not _background_threads_inhibited
         )
+        hooks = _lifespan_test_hooks
+        if hooks is not None:
+            logger.warning("bridge lifespan: TEST HOOKS ON (stub supervisor and stub tasks)")
         if not bg:
             logger.warning(
                 "bridge lifespan: background threads OFF (supervisor + backlog migration "
@@ -923,17 +1292,28 @@ def build_app(
         # persona_dir. The lifespan only constructs the provider (stateless),
         # the EventBus, the supervisor thread, and the idle watcher.
         #
-        # TIER_INTERACTIVE_CHAT (#154) — routed through the model-tier accessor,
-        # but via `build_interactive_chat_provider` specifically (not the plain
-        # `build_tier_provider` every other tier uses): this is the one real
-        # call site that must keep honoring a persona's own `persona_config.json`
-        # `.model` field rather than forcing the tier's nominal model — see
-        # `brain/bridge/model_tier.py`'s docstring on that function for why.
-        provider = build_interactive_chat_provider(persona_dir)
+        # The chat job (#154) is built like every other job: the persona's provider kind, and the model its
+        # install-wide `model.interactive_chat` setting names, looked up on every call (nothing is
+        # held on this provider, so a settings change reaches the next turn without a restart).
+        provider = build_tier_provider(persona_dir, TIER_INTERACTIVE_CHAT)
 
         bus = EventBus()
         bus.bind_loop(asyncio.get_running_loop())
         events.set_publisher(bus.publish)
+
+        # #456: one stop per bridge app. A new app in this process (tests) starts unstopped; the controller is the
+        # bridge's single stop entry point (a local one when none is passed). A stop that already began (a signal
+        # before the lifespan, review S1) keeps the process-wide flag set. The task registry is the process's own (a
+        # bridge process runs one app); tests that build several apps reset it themselves.
+        controller = (
+            shutdown_controller
+            if isinstance(shutdown_controller, BridgeShutdownController)
+            else BridgeShutdownController()
+        )
+        if not controller.stopping:
+            cli_throttle.clear_shutdown()
+        if controller.persona_dir is None:
+            controller.configure(persona_dir)
 
         app.state.bridge = BridgeAppState(
             persona_dir=persona_dir,
@@ -961,15 +1341,49 @@ def build_app(
         except Exception:
             logger.warning("could not mark the brain overlay in use", exc_info=True)
 
-        # Rewrite the ops-tunables defaults section (spec 2026-07-04). Fail-soft:
-        # write_defaults_section swallows its own errors; belt-and-braces here so
-        # an import problem can't block startup either.
+        # The settings file boot pass (spec 2026-07-04, reshaped in #529): create tunables.toml with every registered
+        # setting, add the ones a new version registered, move a value that still equals its old default onto the new
+        # default. Fail-soft: sync_file swallows its own errors; belt-and-braces here so an import problem can't block
+        # startup either. An unreadable file is left alone and reported with its line.
+        _registry_complete = False
         try:
-            from brain.tunables import write_defaults_section
+            from brain.tunables import sync_file
 
-            write_defaults_section()
+            # Importing a module is what registers its settings, and the pass writes only what is registered in THIS
+            # process. These modules are otherwise loaded lazily (by the supervisor, an upload, a weekly tick), so import
+            # them first: the file then lists every setting from the first boot (a test compares it with a scan of every
+            # register call, so a module missing here fails it). Each import is isolated, so one that fails is logged and
+            # the pass still runs; the old-file fold below then treats the registry as incomplete.
+            _registry_complete = not _import_setting_modules()
+            sync_file()
         except Exception as _exc:  # noqa: BLE001
-            logger.warning("tunables boot rewrite skipped: %s", _exc)
+            _registry_complete = False
+            logger.warning("tunables boot pass skipped: %s", _exc)
+
+        # Backward compatibility, permanent: an old JSON settings file at KINDLED_HOME (NOT under this persona's directory:
+        # an earlier version of this call passed persona_dir and silently migrated nothing) is folded into tunables.toml and
+        # renamed. After the boot pass, before the persona-model fold below, and before the supervisor thread starts, so
+        # no code can read a stale key. The bridge imports every module, so it folds the whole file; when a module could not
+        # be imported above, the registry is incomplete and the fold waits (all-or-nothing), so no setting is discarded for it.
+        try:
+            from brain import paths as _home_paths
+            from brain.tunables_migration import migrate_legacy_json
+
+            migrate_legacy_json(_home_paths.get_home(), complete_registry=_registry_complete)
+        except Exception as _exc:  # noqa: BLE001 - startup must not break on the fold
+            logger.warning("old settings file fold skipped: %s", _exc)
+
+        # Fold a saved per-persona model into the install-wide setting (once per install; this persona's own legacy
+        # keys are cleared every start until gone). After the boot pass and the JSON fold above and BEFORE the touch
+        # below, so the decision sees every persona's PREVIOUS open time.
+        # Fail-soft: model_migration never raises, and a failure leaves the saved model in place for the next start.
+        try:
+            from brain import paths as _paths
+            from brain.model_migration import migrate_persona_models
+
+            migrate_persona_models(_paths.get_home(), persona_dir)
+        except Exception as _exc:  # noqa: BLE001
+            logger.warning("model migration skipped: %s", _exc)
 
         # Touch last_opened_at so PersonaPicker can sort by recency (v0.0.18+)
         try:
@@ -994,7 +1408,7 @@ def build_app(
         # on a lock timeout). The per-turn MCP child, CLI commands,
         # `nell chat --no-bridge` and cmd_start's recovery never call this.
         # Fail-soft like every other non-essential step in this function
-        # (write_defaults_section, the last_opened_at touch, the pronoun
+        # (the settings boot pass, the last_opened_at touch, the pronoun
         # nudge above/below): a bug in this brand-new module must never be
         # the reason a bridge fails to start (code-red-team pass 1, M1).
         try:
@@ -1003,7 +1417,7 @@ def build_app(
             logger.warning("FTS health check skipped: %s", _exc)
 
         # Load the persona emotion vocabulary before any chat request can arrive.
-        # Without this, aggregate_state silently drops all persona-extension
+        # Without this, every reader silently drops all persona-extension
         # emotions for ~15 min after launch (until the supervisor heartbeat tick
         # fires for the first time). Uses a short-lived store — no persistent
         # handle held on app.state per HA hardening rule.
@@ -1012,6 +1426,13 @@ def build_app(
             ensure_persona_vocabulary_loaded(persona_dir, store=_vocab_store)
         finally:
             _vocab_store.close()
+
+        # No emotion-engine switch-over here (S107): the starter runs the rebuild as its own process before this bridge starts, so a
+        # bridge started around the supervisor (python -m brain.bridge.runner) starts on the saved state.
+
+        # The emotion engine's drain at start-up (spec 3.1 S4): alone, before the backlog migration; it catches and logs its
+        # own failures and never raises.
+        emotion_engine.engine_for(persona_dir).note_active(datetime.now(UTC))
 
         # Backwards-compat backlog migration — one-time, before the supervisor's
         # first daily compaction tick can fold a never-compacted backlog cold.
@@ -1034,45 +1455,27 @@ def build_app(
                 # the tolerant reader + next cascade tick self-heal either way.
                 run_sections_migration(persona_dir)
 
-                # Migration folds with COMPACTION_MODEL (haiku), not the chat model.
+                # Migration folds with the compaction job's model, not the chat model.
                 run_backlog_migration(
                     persona_dir, provider=build_compaction_provider(persona_dir)
                 )
             except Exception:  # noqa: BLE001 — startup must not break on the migration
                 logger.exception("compaction backlog migration thread crashed")
 
-        if bg:
-            mig_thread = threading.Thread(
-                target=_run_backlog_migration,
+        if bg and hooks is None:
+            # #456 (C9): a counted task while it runs; not started once the stop has begun.
+            mig_thread = shutdown_progress.start_tracked_thread(
+                "backlog migration",
+                _run_backlog_migration,
                 name="compaction-backlog-migration",
                 daemon=True,
             )
-            mig_thread.start()
             app.state.bridge.migration_thread = mig_thread
-
-        # One-time tunables migration (ram-spike-fix INC-6, S25/S30/S37/S52/S71):
-        # retires the pre-lull idle-tuning keys into the single
-        # chat.idle_lull_seconds key. Synchronous, BEFORE the supervisor thread
-        # starts (C12: ordering asserted here) so no code — including the
-        # supervisor's first loop pass — can ever read a stale key. Fail-safe
-        # internally (never raises); the try/except here is belt-and-suspenders
-        # matching every other non-essential startup step in this function.
-        try:
-            from brain import paths
-            from brain.tunables_migration import migrate_idle_keys
-
-            # tunables.json lives at KINDLED_HOME (paths.get_home()), NOT under
-            # this persona's own directory (get_home()/"personas"/<name>) —
-            # passing persona_dir here would silently migrate a file that
-            # doesn't exist (stage-6 code red-team BLOCKER, caught before ship).
-            migrate_idle_keys(paths.get_home())
-        except Exception as _exc:  # noqa: BLE001 — startup must not break on the migration
-            logger.warning("tunables idle-key migration failed: %s", _exc)
 
         # S82: seed is_chat_idle's anchor from the newest message timestamp
         # already saved in THIS persona's active_conversations/ buffers —
         # BEFORE the supervisor thread starts (same ordering rationale as the
-        # tunables migration above: no reader of the anchor may run first).
+        # tunables fold above: no reader of the anchor may run first).
         # No new persisted file; the function itself fails closed internally
         # on a malformed saved timestamp (S63), so this try/except is
         # belt-and-suspenders matching every other non-essential startup step.
@@ -1083,6 +1486,31 @@ def build_app(
         except Exception as _exc:  # noqa: BLE001 — startup must not break; already fails closed internally
             logger.warning("is-chat-idle seed from active_conversations failed: %s", _exc)
 
+        # Floor bootstraps (name-recall fix S85, revised; spec §2): the cosine
+        # (S91: only the COSINE one) bootstrap floor is computed ONCE per
+        # process, here at process start, on a daemon thread off every reply
+        # path (recall only peeks the caches). Until it finishes, the no-rerank
+        # path renders keyword results only. The RERANK floor bootstraps on
+        # first need in the background; a failed bootstrap is retried in the
+        # background on each incoming message (`respond()`, S92) and at the
+        # next lull by the central cadence jobs. Off with the other
+        # background threads in tests. Fault-isolated: never breaks startup.
+        # Started AFTER the is-chat-idle seed above (the retry rule reads the
+        # same anchor through `chat_activity_marker`, so nothing may read it
+        # before the seed) and before the supervisor thread.
+        if bg and hooks is None:
+            try:
+                from brain.bridge import cli_throttle as _cli_throttle
+                from brain.memory import floor_startup as _floor_startup
+
+                app.state.bridge.floor_bootstrap_thread = _floor_startup.start_background(
+                    persona_dir,
+                    activity_marker=_cli_throttle.chat_activity_marker,
+                    name="floor-bootstrap",
+                )
+            except Exception:  # noqa: BLE001 — startup must not break on the bootstrap thread
+                logger.exception("floor bootstrap startup thread could not be started")
+
         # S84: "bridge start" for the empty-session prune (no message seen yet
         # in this process). Captured here, on this thread, BEFORE the supervisor
         # thread starts and before `yield` lets any /session/new in, so every
@@ -1090,7 +1518,7 @@ def build_app(
         bridge_started_at = datetime.now(UTC)
 
         # Spawn supervisor thread (non-daemon — joins on shutdown)
-        from brain.bridge.supervisor import run_folded
+        from brain.bridge import supervisor as _supervisor_mod
 
         def _is_session_busy(sid: str) -> bool:
             """Best-effort cross-thread check: is a request in-flight for ``sid``?
@@ -1114,24 +1542,51 @@ def build_app(
             return lk is not None and lk.locked()
 
         stop_event = threading.Event()
+        controller.add_stop_event(stop_event)
         sup_thread: threading.Thread | None = None
         if bg:
-            sup_thread = threading.Thread(
-                target=run_folded,
-                kwargs={
-                    "stop_event": stop_event,
-                    "persona_dir": persona_dir,
-                    "provider": provider,
-                    "event_bus": bus,
-                    "tick_interval_s": tick_interval_s,
-                    "is_session_busy": _is_session_busy,
-                    "bridge_started_at": bridge_started_at,
-                },
-                name="sp7-supervisor",
-                daemon=False,
+            # #456 (D1): the supervisor is a counted task from before its thread starts until its loop returns.
+            sup_handle = shutdown_progress.registry.register("supervisor")
+
+            sup_status = _supervisor_mod.SupervisorStatus()
+            app.state.bridge.supervisor_status = sup_status
+            from brain.bridge import state_file as _state_file_mod
+
+            sup_status.on_change = lambda d: _state_file_mod.update(
+                persona_dir, lambda st: setattr(st, "supervisor", d)
             )
-            sup_thread.start()
+
+            def _run_supervisor() -> None:
+                try:
+                    if hooks is not None:
+                        hooks["supervisor"](stop_event)
+                        return
+                    # #456 (D9): a loop death restarts the loop; a startup death re-runs the startup once.
+                    _supervisor_mod.run_supervised(
+                        stop_event,
+                        status=sup_status,
+                        persona_dir=persona_dir,
+                        provider=provider,
+                        event_bus=bus,
+                        tick_interval_s=tick_interval_s,
+                        is_session_busy=_is_session_busy,
+                        bridge_started_at=bridge_started_at,
+                        activity=lambda job: shutdown_progress.registry.set_activity(
+                            sup_handle, f"background job: {job}" if job else "supervisor"
+                        ),
+                    )
+                finally:
+                    shutdown_progress.registry.unregister(sup_handle)
+
+            sup_thread = threading.Thread(target=_run_supervisor, name="sp7-supervisor", daemon=False)
+            try:
+                sup_thread.start()
+            except BaseException:
+                shutdown_progress.registry.unregister(sup_handle)
+                raise
             app.state.bridge.supervisor_thread = sup_thread
+            if hooks is not None:
+                hooks["start_tasks"](persona_dir)
 
         # Idle-shutdown watcher (only if requested)
         idle_task = None
@@ -1141,14 +1596,18 @@ def build_app(
         try:
             yield
         finally:
-            # Shutdown sequence per spec §7:
-            #   1. Cancel idle watcher (so it can't fire SIGTERM during teardown)
-            #   2. Drain in-flight chats (best-effort wait, 30s cap)
-            #   3. Close all live sessions via ingest pipeline (silence_minutes=0)
-            #   4. Stop supervisor thread (180s join cap)
-            #   5. Heartbeat close-trigger (Reflex Phase 2 growth tick anchor)
-            #   6. Publish shutdown event
-            #   7. Clear publisher
+            # #456 stop sequence (spec 2.1, Q-B: no session drain, no close heartbeat):
+            #   0. begin_stop belt (never overwrites the reason a path recorded first)
+            #   1. cancel the idle watcher and the derived-model re-check
+            #   2. wait, with no time limit, until the supervisor thread has ended and the task registry is empty,
+            #      then seal it in the same step (nothing registers after)
+            #   3. flush the cost series and recall diagnostics
+            #   4. publish the shutdown event
+            #   5. clear the publisher
+            # A signal the monitor has not applied yet keeps its reason (review R2-S3, C13). "unknown" means no stop was
+            # asked for (uvicorn ended for its own reasons); the runner's after-run decision records that as a crash.
+            # Off the event loop: a first stop writes the bridge.json mark (review O-6).
+            await asyncio.to_thread(controller.begin_stop, controller.signal_reason or _STOP_REASON_UNKNOWN)
 
             # 1. Cancel idle watcher
             if idle_task is not None:
@@ -1160,88 +1619,52 @@ def build_app(
                 except Exception:
                     logger.exception("idle watcher raised during teardown")
 
-            # 2. Drain in-flight chats — wait up to 30s for active locks to release
-            await _wait_for_in_flight_drain(app.state.bridge, timeout=30.0)
+            # 2. Wait for everything that is running. No internal time limit (C10): the user decides when to give up
+            #    (the watcher's hard-exit offer); this process never writes "stopped" while work runs.
+            while (sup_thread is not None and sup_thread.is_alive()) or not shutdown_progress.registry.seal():
+                await asyncio.sleep(_STOP_POLL_S)
 
-            # 3. Close all live sessions (silence_minutes=0) via per-call stores.
-            #    This is the data-saving step — every conversation that was open
-            #    becomes memory before the lights go out.
-            drain_errors = 0
+            # 3. Save the buffered cost-series samples (S146, S164) now that the supervisor, the only other flusher,
+            #    has stopped.
+            await _flush_cost_series_at_stop(persona_dir)
+
+            # 4. Publish shutdown event
             try:
-                reports = await asyncio.to_thread(
-                    _drain_sessions_blocking,
-                    persona_dir,
-                    provider,
-                    0,
-                )
-            except Exception:
-                logger.exception("shutdown drain failed")
-                reports = []
-                drain_errors = 1
-
-            # 3b. Record drain-error count to the state file. The runner's
-            # `_write_clean_shutdown` (atexit + finally) reads this and
-            # leaves shutdown_clean=False if any session failed to ingest,
-            # so the next bridge start re-runs `run_recovery_if_needed`
-            # against the orphan buffers instead of treating the dirty
-            # exit as clean. This closes the "clean shutdown that
-            # happened to have a failed drain" hole.
-            drain_errors += sum(getattr(r, "errors", 0) for r in reports)
-            if drain_errors > 0:
-                try:
-                    from brain.bridge import state_file as _state_file_mod
-
-                    cur = _state_file_mod.read(persona_dir)
-                    if cur is not None:
-                        cur.drain_errors = drain_errors
-                        cur.shutdown_clean = False
-                        _state_file_mod.write(persona_dir, cur)
-                    logger.warning(
-                        "shutdown drain produced %d ingest errors; marked dirty for next start",
-                        drain_errors,
-                    )
-                except Exception:
-                    logger.exception("failed to record drain_errors to state file")
-
-            # 4. Stop supervisor thread (None when background threads are off)
-            stop_event.set()
-            if sup_thread is not None:
-                sup_thread.join(timeout=180.0)
-                if sup_thread.is_alive():
-                    logger.warning("supervisor thread did not stop within 180s")
-
-            # 5. Heartbeat close-trigger — anchor for Reflex Phase 2 weekly growth.
-            #    In-process import + run_tick(trigger="close"). Best-effort:
-            #    failure is logged but doesn't block shutdown.
-            try:
-                await asyncio.to_thread(_run_heartbeat_close, persona_dir, provider)
-            except Exception:
-                logger.exception("heartbeat close-trigger failed during shutdown")
-
-            # 6. Publish shutdown event
-            try:
-                bus.publish(
-                    {
-                        "type": "shutdown",
-                        "clean": drain_errors == 0,
-                        "drained": len(reports),
-                        "drain_errors": drain_errors,
-                        "at": _now(),
-                    }
-                )
+                bus.publish({"type": "shutdown", "clean": True, "reason": controller.reason, "at": _now()})
             except Exception:
                 logger.exception("shutdown event publish failed")
 
-            # 7. Clear publisher
+            # 5. Clear publisher
             events.set_publisher(None)
             logger.info("bridge stopped persona=%s", persona_dir.name)
 
     app = FastAPI(title="companion-emergence bridge", version="0.1.0", lifespan=lifespan)
+    app.router.route_class = _TrackedSyncRoute
 
     # CORS — narrowly scoped to the same allowed_origins used for WS auth,
     # plus localhost dev origins (Tauri devUrl + Vite default ports). Bearer
     # auth still gates every route — CORS is not a security boundary, just a
     # same-origin policy waiver for the trusted local app surface.
+    # #456 (C40, D21): once the stop has begun, every request except GET /health is refused with 503
+    # {"code": "bridge_stopping"} and runs no engine code. A request admitted before the stop runs to its end.
+    @app.middleware("http")
+    async def _admission(request: Request, call_next):  # noqa: ANN202 - Starlette middleware signature
+        if (
+            cli_throttle.shutdown_requested()
+            and request.method != "OPTIONS"
+            and not (request.method == "GET" and request.url.path == "/health")
+        ):
+            return JSONResponse(
+                status_code=503, content={"code": "bridge_stopping", "message": "the bridge is stopping"}
+            )
+        return await call_next(request)
+
+    # A request admitted just before the stop whose worker registers after the seal (tracked_to_thread) is refused the
+    # same way as one that arrives after it, not with a 500 (review of #458).
+    @app.exception_handler(cli_throttle.ShutdownDeferred)
+    async def _stopping(_request: Request, _exc: cli_throttle.ShutdownDeferred) -> JSONResponse:
+        return JSONResponse(status_code=503, content={"code": "bridge_stopping", "message": "the bridge is stopping"})
+
     from fastapi.middleware.cors import CORSMiddleware
 
     cors_origins = list(allowed_origins) + list(DEV_ALLOWED_ORIGINS)
@@ -1361,6 +1784,13 @@ def build_app(
             logger.warning("overlay probe failed", exc_info=True)
             running = None
 
+        # #364: replies that failed to parse, per site, so a quiet fallback shows.
+        try:
+            parse_failures = count_recent_parse_failures(s.persona_dir)
+        except OSError:  # the restart health-poll path: must never 500
+            logger.warning("parse-failure count failed", exc_info=True)
+            parse_failures = {}
+
         return {
             "liveness": "ok",
             "version": _brain_version,
@@ -1370,10 +1800,13 @@ def build_app(
             "sessions_active": len(all_sessions()),
             "last_chat_at": s.last_chat_at.isoformat() if s.last_chat_at else None,
             "supervisor_thread": sup_status,
+            # #456 (Q6): "running" / "restarted" (with the error) / "failed" / "stopped", or None (not started).
+            "supervisor": s.supervisor_status.as_dict() if s.supervisor_status is not None else None,
             "health_scan": health_scan,
             "health_error": health_error,
             "pending_alarms": len(alarms),
             "anomalies": len(anomalies),
+            "parse_failures_24h": parse_failures,
             # #246: the brain's CLI login state — "expired" means background LLM
             # calls are backed off and the app should offer re-authorisation.
             "provider_auth": provider_auth.state(),
@@ -1398,90 +1831,18 @@ def build_app(
         )
 
     @app.get("/sessions/active", dependencies=[Depends(require_http_auth)])
-    def sessions_active_endpoint() -> dict[str, str | None]:
-        """Return the most-recent-turn session_id that's still attach-eligible.
+    async def sessions_active_endpoint() -> StreamingResponse:
+        """Return the session the app should attach to on launch: ``{"session_id": "<uuid>"}`` or ``{"session_id": null}``.
 
-        "Attach-eligible" = the session's last turn is younger than the
-        24h finalize threshold (matches the supervisor's
-        ``finalize_after_hours`` default in brain.bridge.supervisor —
-        deliberately hardcoded rather than wired through a config knob).
-        Older buffers will be cleaned up by the next supervisor finalize
-        tick; returning them would invite a race where the renderer
-        attaches and then immediately has the session deleted.
-
-        Response: ``{"session_id": "<uuid>"}`` or ``{"session_id": null}``.
+        The decision (``_sessions_active_blocking``: the attach-eligible session, or the rollover of a stale buffer, whose
+        extraction runs to the end, #523) runs in a worker thread as ONE shared task per persona
+        (``_shared_sessions_active_task``): a request that arrives while it runs waits for the same answer. On the event loop
+        this route only looks the task up and streams: one space every ``bridge.stream_keepalive_seconds`` until the task is
+        done, then the JSON (``_sessions_active_body``), so a launch rollover that takes minutes is not cut as idle. Always
+        200 ``application/json``; the fast paths answer in milliseconds with the JSON as the only body message.
         """
-        from contextlib import ExitStack
-
-        from brain.chat.rollover import perform_rollover
-        from brain.ingest.buffer import list_active_sessions, read_session
-
         s: BridgeAppState = app.state.bridge
-        now = datetime.now(UTC)
-        # 24 hours mirrors supervisor.finalize_after_hours default — sessions
-        # older than this are eligible for finalize and may disappear on
-        # the next sweep, so don't advertise them as attachable.
-        _ATTACH_MAX_AGE_HOURS = 24.0  # noqa: N806 — local frozen constant
-        best_sid: str | None = None
-        best_ts: datetime | None = None
-        # Stale (idle > threshold) selection for the 1c-A rollover: roll over the
-        # MOST-RECENTLY-ACTIVE stale buffer (the one the user most plausibly
-        # continues); tie-break the lexicographically-largest sid (stage-3 A1-b).
-        stale_sid: str | None = None
-        stale_ts: datetime | None = None
-        for sid in list_active_sessions(s.persona_dir):
-            try:
-                turns = read_session(s.persona_dir, sid)
-            except (ValueError, OSError):
-                # Defensive: a malformed session_id on disk or unreadable
-                # file shouldn't take the endpoint down. Skip and move on.
-                continue
-            if not turns:
-                continue
-            raw_ts = turns[-1].get("ts")
-            if not raw_ts:
-                # Defensive — ingest_turn always writes a ts, so this
-                # should not happen in practice. Skip.
-                continue
-            try:
-                last = datetime.fromisoformat(str(raw_ts).replace("Z", "+00:00"))
-                if last.tzinfo is None:
-                    last = last.replace(tzinfo=UTC)
-            except (ValueError, TypeError):
-                continue
-            age_hours = (now - last).total_seconds() / 3600.0
-            if age_hours >= _ATTACH_MAX_AGE_HOURS:
-                if stale_ts is None or last > stale_ts or (last == stale_ts and sid > (stale_sid or "")):
-                    stale_ts = last
-                    stale_sid = sid
-                continue
-            if best_ts is None or last > best_ts:
-                best_ts = last
-                best_sid = sid
-
-        if best_sid is not None:
-            return {"session_id": best_sid}
-
-        # No attach-eligible session — if a stale buffer exists, SYNC-roll it over
-        # (extract → fold everything → archive → delete old buffer → seed a
-        # summary-only head) and return the NEW session id (1c-A, owner-ratified).
-        if stale_sid is not None:
-            try:
-                with ExitStack() as stack:
-                    store = MemoryStore(s.persona_dir / "memories.db", integrity_check=False)
-                    stack.callback(store.close)
-                    hebbian = HebbianMatrix(s.persona_dir / "hebbian.db")
-                    stack.callback(hebbian.close)
-                    new_sid = perform_rollover(
-                        s.persona_dir, stale_sid, s.persona,
-                        seed_mode="summary_only", now=now, provider=s.provider,
-                        store=store, hebbian=hebbian,
-                    )
-                return {"session_id": new_sid}
-            except Exception:
-                logger.exception("sessions_active: stale rollover failed sid=%s", stale_sid)
-                return {"session_id": None}
-        return {"session_id": None}
+        return StreamingResponse(_sessions_active_body(_shared_sessions_active_task(s)), media_type="application/json")
 
     @app.get("/state/{session_id}", dependencies=[Depends(require_http_auth)])
     def state_endpoint(session_id: str) -> dict[str, Any]:
@@ -1516,7 +1877,11 @@ def build_app(
         """
         from brain.bridge.persona_state import build_persona_state
 
-        return build_persona_state(persona_dir)
+        state = build_persona_state(persona_dir)
+        sup_state = app.state.bridge.supervisor_status
+        if isinstance(state, dict):
+            state["supervisor"] = sup_state.as_dict() if sup_state is not None else None  # #456 (Q6)
+        return state
 
     # ── /persona/feed — visible inner life journal ──────────────────────────
     @app.get("/persona/feed", dependencies=[Depends(require_http_auth)])
@@ -1545,12 +1910,9 @@ def build_app(
         _maturity_order = {"known": 0, "forming": 1, "immature": 2, "falsified": 3}
         patterns_sorted = sorted(patterns, key=lambda p: _maturity_order.get(p.maturity, 99))
         backfill = None
-        bf_path = persona_dir / "attunement" / "backfill_state.json"
-        if bf_path.exists():
-            try:
-                backfill = json.loads(bf_path.read_text(encoding="utf-8"))
-            except (ValueError, OSError):
-                backfill = None
+        backfill = read_json(
+            persona_dir / "attunement" / "backfill_state.json", default=lambda: None
+        )  # missing, corrupt or unreadable: None
         return {
             "current_read": asdict(current) if current else None,
             "learned_patterns": [asdict(p) for p in patterns_sorted],
@@ -1841,40 +2203,29 @@ def build_app(
             return _self_test.run_self_test(persona_dir, http=http)
 
     # ── POST /persona/config/model — live model switching ──────────────────
+    model_check_lock = asyncio.Lock()  # single-flight: one Apply-time check call at a time
+
     @app.post("/persona/config/model", dependencies=[Depends(require_http_auth)])
     async def set_persona_model(req: ModelConfigReq) -> dict:
-        """Switch the active LLM model without restarting the bridge.
+        """Set the chat model for the whole install (see ``_apply_chat_model``).
 
-        Validates `model` against KNOWN_MODELS (sonnet / opus / haiku),
-        persists to persona_config.json, and hot-swaps provider._model so
-        the next chat uses the new model immediately.
+        The chat model is the install-wide ``model.interactive_chat`` entry of the settings file; every bridge reads it
+        on every call, so nothing is switched live. A persona on another provider (ollama, fake) is refused: its
+        picker must not change every Claude persona's setting.
 
-        Returns: {ok: true, model: <new_model>}
+        Returns: {ok: true, model: <the id the chat job runs now>}  (+ ``checked: bool`` when a check was attempted)
         Errors:  400 {ok: false, error: "unknown_model", valid: [...]}
+                 400 {ok: false, error: "model_unavailable", model: <id>}
+                 400 {ok: false, error: "model_not_applicable"}
+                 500 {ok: false, error: "tunables_unwritable", detail}
         """
-        from dataclasses import replace as dc_replace
-
-        from brain.persona_config import KNOWN_MODELS, PersonaConfig
-
-        if req.model not in KNOWN_MODELS:
-            return JSONResponse(
-                status_code=400,
-                content={
-                    "ok": False,
-                    "error": "unknown_model",
-                    "valid": sorted(KNOWN_MODELS),
-                },
-            )
         s: BridgeAppState = app.state.bridge
-        config_path = s.persona_dir / "persona_config.json"
-        current = PersonaConfig.load(config_path)
-        updated = dc_replace(current, model=req.model)
-        updated.save(config_path)
-        # Hot-swap: if the live provider exposes _model, update it so the
-        # next chat call uses the new model without a bridge restart.
-        if hasattr(s.provider, "_model"):
-            s.provider._model = req.model
-        return {"ok": True, "model": req.model}
+        if not isinstance(s.provider, ClaudeCliProvider):
+            return JSONResponse(status_code=400, content={"ok": False, "error": "model_not_applicable"})
+        status, result = await _apply_chat_model(req.model, check=True, lock=model_check_lock)
+        if status != 200:
+            return JSONResponse(status_code=status, content=result)
+        return result
 
     # ── POST /persona/config/pronouns — user pronoun persist ──────────────
     @app.post("/persona/config/pronouns", dependencies=[Depends(require_http_auth)])
@@ -2158,7 +2509,7 @@ def build_app(
         """Apply an accepted voice-edit proposal — three-place write.
 
         Three writes on accept (all best-effort isolated):
-          1. nell-voice.md — atomic temp+rename, replace old_text with new_text.
+          1. nell-voice.md — atomic (the shared writer), replace old_text with new_text.
           2. initiate_audit.jsonl — record `replied_explicit` transition.
           3. crystallizations.db.voice_evolution — durable record of the edit.
 
@@ -2249,14 +2600,12 @@ def build_app(
             at=now_iso,
         )
 
-        # Place 2: voice template file (atomic via temp+rename).
+        # Place 2: voice template file (atomic via the shared writer).
         # If this raises after the audit update, the 500 propagates and
         # leaves the persona in a recoverable state: audit says
         # "replied_explicit", file unchanged. Hana can re-issue accept
         # after fixing the underlying disk error.
-        tmp = voice_path.with_suffix(voice_path.suffix + ".tmp")
-        tmp.write_text(new_content, encoding="utf-8")
-        tmp.replace(voice_path)
+        save_with_backup_text(voice_path, new_content, keep_backups=False)
 
         # Place 3: SoulStore voice_evolution.
         try:
@@ -2374,9 +2723,9 @@ def build_app(
         return {"ok": True}
 
     # ── POST /upload — file upload (images + non-image files) ──────────────
-    # Image upload limit (matches the spec D2 default; per-persona override
-    # via PersonaConfig.image_max_bytes can come later if needed).
-    _IMAGE_MAX_BYTES = 20 * 1024 * 1024  # noqa: N806 — local frozen constant
+    # The kinds of image the byte sniff (brain.images.sniff_media_type) can recognise: the declared type of an upload
+    # is only cross-checked against the sniffed one for these. Not files.image_types, which says which images the
+    # read_file tool opens and can only narrow this set.
     _ALLOWED_UPLOAD_MEDIA_TYPES = frozenset(  # noqa: N806
         {"image/png", "image/jpeg", "image/webp", "image/gif"}
     )
@@ -2409,10 +2758,12 @@ def build_app(
 
         s: BridgeAppState = app.state.bridge
         declared_media_type = (file.content_type or "").lower()
-        # Read up to the larger of the two caps + 1 so overrun is detectable
-        # without buffering arbitrarily large payloads in memory.
-        max_bytes = max(_IMAGE_MAX_BYTES, file_store.upload_max_bytes())
-        raw = await file.read(max_bytes + 1)
+        # Read up to the cap + 1 so overrun is detectable without buffering
+        # arbitrarily large payloads in memory, and never more than the body
+        # holds (a large cap must not reach the read). One cap for images and
+        # files: the files.upload_max_bytes setting.
+        max_bytes = file_store.upload_max_bytes()
+        raw = await _read_upload_capped(file, max_bytes)
         if len(raw) > max_bytes:
             raise HTTPException(
                 status_code=413,
@@ -2435,7 +2786,8 @@ def build_app(
                     status_code=422,
                     detail=(f"declared {declared_media_type!r} but bytes look like {sniffed!r}"),
                 )
-            record = save_image_bytes(s.persona_dir, raw, sniffed)
+            # Off the event loop and counted as a request worker (#456): the write fsyncs up to the upload cap.
+            record = await tracked_to_thread("upload", save_image_bytes, s.persona_dir, raw, sniffed)
             return {
                 "kind": "image",
                 "sha": record.sha,
@@ -2444,7 +2796,7 @@ def build_app(
             }
         # Non-image path (#43). The on-disk name is the content sha only; the
         # client filename is returned as display metadata, never a path part.
-        frecord = file_store.save_file_bytes(s.persona_dir, raw)
+        frecord = await tracked_to_thread("upload", file_store.save_file_bytes, s.persona_dir, raw)
         return {
             "kind": "file",
             "sha": frecord.sha,
@@ -2574,7 +2926,7 @@ def build_app(
 
         Reads ``<persona>/active_conversations/<session_id>.jsonl`` line
         by line through the canonical
-        :func:`iter_jsonl_skipping_corrupt`, then yields the latest
+        :func:`iter_jsonl`, then yields the latest
         ``limit`` turns whose ``turn`` index is strictly less than
         ``before_turn`` (when supplied). ``turn`` is the 1-based line
         index — synthetic, since the buffer doesn't store it on disk —
@@ -2644,7 +2996,7 @@ def build_app(
         # generator, and an unclosed reader keeps the buffer file handle
         # alive until GC — on Windows that blocks close_session's unlink
         # (WinError 32). contextlib.closing closes it deterministically.
-        with contextlib.closing(iter_jsonl_skipping_corrupt(path)) as reader:
+        with contextlib.closing(iter_jsonl(path, recover=Recovery.RAISE)) as reader:
             for idx, raw in enumerate(reader, start=1):
                 # ``idx`` is monotonic — once it crosses the cursor we're done
                 # reading; ``break`` avoids paying O(buffer size) per page.
@@ -2671,11 +3023,11 @@ def build_app(
     @app.post("/tools/search_memories", dependencies=[Depends(require_http_auth)])
     async def search_memories_endpoint(req: SearchMemoriesReq) -> dict[str, Any]:
         s: BridgeAppState = app.state.bridge
-        return await asyncio.to_thread(_search_memories_blocking, s.persona_dir, req)
+        return await tracked_to_thread("memory search", _search_memories_blocking, s.persona_dir, req)
 
     # ── POST /chat — JSON one-shot fallback ────────────────────────────────
     @app.post("/chat", dependencies=[Depends(require_http_auth)])
-    async def chat(req: ChatReq) -> dict[str, Any]:
+    async def chat(req: ChatReq, background_tasks: BackgroundTasks) -> dict[str, Any]:
         s: BridgeAppState = app.state.bridge
         # F-201 Phase B: hydrate from disk if the in-memory registry was
         # cleared by a bridge restart but the buffer file still exists.
@@ -2693,7 +3045,8 @@ def build_app(
             t0 = datetime.now(UTC)
             events.publish("chat_started", session_id=sid, client=s.client_origin)
             try:
-                result = await asyncio.to_thread(
+                result = await tracked_to_thread(
+                    "chat reply",
                     _respond_blocking,
                     s.persona_dir,
                     sess,
@@ -2707,7 +3060,7 @@ def build_app(
                 # logs only — clients get a stable code, not stderr or
                 # local paths from the underlying provider/process.
                 # #246: classified from THIS call's text, never from global state.
-                raise HTTPException(status_code=502, detail=_chat_error_code(exc)) from exc
+                raise HTTPException(status_code=502, detail=_chat_error_detail(exc, s.provider)) from exc
             duration_ms = int((datetime.now(UTC) - t0).total_seconds() * 1000)
             s.last_chat_at = datetime.now(UTC)
             events.publish(
@@ -2716,6 +3069,8 @@ def build_app(
                 turn=result.turn,
                 duration_ms=duration_ms,
             )
+            # The emotion engine's drain runs after the response is sent (spec 3.1 S4), and only on this success path.
+            background_tasks.add_task(_drain_emotion_engine, s.persona_dir)
             return {
                 "session_id": sid,
                 "reply": result.content,
@@ -2828,6 +3183,13 @@ def build_app(
                 return
             reply_to_audit_id = raw_reply_id
 
+        # #456 (C40): no new turn once the stop has begun.
+        if cli_throttle.shutdown_requested():
+            await ws.send_json({"type": "error", "code": "bridge_stopping", "done": True})
+            await ws.close()
+            return
+
+        drain_after_close = False  # set only by the success path; every error path returns before it
         async with lock:
             t0 = datetime.now(UTC)
             await ws.send_json({"type": "started", "session_id": session_id, "at": _now()})
@@ -2840,7 +3202,8 @@ def build_app(
             # complete even if the audit/memory write fails.
             if reply_to_audit_id is not None:
                 try:
-                    await asyncio.to_thread(
+                    await tracked_to_thread(
+                        "chat reply",
                         _apply_replied_explicit_transition,
                         s.persona_dir,
                         reply_to_audit_id,
@@ -2860,7 +3223,8 @@ def build_app(
 
             async def _guarded_respond() -> Any:
                 try:
-                    return await asyncio.to_thread(
+                    return await tracked_to_thread(
+                        "chat reply",
                         _respond_blocking,
                         s.persona_dir,
                         sess,
@@ -2870,7 +3234,7 @@ def build_app(
                         reply_to_audit_id,
                     )
                 finally:
-                    chunk_q.put_nowait(None)
+                    _end_chunk_stream(loop, chunk_q)
 
             respond_task = asyncio.create_task(_guarded_respond())
 
@@ -2902,7 +3266,11 @@ def build_app(
                 logger.exception("stream failed session=%s", session_id)
                 # Audit 2026-05-07 P3-2: stable code for clients;
                 # full exception text stays in the log only.
-                await ws.send_json({"type": "error", "code": _chat_error_code(exc), "done": True})
+                error_frame: dict[str, Any] = {"type": "error", "code": _chat_error_code(exc), "done": True}
+                rejected_model = _chat_error_model(exc, s.provider)
+                if rejected_model:
+                    error_frame = {**error_frame, "model": rejected_model}
+                await ws.send_json(error_frame)
                 await ws.close()
                 return
 
@@ -2953,6 +3321,11 @@ def build_app(
             # client gets the clean shutdown it expects after the
             # `done` frame.
             await ws.close(code=1000)
+            drain_after_close = True
+        # The emotion engine's drain, after the clean close so the client never waits for it, after the session's turn
+        # lock is released so the next turn does not wait behind a catch-up, and only on the success path.
+        if drain_after_close:
+            await _drain_emotion_engine(s.persona_dir)
 
     # ── WS /events — server-push only broadcast ────────────────────────────
     @app.websocket("/events")
@@ -2983,12 +3356,12 @@ def build_app(
         status_code=202,
         dependencies=[Depends(require_http_auth)],
     )
-    async def supervisor_shutdown() -> dict[str, Any]:
+    async def supervisor_shutdown(request: Request) -> dict[str, Any]:
         """Trigger graceful shutdown via the shutdown controller.
 
-        Returns 202 immediately. The actual drain (30s in-flight chat wait +
-        supervisor join + buffer snapshot) runs in the FastAPI lifespan
-        teardown triggered by uvicorn server.should_exit via the controller.
+        Returns 202 immediately. The stop itself (#456) runs in the FastAPI
+        lifespan teardown, triggered through the controller: it waits, with no
+        time limit, for every registered task to end, then seals the registry.
 
         Requires a shutdown controller (set by runner.py via build_app). If the
         bridge was started without one (e.g. tests that do not pass a controller),
@@ -3009,10 +3382,20 @@ def build_app(
                 },
             )
 
-        ok = s.shutdown_controller.request("manual_restart")
+        # #456 (C13): an optional body names why: {"reason": "user_stop" | "app_restart"}; none = "manual_restart".
+        reason = REASON_MANUAL_RESTART
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - no body, or not JSON: the default reason
+            body = None
+        if isinstance(body, dict) and body.get("reason") in (REASON_USER_STOP, REASON_APP_RESTART):
+            reason = body["reason"]
+        # Off the event loop (review O-6): the request writes the bridge.json "stopping" mark, which can fsync; it is
+        # still on disk before the 202 (C6).
+        ok = await asyncio.to_thread(s.shutdown_controller.request, reason)
         if not ok:
             logger.error("manual restart could not request controller shutdown")
-        return {"status": "shutting_down", "drain_seconds": 30}
+        return {"status": "shutting_down"}
 
     # ── POST /sessions/snapshot — non-destructive ingest (preserves buffer) ──
     @app.post("/sessions/snapshot", dependencies=[Depends(require_http_auth)])
@@ -3028,7 +3411,8 @@ def build_app(
         lock = s.in_flight_locks.setdefault(sid, asyncio.Lock())
         async with lock:
             try:
-                report = await asyncio.to_thread(
+                report = await tracked_to_thread(
+                    "session snapshot",
                     _snapshot_session_blocking,
                     s.persona_dir,
                     sid,
@@ -3048,16 +3432,22 @@ def build_app(
         events.publish(
             "session_snapshot",
             session_id=sid,
+            deferred=report.deferred,
+            busy=report.busy,
             committed=report.committed,
             enqueued=report.enqueued,
             deduped=report.deduped,
             soul_candidates=report.soul_candidates,
             soul_queue_errors=report.soul_queue_errors,
             errors=report.errors,
+            chunks=report.chunks,
         )
         return {
             "session_id": sid,
             "closed": False,
+            "deferred": report.deferred,
+            "busy": report.busy,
+            "chunks": report.chunks,
             "committed": report.committed,
             "enqueued": report.enqueued,
             "deduped": report.deduped,
@@ -3103,7 +3493,8 @@ def build_app(
             # H-A: per-call stores inside the worker thread, not shared singletons.
             # Wrap the pipeline call so internal exceptions don't crash the handler.
             try:
-                report = await asyncio.to_thread(
+                report = await tracked_to_thread(
+                    "session close",
                     _close_session_blocking,
                     s.persona_dir,
                     sid,
@@ -3152,8 +3543,9 @@ def build_app(
                     errors=report.errors,
                 )
                 # Extraction failures AND commit failures deliberately retain
-                # the JSONL buffer for retry (close_session gates the delete
-                # on report.commit_failures == 0). Do not remove the in-memory
+                # the JSONL buffer for retry (close_session deletes it only when
+                # report.reached_end: every chunk committed and no row arrived
+                # during the pass, #523). Do not remove the in-memory
                 # session or drop its lock entry, otherwise the retry path
                 # turns into 404 while the client was told nothing actionable.
                 raise HTTPException(
@@ -3170,6 +3562,30 @@ def build_app(
                         "errors": report.errors,
                     },
                 )
+
+            if report.deferred or report.busy or not report.reached_end:
+                # #473, #477: "not now", not a failure. The pass left the buffer on disk (a deferral or a busy pass; or,
+                # #523, rows arrived while the close ran, so the buffer was kept with them after the cursor), so the
+                # session stays registered (a retry or the sweep will take it) and the response says so instead of
+                # claiming the close happened.
+                events.publish(
+                    "session_close_deferred",
+                    session_id=sid,
+                    deferred=report.deferred,
+                    busy=report.busy,
+                )
+                return {
+                    "session_id": sid,
+                    "closed": False,
+                    "deferred": report.deferred,
+                    "busy": report.busy,
+                    "committed": report.committed,
+                    "enqueued": report.enqueued,
+                    "deduped": report.deduped,
+                    "soul_candidates": report.soul_candidates,
+                    "soul_queue_errors": report.soul_queue_errors,
+                    "errors": report.errors,
+                }
 
             # H2: clean up registry + lock so sessions_active stays accurate.
             remove_session(sid)
@@ -3188,6 +3604,8 @@ def build_app(
         return {
             "session_id": sid,
             "closed": True,
+            "deferred": False,
+            "busy": False,
             "committed": report.committed,
             "enqueued": report.enqueued,
             "deduped": report.deduped,

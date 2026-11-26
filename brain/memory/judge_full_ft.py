@@ -80,7 +80,10 @@ LabeledTriple = tuple[str, str, str]
 # increment's — this exists only so the knob is live/overridable from day
 # one. The bounded sequence length reuses the shared
 # `judge_selftune.lora_max_length` tunable (see `build_full_ft_retrain_fn`).
-FULL_FT_EPOCHS_DEFAULT: int = tunables.register("judge_selftune.full_ft_epochs", 1)
+FULL_FT_EPOCHS_DEFAULT: int = tunables.register(
+    "judge_selftune.full_ft_epochs", 1,
+    description="How many passes the full judge retrain makes over its examples.",
+)
 
 
 def _label_to_float(label: str) -> float:

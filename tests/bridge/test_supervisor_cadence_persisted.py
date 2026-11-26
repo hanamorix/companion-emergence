@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from brain import dev_constants
 from brain.bridge.model_tier import MODEL_RELEVANCE_JUDGE
 from brain.bridge.supervisor import run_folded
 from brain.memory import judge_selftune
@@ -21,7 +22,7 @@ from brain.memory.store import MemoryStore
 
 # #210: every test below stops the loop from inside its counted callback, so this is only a
 # ceiling for the failure path. 2 s was too tight for the windows-latest runner under load.
-_WATCHDOG_S = 10.0
+_WATCHDOG_S = 60.0
 
 
 def _cadence_dir(persona_dir: Path) -> Path:
@@ -116,13 +117,14 @@ def test_maintenance_fires_from_persisted_due_time_on_fresh_process(
         )
     )
     _neutralise(monkeypatch)
-    monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", lambda *a, **k: None)
     calls = [0]
     stop = threading.Event()
+    # #456 (C3): a stop requested during forgetting pauses the maintenance job (no narrative pass, no advance), so
+    # the loop is ended from the narrative pass, which runs after forgetting when no stop is pending.
+    monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", lambda *a, **k: stop.set())
 
     def _counter(*a, **k):
         calls[0] += 1
-        stop.set()
         return {}
 
     monkeypatch.setattr("brain.bridge.supervisor.forgetting_run_pass", _counter)
@@ -242,13 +244,13 @@ def test_maintenance_advances_even_when_forgetting_raises(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
     )
     _neutralise(monkeypatch)
-    monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", lambda *a, **k: None)
     stop = threading.Event()
+    # #456 (C3): end the loop from the narrative pass (see the test above), not from inside forgetting.
+    monkeypatch.setattr("brain.bridge.supervisor._run_narrative_memory_pass", lambda *a, **k: stop.set())
     raised = [0]
 
     def _raiser(*a, **k):
         raised[0] += 1
-        stop.set()
         raise RuntimeError("boom")
 
     monkeypatch.setattr("brain.bridge.supervisor.forgetting_run_pass", _raiser)
@@ -403,7 +405,7 @@ def test_vocab_repair_fires_from_persisted_due_time_on_fresh_process(
 
     monkeypatch.setattr("brain.bridge.supervisor._run_vocab_repair_tick", _counter)
 
-    watchdog = threading.Timer(10.0, stop.set)  # failure-path ceiling only (#210)
+    watchdog = threading.Timer(_WATCHDOG_S, stop.set)  # failure-path ceiling only (#210)
     watchdog.start()
     run_folded(
         stop,
@@ -464,6 +466,7 @@ def _seed_labeled_calibration_rows(persona_dir: Path, n: int) -> None:
         store.close()
 
 
+@pytest.mark.slow(reason='1.5 s of CPU in its call phase on ubuntu in CI (wall 1.5 s); #540, J12')
 def test_judge_selftune_fires_from_persisted_due_time_on_fresh_process(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -475,10 +478,10 @@ def test_judge_selftune_fires_from_persisted_due_time_on_fresh_process(
     would stay absent."""
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).write_text(
+    (_cadence_dir(persona_dir) / dev_constants.JUDGE_TUNE_CADENCE_FILE).write_text(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
     )
-    handful = judge_selftune.JUDGE_TUNE_GATE_HANDFUL_DECISIONS
+    handful = dev_constants.JUDGE_SELFTUNE_GATE_HANDFUL_DECISIONS
     _seed_labeled_calibration_rows(persona_dir, handful + 1)
     _neutralise(monkeypatch)
     stop = threading.Event()
@@ -510,7 +513,7 @@ def test_judge_selftune_fires_from_persisted_due_time_on_fresh_process(
 
     assert calls[0] >= 1, "persisted past-due judge self-tune must fire on a fresh process"
     saved = json.loads(
-        (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).read_text()
+        (_cadence_dir(persona_dir) / dev_constants.JUDGE_TUNE_CADENCE_FILE).read_text()
     )
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50)
 
@@ -537,6 +540,7 @@ def test_judge_selftune_fires_from_persisted_due_time_on_fresh_process(
     assert post_row_ids == []
 
 
+@pytest.mark.slow(reason='1.4 s of CPU in its call phase on ubuntu in CI (wall 1.4 s); #540, J12')
 def test_judge_selftune_gate_does_not_fire_below_handful_but_cadence_still_advances(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -547,7 +551,7 @@ def test_judge_selftune_gate_does_not_fire_below_handful_but_cadence_still_advan
     the tick re-checks next week, not on the very next base tick."""
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).write_text(
+    (_cadence_dir(persona_dir) / dev_constants.JUDGE_TUNE_CADENCE_FILE).write_text(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
     )
     _neutralise(monkeypatch)
@@ -580,7 +584,7 @@ def test_judge_selftune_gate_does_not_fire_below_handful_but_cadence_still_advan
 
     assert calls[0] >= 1
     saved = json.loads(
-        (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).read_text()
+        (_cadence_dir(persona_dir) / dev_constants.JUDGE_TUNE_CADENCE_FILE).read_text()
     )
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50), (
         "cadence must advance even when the gate does not fire"
@@ -600,7 +604,7 @@ def test_judge_selftune_cadence_advances_even_when_tick_raises(
     above, pinned separately for judge self-tune's own block."""
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).write_text(
+    (_cadence_dir(persona_dir) / dev_constants.JUDGE_TUNE_CADENCE_FILE).write_text(
         json.dumps({"next_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()})
     )
     _neutralise(monkeypatch)
@@ -631,7 +635,7 @@ def test_judge_selftune_cadence_advances_even_when_tick_raises(
 
     assert raised[0] >= 1, "the raising tick must have fired"
     saved = json.loads(
-        (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).read_text()
+        (_cadence_dir(persona_dir) / dev_constants.JUDGE_TUNE_CADENCE_FILE).read_text()
     )
     assert datetime.fromisoformat(saved["next_at"]) > datetime.now(UTC) + timedelta(minutes=50), (
         "advance+save must run in finally even when the tick raises"
@@ -670,6 +674,6 @@ def test_judge_selftune_disabled_cadence_writes_no_state_file(
     )
     watchdog.cancel()
 
-    assert not (_cadence_dir(persona_dir) / judge_selftune.JUDGE_TUNE_CADENCE_FILE).exists(), (
+    assert not (_cadence_dir(persona_dir) / dev_constants.JUDGE_TUNE_CADENCE_FILE).exists(), (
         "judge_selftune_interval_s=None must never write its cadence state file"
     )

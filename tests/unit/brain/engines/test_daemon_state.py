@@ -245,7 +245,7 @@ def test_load_daemon_state_missing_file_returns_empty(tmp_path: Path) -> None:
 
 
 def test_load_daemon_state_corrupt_json_heals_and_returns_anomaly(tmp_path: Path) -> None:
-    """Corrupt daemon_state.json triggers attempt_heal and returns an anomaly."""
+    """Corrupt daemon_state.json triggers the json_io HEAL recovery and returns an anomaly."""
     (tmp_path / "daemon_state.json").write_text("not valid json {{{", encoding="utf-8")
     state, anomaly = load_daemon_state(tmp_path)
     # State is empty (default after heal-fail)

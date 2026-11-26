@@ -6,11 +6,12 @@ from pathlib import Path
 
 from brain.persona_config import DEFAULT_PROVIDER, DEFAULT_SEARCHER, PersonaConfig
 
-# ---- Task 9: attempt_heal wiring ----
+# ---- Task 9: json_io HEAL wiring ----
 
 
-def test_persona_config_load_corrupt_file_quarantines_and_resets(tmp_path: Path) -> None:
-    """Corrupt JSON → defaults returned + quarantine file present, original gone."""
+def test_persona_config_load_corrupt_file_quarantines_and_resets(tmp_path: Path, caplog) -> None:
+    """Corrupt JSON → defaults returned + quarantine file present, original gone; the public `load` returns the
+    defaults too and logs the anomaly."""
     path = tmp_path / "persona_config.json"
     path.write_text("{this is not json", encoding="utf-8")
 
@@ -24,6 +25,14 @@ def test_persona_config_load_corrupt_file_quarantines_and_resets(tmp_path: Path)
     assert not path.exists() or path.read_text().strip().startswith("{")  # reset default written
     corrupt_files = list(tmp_path.glob("persona_config.json.corrupt-*"))
     assert len(corrupt_files) == 1
+
+    public = tmp_path / "public" / "persona_config.json"
+    public.parent.mkdir()
+    public.write_text("{this is not json", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        loaded = PersonaConfig.load(public)
+    assert loaded.provider == DEFAULT_PROVIDER and loaded.searcher == DEFAULT_SEARCHER
+    assert any("PersonaConfig anomaly detected" in r.getMessage() for r in caplog.records)
 
 
 def test_persona_config_load_corrupt_file_restores_from_bak(tmp_path: Path) -> None:
@@ -54,15 +63,6 @@ def test_load_well_formed_file_returns_values(tmp_path: Path) -> None:
     cfg = PersonaConfig.load(path)
     assert cfg.provider == "ollama"
     assert cfg.searcher == "noop"
-
-
-def test_load_corrupt_json_returns_defaults(tmp_path: Path) -> None:
-    """Hand-corrupted JSON degrades to defaults rather than crashing."""
-    path = tmp_path / "persona_config.json"
-    path.write_text("{this is not json", encoding="utf-8")
-    cfg = PersonaConfig.load(path)
-    assert cfg.provider == DEFAULT_PROVIDER
-    assert cfg.searcher == DEFAULT_SEARCHER
 
 
 def test_load_non_object_payload_returns_defaults(tmp_path: Path) -> None:
@@ -106,12 +106,12 @@ def test_save_round_trip(tmp_path: Path) -> None:
 def test_save_is_atomic(tmp_path: Path) -> None:
     """save() writes via .new + os.replace — no partial file on crash mid-write.
 
-    Verified indirectly: after save() returns, no .new file remains.
+    Verified indirectly: after save() returns, no per-save temp (*.new) file remains.
     """
     path = tmp_path / "persona_config.json"
     PersonaConfig(provider="claude-cli", searcher="ddgs").save(path)
     assert path.exists()
-    assert not path.with_suffix(path.suffix + ".new").exists()
+    assert not list(path.parent.glob("*.new"))
 
 
 # ---- Bug A (audit-3): user_name field ----

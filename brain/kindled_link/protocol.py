@@ -1,7 +1,7 @@
 """kindled-link/1 wire protocol — canonical signing input, Ed25519 signatures,
 X25519+HKDF session keys, ChaCha20-Poly1305 with a sequence-derived nonce, and
-the receiver reject rules. Pure crypto + dict assembly; no I/O. See
-docs/superpowers/specs/2026-06-15-kindled-to-kindled-protocol.md."""
+the receiver reject rules. Pure crypto + dict assembly; no I/O. Its protocol
+spec (2026-06-15, kindled-to-kindled) was never committed and is lost (#797)."""
 from __future__ import annotations
 
 import enum

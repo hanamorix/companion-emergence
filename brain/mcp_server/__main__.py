@@ -1,4 +1,4 @@
-"""Entry: `python -m brain.mcp_server --persona-dir <path>`."""
+"""Entry: `python -m brain.mcp_server --persona-dir <path> [--tool-prefix <prefix>]`."""
 
 from __future__ import annotations
 
@@ -16,8 +16,13 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         help="Path to the active persona directory (required).",
     )
+    parser.add_argument(
+        "--tool-prefix",
+        default="",
+        help="What the client calls these tools, e.g. mcp__brain-tools__ (default: bare names).",
+    )
     args = parser.parse_args(argv)
-    run_server(args.persona_dir)
+    run_server(args.persona_dir, tool_prefix=args.tool_prefix)
     return 0
 
 

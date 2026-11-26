@@ -5,7 +5,7 @@ from pathlib import Path
 from brain import cli
 
 
-def _make_v012_persona(root: Path, name: str = "phoebe") -> Path:
+def _make_v012_persona(root: Path, name: str = "canary") -> Path:
     persona_dir = root / name
     persona_dir.mkdir(parents=True)
     conn = sqlite3.connect(persona_dir / "memories.db")
@@ -18,7 +18,7 @@ def _make_v012_persona(root: Path, name: str = "phoebe") -> Path:
     sqlite3.connect(persona_dir / "hebbian.db").close()
     sqlite3.connect(persona_dir / "crystallizations.db").close()
     (persona_dir / "persona_config.json").write_text(json.dumps({
-        "persona_name": name, "user_name": "zero", "voice_template": "skip",
+        "persona_name": name, "user_name": "bob", "voice_template": "skip",
         "provider": "claude-cli", "model": "sonnet",
     }))
     return persona_dir
@@ -30,7 +30,7 @@ def test_migrate_companion_emergence_roundtrip(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("KINDLED_HOME", str(home))
     rc = cli.main([
         "migrate", "--source", "companion-emergence",
-        "--input", str(src), "--install-as", "phoebe", "--json",
+        "--input", str(src), "--install-as", "canary", "--json",
     ])
     assert rc == 0
     out = capsys.readouterr().out
@@ -38,8 +38,8 @@ def test_migrate_companion_emergence_roundtrip(tmp_path, monkeypatch, capsys):
     assert payload["kind"] == "MigrationReport"
     assert payload["source_kind"] == "companion-emergence"
     assert payload["memories_migrated"] == 1
-    assert (home / "personas" / "phoebe" / "memories.db").is_file()
-    assert json.loads((home / "app_config.json").read_text())["selected_persona"] == "phoebe"
+    assert (home / "personas" / "canary" / "memories.db").is_file()
+    assert json.loads((home / "app_config.json").read_text())["selected_persona"] == "canary"
 
 
 def test_migrate_preflight_only(tmp_path, monkeypatch, capsys):
@@ -53,5 +53,5 @@ def test_migrate_preflight_only(tmp_path, monkeypatch, capsys):
     assert rc == 0
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert payload["ok"] is True
-    assert payload["persona_name"] == "phoebe"
-    assert not (home / "personas" / "phoebe").exists()
+    assert payload["persona_name"] == "canary"
+    assert not (home / "personas" / "canary").exists()

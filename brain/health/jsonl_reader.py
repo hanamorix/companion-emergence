@@ -13,14 +13,174 @@ raw text plus the list of split lines).
 
 from __future__ import annotations
 
-import gzip
 import json
 import logging
-import os
 from collections.abc import Iterator
 from pathlib import Path
+from typing import NamedTuple
 
 logger = logging.getLogger(__name__)
+
+
+class JsonlLineError(ValueError):
+    """A bad line met by ``_parse_lines(..., strict=True)``: carries the 1-based line number.
+
+    Defined here, not in ``brain.health.json_io``, so this module never imports it.
+    """
+
+    def __init__(self, line: int, reason: str, path: Path) -> None:
+        super().__init__(f"{path}: line {line}: {reason}")
+        self.line = line
+        self.reason = reason
+        self.path = path
+
+
+class UnloadableJsonlLineError(ValueError):
+    """A line the JSON parser cannot load (an integer past the interpreter's digit limit, nesting past the recursion limit) stopped a read.
+
+    ``code`` is the stable identifier (``"jsonl_unloadable_line"``); ``path`` is the file (or the ``source`` given to ``parse_jsonl``),
+    ``line`` the 1-based line within the text the reader was given and ``reason`` the parser's message, never the line's content.
+    For ``read_jsonl_tail`` on a plain file, which parses a window of the last lines, ``line`` is None (the file line is not known
+    without counting the whole file) and ``reason`` also names the line's position in that window. The parser's own ``ValueError`` or
+    ``RecursionError`` is ``__cause__``. A ``ValueError`` but not a :class:`JsonlLineError`, so strict-mode handlers do not take it
+    for an ordinary bad line. See #646.
+    """
+
+    code = "jsonl_unloadable_line"
+
+    def __init__(self, line: int | None, reason: str, path: Path) -> None:
+        super().__init__(f"{path}: line {line}: {reason}" if line is not None else f"{path}: {reason}")
+        self.line = line
+        self.reason = reason
+        self.path = path
+
+    def __reduce__(self):
+        return (type(self), (self.line, self.reason, self.path))
+
+
+# JSONDecodeError is a ValueError, and so is the error for an integer of more than 4300 digits.
+_JSON_PARSE_ERRORS = (ValueError, RecursionError)
+
+
+class LineVerdict(NamedTuple):
+    """What :func:`classify_line` made of one line.
+
+    ``kind`` is None for a usable object (``data`` is it) and for a blank line (``data`` is None too); otherwise ``utf8``,
+    ``json`` or ``shape``, with ``detail`` the codec reason, the parser's message or the JSON type name, and ``exc`` the
+    exception behind ``utf8`` and ``json`` (None for ``shape``).
+    """
+
+    raw: str
+    text: str
+    data: dict | None
+    kind: str | None
+    detail: str
+    exc: BaseException | None
+
+    @property
+    def reason(self) -> str | None:
+        """The one-line reason a bad line is bad (None for a usable or a blank line); it never carries the line's content."""
+        if self.kind == "utf8":
+            return f"invalid UTF-8 ({self.detail})"
+        if self.kind == "json":
+            return f"malformed JSON ({self.detail})"
+        if self.kind == "shape":
+            return f"not a JSON object ({self.detail})"
+        return None
+
+
+def classify_line(raw: str) -> LineVerdict:
+    """The one place a JSONL line is judged: usable object, blank, or bad (and why).
+
+    ``raw`` is the line as read, decoded with ``errors="surrogateescape"`` (a byte that is not valid UTF-8 is then a lone
+    surrogate and costs only this line). The checks run in this order: invalid UTF-8, blank, JSON that does not parse
+    (``ValueError``, which includes the integer digit limit, or ``RecursionError`` for a line nested too deep), a value that is
+    not an object. Every JSONL reader (``_parse_lines`` here, ``json_io``'s raw reader and its line-position reader) calls
+    this, so they agree on what a bad line is; each keeps its own log text and strict-mode error, and what it does with a
+    line the JSON parser cannot load: the raw reader skips it and the line-position reader reports it as a bad line, while
+    ``_parse_lines`` raises ``UnloadableJsonlLineError`` (see there).
+    """
+    try:
+        raw.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        return LineVerdict(raw, raw.rstrip("\r\n"), None, "utf8", exc.reason, exc)
+    text = raw.rstrip("\r\n")
+    if not text.strip():
+        return LineVerdict(raw, text, None, None, "", None)
+    try:
+        data = json.loads(text)
+    except _JSON_PARSE_ERRORS as exc:
+        return LineVerdict(raw, text, None, "json", str(exc), exc)
+    if isinstance(data, dict):
+        return LineVerdict(raw, text, data, None, "", None)
+    return LineVerdict(raw, text, None, "shape", type(data).__name__, None)
+
+
+def _parse_lines(fh, path: Path, *, strict: bool = False, window: bool = False) -> Iterator[dict]:
+    """Parse an open text stream of JSONL, skipping bad lines with a warning.
+
+    The stream must be opened with ``errors="surrogateescape"``: a line whose
+    bytes are not valid UTF-8 (a crash mid-append can cut a multi-byte
+    character, and the next append lands on the same line) then decodes with
+    lone surrogates instead of raising, so it costs only that line, like a JSON
+    error (#433). Strict decoding raised out of the loop and failed every read.
+    Text mode keeps the line splitting (\n, \r\n, \r) and the streaming read.
+
+    ``strict=True`` (keyword-only, added for brain.health.json_io) raises
+    :class:`JsonlLineError` on the first bad line instead of skipping it, for
+    callers that must fail closed. The default is unchanged. Each line is judged by
+    :func:`classify_line`.
+
+    One kind of line stops the read instead of being skipped, in strict mode too: a line the JSON parser
+    cannot load at all (an integer past the interpreter's digit limit, nesting past the recursion limit).
+    :class:`UnloadableJsonlLineError` comes out (the parser's own ``ValueError`` or ``RecursionError`` is its ``__cause__``),
+    as the parser's bare exception did before the parsers shared :func:`classify_line` (#643, #646). With ``window=True`` the text is
+    a window of a larger file (``read_jsonl_tail``), so that error has no ``line`` (None) and its reason names the position in the
+    window; the strict-mode :class:`JsonlLineError` keeps the window position as its ``line``.
+    """
+    for line_index, raw in enumerate(fh, start=1):
+        verdict = classify_line(raw)
+        if verdict.kind is None:
+            if verdict.data is not None:
+                yield verdict.data
+            continue
+        if verdict.kind == "json" and not isinstance(verdict.exc, json.JSONDecodeError):
+            # A known, deliberate abort, to be fixed later (#646): one such line stops the whole read. These readers
+            # always stopped here; they now say so with a named error instead of the parser's bare exception.
+            # Skipping the line is not safe yet: callers that rewrite, delete or take a safety set from what they
+            # read would lose or fail to protect data, so #646 audits them first.
+            reason = verdict.reason or ""
+            if window:
+                raise UnloadableJsonlLineError(
+                    None, f"{reason} (line {line_index} of the window of the last lines read, not a file line)", path
+                ) from verdict.exc
+            raise UnloadableJsonlLineError(line_index, reason, path) from verdict.exc
+        if strict:
+            raise JsonlLineError(line_index, verdict.reason or "", path) from verdict.exc
+        if verdict.kind == "utf8":
+            logger.warning(
+                "skipping malformed jsonl line %d in %s: invalid UTF-8 (%s) | content: %r",
+                line_index,
+                path,
+                verdict.detail,
+                raw.encode("utf-8", "surrogateescape").decode("utf-8", "replace")[:201],
+            )
+        elif verdict.kind == "json":
+            logger.warning(
+                "skipping malformed jsonl line %d in %s: %s | content: %r",
+                line_index,
+                path,
+                verdict.detail,
+                verdict.text[:201],
+            )
+        else:
+            logger.warning(
+                "skipping non-dict jsonl line %d in %s (value type=%s) | content: %r",
+                line_index,
+                path,
+                verdict.detail,
+                verdict.text[:201],
+            )
 
 
 def iter_jsonl_skipping_corrupt(path: Path) -> Iterator[dict]:
@@ -34,7 +194,8 @@ def iter_jsonl_skipping_corrupt(path: Path) -> Iterator[dict]:
     this generator.
 
     Per-line resilience: a single corrupt line never invalidates the
-    lines around it. Each skipped line emits a warning that includes
+    lines around it, except a line the JSON parser cannot load (see
+    :func:`_parse_lines`), which stops the read. Each skipped line emits a warning that includes
     the line number, the file path, the parse exception, and a 200-
     char preview of the bad content — enough for a human to find and
     quarantine the line.
@@ -47,136 +208,5 @@ def iter_jsonl_skipping_corrupt(path: Path) -> Iterator[dict]:
     """
     if not path.exists():
         return
-    with open(path, encoding="utf-8") as fh:
-        for line_index, raw in enumerate(fh, start=1):
-            stripped = raw.rstrip("\r\n")
-            if not stripped.strip():
-                continue
-            try:
-                data = json.loads(stripped)
-            except json.JSONDecodeError as exc:
-                logger.warning(
-                    "skipping malformed jsonl line %d in %s: %s | content: %r",
-                    line_index,
-                    path,
-                    exc,
-                    stripped[:201],
-                )
-                continue
-            if isinstance(data, dict):
-                yield data
-            else:
-                logger.warning(
-                    "skipping non-dict jsonl line %d in %s (value type=%s) | content: %r",
-                    line_index,
-                    path,
-                    type(data).__name__,
-                    stripped[:201],
-                )
-
-
-def read_jsonl_skipping_corrupt(path: Path) -> list[dict]:
-    """Return parsed lines from ``path`` as a list, skipping malformed ones.
-
-    Thin list-materialising wrapper around
-    :func:`iter_jsonl_skipping_corrupt` so existing callers that want
-    all lines at once keep their shape. The streaming path inside
-    still avoids the previous memory spike.
-    """
-    return list(iter_jsonl_skipping_corrupt(path))
-
-
-def read_last_n_jsonl_lines(path: Path, n: int, *, chunk_size: int = 8192) -> list[str]:
-    """Read the last n raw lines of a JSONL file via a backward seek.
-
-    Bounded I/O: cost scales with n and average line length, not with total
-    file size (#225 — the ignore-streak bounded-window redesign). Reads
-    backward in byte chunks from EOF, accumulating raw BYTES (never decoding
-    per-chunk, so a multi-byte UTF-8 character split across a chunk boundary
-    is never corrupted — only the file's own byte sequence, concatenated
-    back into original order, is ever decoded, and only once, at the end).
-    Stops when either (a) the accumulated buffer contains more than n
-    newlines, or (b) BOF is reached — these are tracked as DISTINCT
-    conditions, not conflated: only case (a) means the read started
-    mid-line (so the leading fragment is a genuine partial line and must be
-    dropped); case (b) means byte 0 of the file was reached, so the first
-    accumulated line is always complete and must be KEPT. Returns raw JSONL
-    text lines (not yet parsed), in original file order, at most n of them
-    (or fewer, if the file itself has fewer than n lines). Caller parses
-    each with the same corrupt-line-skip discipline as
-    ``read_jsonl_skipping_corrupt``.
-
-    Returns ``[]`` immediately for a nonexistent path or ``n <= 0``,
-    matching every other reader in this module's missing-file convention.
-    """
-    if n <= 0:
-        return []
-    if not path.exists():
-        return []
-    with path.open("rb") as f:
-        f.seek(0, os.SEEK_END)
-        remaining = f.tell()
-        block = b""
-        reached_bof = False
-        while block.count(b"\n") <= n:
-            if remaining <= 0:
-                reached_bof = True
-                break
-            read_size = min(chunk_size, remaining)
-            remaining -= read_size
-            f.seek(remaining)
-            block = f.read(read_size) + block
-    # Decode ONCE, on the fully-assembled byte buffer — never per chunk.
-    # errors="replace" (matching brain/bridge/daemon.py:cmd_tail_log's own
-    # convention) so a mangled leading fragment (dropped below when not at
-    # BOF) can't raise and abort an otherwise-good read.
-    text = block.decode("utf-8", errors="replace")
-    lines = text.split("\n")
-    if lines and lines[-1] == "":
-        lines.pop()  # trailing "" from a final trailing newline
-    if not reached_bof and lines:
-        lines.pop(0)  # genuine partial leading fragment — discard
-    return lines[-n:] if len(lines) > n else lines
-
-
-def iter_jsonl_streaming(path: Path) -> Iterator[dict]:
-    """Stream JSONL entries from ``path``, transparently handling ``.gz``.
-
-    Same per-line resilience as :func:`iter_jsonl_skipping_corrupt`: a
-    malformed or non-dict line emits a warning and is skipped, not
-    aborted on. Whether the file is gzipped is detected by the
-    ``.gz`` suffix.
-
-    Returns immediately if the path doesn't exist (no error). Use this
-    when a caller needs to fan out across active + rotated archives.
-    """
-    if not path.exists():
-        return
-    is_gz = path.suffix == ".gz"
-    open_fn = gzip.open if is_gz else open
-    with open_fn(path, "rt", encoding="utf-8") as fh:
-        for line_index, raw in enumerate(fh, start=1):
-            stripped = raw.rstrip("\r\n")
-            if not stripped.strip():
-                continue
-            try:
-                data = json.loads(stripped)
-            except json.JSONDecodeError as exc:
-                logger.warning(
-                    "skipping malformed jsonl line %d in %s: %s | content: %r",
-                    line_index,
-                    path,
-                    exc,
-                    stripped[:201],
-                )
-                continue
-            if isinstance(data, dict):
-                yield data
-            else:
-                logger.warning(
-                    "skipping non-dict jsonl line %d in %s (value type=%s) | content: %r",
-                    line_index,
-                    path,
-                    type(data).__name__,
-                    stripped[:201],
-                )
+    with open(path, encoding="utf-8", errors="surrogateescape") as fh:
+        yield from _parse_lines(fh, path)

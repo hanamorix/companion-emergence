@@ -24,6 +24,7 @@ released on context exit.
 from __future__ import annotations
 
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -92,14 +93,41 @@ def file_lock(path: Path, *, blocking: bool = True) -> Iterator[bool]:
         fh.close()
 
 
+class LockTimeoutError(TimeoutError):
+    """``locked_within`` gave up: another holder kept the lock for the whole wait. The caller's body never ran."""
+
+
+@contextmanager
+def locked_within(path: Path, seconds: float, *, poll_seconds: float | None = None) -> Iterator[None]:
+    """Hold the ``path`` lock for the ``with`` body, waiting at most ``seconds`` to get it.
+
+    ``file_lock(blocking=True)`` has no timeout, so a wedged holder would hang the caller for good (a bridge boot, a
+    settings request). This polls the NON-blocking form (the same on POSIX and Windows) until the deadline. On the
+    deadline it raises :class:`LockTimeoutError` (a ``TimeoutError``) and the body is NEVER entered: the non-blocking
+    ``file_lock`` yields False and still runs its own body without the lock, so the flag is checked here and the
+    caller's body runs only when it is True. An exception raised by the body propagates exactly once (the body is not
+    retried) and releases the lock. The lock is not re-entrant: nesting the same ``path`` times out.
+    """
+    from brain import dev_constants
+
+    step = dev_constants.SETTINGS_FILE_LOCK_POLL_S if poll_seconds is None else poll_seconds
+    deadline = time.monotonic() + seconds
+    while True:
+        with file_lock(path, blocking=False) as acquired:
+            if acquired:
+                yield
+                return
+        if time.monotonic() >= deadline:
+            raise LockTimeoutError(f"could not lock {path} within {seconds:g} s")
+        time.sleep(step)
+
+
 # Windows: msvcrt.locking with LK_LOCK only retries every second for
 # ~10s then raises. Under high contention (the concurrent-appenders
 # test runs 8×5 = 40 ops fighting for the same lock) that 10s window
 # can starve. Wrap with our own non-blocking attempt + sleep loop so
 # we never give up — matches fcntl.flock's "block until acquired"
 # semantics on POSIX.
-import time as _time  # noqa: E402
-
 _WIN_LOCK_INITIAL_SLEEP = 0.005
 _WIN_LOCK_MAX_SLEEP = 0.2
 
@@ -120,7 +148,7 @@ def _windows_lock_acquire(fh: IO[bytes], *, blocking: bool = True) -> bool:
         except OSError:
             if not blocking:
                 return False
-            _time.sleep(sleep_s)
+            time.sleep(sleep_s)
             if sleep_s < _WIN_LOCK_MAX_SLEEP:
                 sleep_s = min(sleep_s * 2, _WIN_LOCK_MAX_SLEEP)
 

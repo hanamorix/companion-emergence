@@ -5,8 +5,7 @@ When the harness stands up the real bridge (BridgeServer.start() -> brain.bridge
 emotion_vocabulary.json from the Canary's seeded memories and register()s any persona-extension
 emotion (e.g. "warmth") into the process-global brain.emotion.vocabulary._REGISTRY. Pre-fix,
 sandbox() restored env + tempdirs but NOT that registry, so the registration escaped the run and
-polluted later unit tests (notably tests/unit/brain/emotion/test_aggregate.py::
-test_dropped_unregistered_emotion_warns_once, which then saw 0 warnings instead of 1).
+polluted later unit tests that count the registered emotions.
 
 These tests reproduce that leak and prove sandbox() now restores the registry on teardown — both on
 a clean exit AND when SandboxLeak is raised. Zero model tokens: BridgeServer.start() only
@@ -17,7 +16,6 @@ Diagnosis: hunts/harness-vocab-registry-leak/diagnosis.md.
 
 from __future__ import annotations
 
-import socket
 from pathlib import Path
 
 import pytest
@@ -44,32 +42,17 @@ def _seed_fake_cred(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("HOME", str(fake_home))
 
 
-def _free_port() -> int:
-    """Ask the OS for a free loopback port; raises OSError if it cannot bind (callers skip)."""
-    s = socket.socket()
-    try:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
-    finally:
-        s.close()
-
-
 @pytest.fixture(autouse=True)
 def _registry_self_clean():
     """G9: this test must never leak the very thing it tests, regardless of prior state. Snapshot the
-    process-global registry + warned-set around each test and restore in a finally, so the test
+    process-global registry around each test and restore in a finally, so the test
     passes whether or not `warmth`/`reverence` were registered before it ran."""
-    import brain.emotion.aggregate as aggregate
-
     saved_registry = dict(vocabulary._REGISTRY)
-    saved_warned = set(aggregate._warned_unregistered)
     try:
         yield
     finally:
         vocabulary._REGISTRY.clear()
         vocabulary._REGISTRY.update(saved_registry)
-        aggregate._warned_unregistered.clear()
-        aggregate._warned_unregistered.update(saved_warned)
 
 
 def test_sandbox_does_not_leak_persona_emotion_registration(
@@ -81,22 +64,14 @@ def test_sandbox_does_not_leak_persona_emotion_registration(
     _seed_fake_cred(monkeypatch, tmp_path)
     assert vocabulary.get("warmth") is None, "precondition: warmth unregistered before the run"
 
-    try:
-        port = _free_port()
-    except OSError:
-        pytest.skip("cannot bind a loopback port in this environment")
-
     with sandbox() as sb:
         # default MemorySeed emotion is {"warmth": 0.3} -> a non-baseline persona extension.
         live = build_persona(PersonaSpec(memories=[MemorySeed(content="Bob has a dog.")]), sb)
         # build_persona alone does NOT register (no vocab file, no load yet).
         assert vocabulary.get("warmth") is None, "build_persona must not register on its own"
 
-        server = BridgeServer(live.persona_dir, port=port)
-        try:
-            server.start()
-        except OSError:
-            pytest.skip("cannot start the bridge on this port in this environment")
+        server = BridgeServer(live.persona_dir, port=0)
+        server.start()  # port 0: the OS picks a free port, so there is no bind race; a start failure fails the test
         # The real bridge start reconstructed the vocab and registered warmth (representativeness
         # anchor: the leak IS present inside the run, so a None-after is a real restore, not a no-op).
         assert vocabulary.get("warmth") is not None, "bridge start should register warmth in-run"
@@ -117,11 +92,6 @@ def test_sandbox_registry_restore_survives_a_leak_raise(
     _seed_fake_cred(monkeypatch, tmp_path)
     assert vocabulary.get("warmth") is None
 
-    try:
-        port = _free_port()
-    except OSError:
-        pytest.skip("cannot bind a loopback port in this environment")
-
     guarded = tmp_path / "guarded-root"
     guarded.mkdir()
     (guarded / "existing.txt").write_text("original")
@@ -131,11 +101,8 @@ def test_sandbox_registry_restore_survives_a_leak_raise(
             live = build_persona(
                 PersonaSpec(memories=[MemorySeed(content="Bob has a dog.")]), sb
             )
-            server = BridgeServer(live.persona_dir, port=port)
-            try:
-                server.start()
-            except OSError:
-                pytest.skip("cannot start the bridge on this port in this environment")
+            server = BridgeServer(live.persona_dir, port=0)
+            server.start()  # port 0: the OS picks a free port, so there is no bind race; a start failure fails the test
             assert vocabulary.get("warmth") is not None, "bridge start should register warmth"
             server.stop()
             # MAJOR-2: confirm the uvicorn thread joined (is dead) before we rely on the restore's
@@ -171,11 +138,6 @@ def test_sandbox_does_not_leak_a_nonwarmth_extension(
     _seed_fake_cred(monkeypatch, tmp_path)
     assert vocabulary.get("reverence") is None, "precondition: reverence unregistered"
 
-    try:
-        port = _free_port()
-    except OSError:
-        pytest.skip("cannot bind a loopback port in this environment")
-
     with sandbox() as sb:
         live = build_persona(
             PersonaSpec(
@@ -183,11 +145,8 @@ def test_sandbox_does_not_leak_a_nonwarmth_extension(
             ),
             sb,
         )
-        server = BridgeServer(live.persona_dir, port=port)
-        try:
-            server.start()
-        except OSError:
-            pytest.skip("cannot start the bridge on this port in this environment")
+        server = BridgeServer(live.persona_dir, port=0)
+        server.start()  # port 0: the OS picks a free port, so there is no bind race; a start failure fails the test
         assert vocabulary.get("reverence") is not None, "bridge start should register reverence"
         server.stop()
 

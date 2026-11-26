@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Literal
 
 from brain.health.anomaly import BrainAnomaly
-from brain.health.attempt_heal import attempt_heal, save_with_backup
+from brain.health.json_io import Recovery, read_json_result, write_json
 from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
@@ -256,15 +256,15 @@ _STATE_FILENAME = "daemon_state.json"
 
 
 def save_daemon_state(persona_dir: Path, state: DaemonState) -> None:
-    """Atomic-write a DaemonState to daemon_state.json via save_with_backup."""
+    """Atomic-write a DaemonState to daemon_state.json via json_io.write_json (.bak rotation)."""
     path = persona_dir / _STATE_FILENAME
-    save_with_backup(path, state.to_dict())
+    write_json(path, state.to_dict(), backups=3)
 
 
 def load_daemon_state(
     persona_dir: Path,
 ) -> tuple[DaemonState, BrainAnomaly | None]:
-    """Load daemon_state.json with self-healing via the attempt_heal pattern.
+    """Load daemon_state.json with self-healing via read_json_result (HEAL).
 
     Returns (state, anomaly).
       - Missing file → (DaemonState(), None) silently (first-ever tick path).
@@ -272,7 +272,8 @@ def load_daemon_state(
         baks are also corrupt, returns (DaemonState(), anomaly).
     """
     path = persona_dir / _STATE_FILENAME
-    raw_dict, anomaly = attempt_heal(path, default_factory=dict, schema_validator=None)
+    _res = read_json_result(path, default=dict, recover=Recovery.HEAL)
+    raw_dict, anomaly = _res.data, _res.anomaly
     if not isinstance(raw_dict, dict):
         raw_dict = {}
     try:
@@ -297,7 +298,7 @@ def update_daemon_state(
 
     Loads current state, sets last_<daemon_type> to the new fire entry,
     recomputes emotional_residue from this fire, then atomic-writes via
-    save_with_backup. Returns the updated state.
+    json_io.write_json. Returns the updated state.
 
     Residue rules (mirror OG nell_brain.py:2066-2072):
       emotion   = fire.dominant_emotion
@@ -330,7 +331,7 @@ def update_daemon_state(
     )
 
     path = persona_dir / _STATE_FILENAME
-    save_with_backup(path, updated.to_dict())
+    write_json(path, updated.to_dict(), backups=3)
 
     return updated
 

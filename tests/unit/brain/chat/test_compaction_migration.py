@@ -2,9 +2,9 @@
 
 Maps to changes/compaction-backlog-migration/1.5-criteria.md (C-M1..C-M12).
 
-The headline fixture is a real 328-turn chatlog copy at
-``~/Downloads/30cd3047-3d47-45b9-a48f-e27f9f2a9bee.jsonl`` (buffer format). It is
-skipped-with-reason when absent so CI without the fixture still runs the edge cases.
+The headline fixture was once a real 328-turn chatlog copy (buffer format) that was
+never committed, so the three headline tests skipped everywhere (#363). They run on a
+synthetic chatlog of the same size and shape and read no real user file.
 """
 
 from __future__ import annotations
@@ -20,8 +20,8 @@ from brain.chat import compaction_migration as mig
 from brain.chat.compaction import CompactionResult, compact_conversation
 from brain.chat.compaction_migration import _marker_path, run_backlog_migration
 from brain.ingest.buffer import read_archive, read_session, write_cursor
+from tests.thread_support import finish_threads
 
-FIXTURE = Path.home() / "Downloads" / "30cd3047-3d47-45b9-a48f-e27f9f2a9bee.jsonl"
 FIXTURE_SID = "30cd3047-3d47-45b9-a48f-e27f9f2a9bee"
 
 
@@ -45,9 +45,24 @@ def _raw(turns: list[dict]) -> list[dict]:
     return [t for t in turns if t.get("speaker") != "summary"]
 
 
+def _synthetic_chatlog() -> list[dict]:
+    """328 alternating turns over five days ending before 2026-06-29, in bursts
+    with idle gaps, so the 24h replay sees several cohorts (as the real log did)."""
+    end = datetime(2026, 6, 29, tzinfo=UTC)
+    rows: list[dict] = []
+    for i in range(328):
+        day, k = divmod(i, 66)  # 66 turns a day, 5 days
+        ts = end - timedelta(days=5 - day) + timedelta(hours=9 + k // 6, minutes=(k % 6) * 7)
+        rows.append({"session_id": FIXTURE_SID,
+                     "speaker": "user" if i % 2 == 0 else "assistant",
+                     "text": f"day {day} turn {k} — “quoted” ünïcode",
+                     "ts": ts.isoformat(timespec="seconds")})
+    return rows
+
+
 def _load_fixture(persona_dir: Path) -> list[dict]:
-    """Copy the real chatlog into active_conversations/, cursor at the last ts."""
-    rows = [json.loads(line) for line in FIXTURE.read_text().splitlines() if line.strip()]
+    """Write the synthetic chatlog into active_conversations/, cursor at the last ts."""
+    rows = _synthetic_chatlog()
     dest_dir = persona_dir / "active_conversations"
     dest_dir.mkdir(parents=True, exist_ok=True)
     (dest_dir / f"{FIXTURE_SID}.jsonl").write_text(
@@ -72,13 +87,7 @@ def _count_transcript_raw_turns(prompt: str) -> int:
     return n
 
 
-fixture_required = pytest.mark.skipif(
-    not FIXTURE.exists(), reason=f"real chatlog fixture not present: {FIXTURE}"
-)
-
-
 # ---------------------------------------------------------------- C-M2/4/7/10
-@fixture_required
 def test_cm2_cm7_backlog_drained(tmp_path: Path) -> None:
     now = datetime(2026, 6, 30, tzinfo=UTC)  # fixed → deterministic vs the fixture ts
     rows = _load_fixture(tmp_path)
@@ -139,7 +148,6 @@ def test_time_stepping_one_fold_per_24h_cohort(tmp_path: Path) -> None:
     assert session[0]["speaker"] == "summary" and len(_raw(session)) == 40
 
 
-@fixture_required
 def test_cm4_lossless_multiset(tmp_path: Path) -> None:
     rows = _load_fixture(tmp_path)
     original = Counter(_identity(t) for t in _raw(rows))
@@ -153,7 +161,6 @@ def test_cm4_lossless_multiset(tmp_path: Path) -> None:
     assert all(archived[k] <= original[k] for k in archived)  # no dup in archive
 
 
-@fixture_required
 def test_cm10_archive_oldest_first_contiguous(tmp_path: Path) -> None:
     rows = _load_fixture(tmp_path)
     original_raw = _raw(rows)
@@ -741,8 +748,9 @@ def test_lockrace_c2_barrier_interleave_no_fold_clobber(tmp_path: Path, monkeypa
     migration saw pre-fix, and the RE-READ before the rewrite detects the now-
     sectioned row and no-ops → the fold survives → GREEN.
 
-    Deterministic (Event barriers + bounded 5s timeouts); cannot hang CI (the
-    writer thread is joined and asserted finished).
+    Deterministic (Event barriers, no time bound: the writer commits only after migration
+    has read, and the test thread releases it in a `finally`); the writer thread is joined
+    and asserted finished.
     """
     import threading
 
@@ -772,17 +780,18 @@ def test_lockrace_c2_barrier_interleave_no_fold_clobber(tmp_path: Path, monkeypa
     def writer() -> None:
         # Commit the fold ONLY after migration has captured its stale snapshot, so
         # the fold lands strictly inside migration's read→write window.
-        if not migration_has_read.wait(timeout=5.0):
-            return
-        rewrite_session_atomic(tmp_path, sid, [fold_row])
-        fold_committed.set()
+        migration_has_read.wait()
+        try:
+            rewrite_session_atomic(tmp_path, sid, [fold_row])
+        finally:
+            fold_committed.set()  # even if the write raised: migration holds on this, and the test fails on the missing fold
 
     def read_barrier(persona_dir, session_id, *a, **kw):
         snapshot = real_read(persona_dir, session_id, *a, **kw)
         if not state["fired"] and session_id == sid:
             state["fired"] = True          # only the FIRST (stale) read barriers
             migration_has_read.set()        # release the writer to commit the fold
-            fold_committed.wait(timeout=5.0)  # hold migration until the fold lands
+            fold_committed.wait()  # hold migration until the fold lands
         return snapshot
 
     monkeypatch.setattr(mig, "read_session", read_barrier)
@@ -791,7 +800,8 @@ def test_lockrace_c2_barrier_interleave_no_fold_clobber(tmp_path: Path, monkeypa
     try:
         run_sections_migration(tmp_path, now=now)
     finally:
-        t.join(timeout=5.0)
+        migration_has_read.set()  # a migration that never read leaves the writer parked here
+        finish_threads(t)
         monkeypatch.undo()
     assert not t.is_alive(), "writer thread did not finish (barrier deadlock)"
 

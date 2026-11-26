@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import codecs
 import difflib
 import json
 import os
@@ -9,24 +10,59 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain import tunables
+from brain.files.path_identity import unusable
+from brain.files.read_guard import PROTECTED, is_read_denied
+from brain.health.json_io import append_jsonl
 from brain.images import media_type_to_ext, save_image_bytes, sniff_media_type
 from brain.tools.impls import _read_cache
 
-_FILE_READ_MAX_BYTES = tunables.register("files.read_max_bytes", 256 * 1024)
-# Viewable-image support. The image branch runs BEFORE the 256KB text cap so
-# a real photo (>256KB text cap, <= image_max_bytes) is returned as a viewable
-# image rather than refused by the text cap (P0 red-team F-1 cap-ordering).
-# image_max_bytes defaults >= the 20MB /upload cap so there is no
-# upload-succeeds-but-read-refuses dead zone.
-_FILE_IMAGE_TYPES = tunables.register(
-    "files.image_types", ["image/png", "image/jpeg", "image/webp", "image/gif"]
+# #590: this cap no longer guards the context. A text file is read a window at a
+# time (_DEFAULT_HEAD_LINES lines, at most _WINDOW_MAX_CHARS characters), streamed
+# so a range read never holds the whole file, so the cap only stops pathological
+# files (each read scans the whole file to count lines and check it is UTF-8). It
+# matches the 20 MiB upload, image and PDF caps, so any file the user can share opens.
+_FILE_READ_MAX_BYTES = tunables.register(
+    "files.read_max_bytes", 20 * 1024 * 1024,
+    description="Largest text file opened, in bytes; text is read 400 lines at a time, so this only stops huge files.",
 )
-_FILE_IMAGE_MAX_BYTES = tunables.register("files.image_max_bytes", 20 * 1024 * 1024)
-# #126: PDFs are read as extracted text (pypdf, pure-Python). Cap matches /upload.
-_FILE_PDF_MAX_BYTES = tunables.register("files.pdf_max_bytes", 20 * 1024 * 1024)
+# Viewable-image support. The image branch runs BEFORE the text cap so a real
+# photo (over a text cap set lower than image_max_bytes) is returned as a viewable
+# image rather than refused by the text cap (P0 red-team F-1 cap-ordering).
+# image_max_bytes defaults to the same 20 MiB as files.upload_max_bytes (a
+# separate setting), so an image uploaded at the default is not refused here.
+_FILE_IMAGE_TYPES = tunables.register(
+    "files.image_types", ["image/png", "image/jpeg", "image/webp", "image/gif"],
+    description="Kinds of image the kindled can look at when it opens an image file.",
+)
+_FILE_IMAGE_MAX_BYTES = tunables.register(
+    "files.image_max_bytes", 20 * 1024 * 1024,
+    description="Largest image the kindled will look at, in bytes.",
+)
+# #126: PDFs are read as extracted text (pypdf, pure-Python). The cap defaults to the upload cap's 20 MiB.
+_FILE_PDF_MAX_BYTES = tunables.register(
+    "files.pdf_max_bytes", 20 * 1024 * 1024,
+    description="Largest PDF the kindled will read, in bytes.",
+)
 _PDF_MAGIC = b"%PDF-"
 _SUGGEST_MAX = 10
 _DEFAULT_HEAD_LINES = 400
+# #595: the most text one read returns, counted as the characters of its JSON-encoded form
+# (what the MCP handler sends: quotes, backslashes and control characters grow when
+# escaped). The Claude CLI passes a tool result to the model only up to 50,000 characters
+# and persists anything longer behind a 2 KB preview that chat cannot open (measured on
+# claude 2.1.321, docs/cli-provider-capabilities.md). 40,000 leaves room under that cap for
+# the path, the note and the keys.
+_WINDOW_MAX_CHARS = 40_000
+_READ_CHUNK_BYTES = 64 * 1024
+# #595: the tool knows only that it returned this recently, not that the result reached the
+# model (an over-size result never did), so the note says no more than that.
+_DEDUP_NOTE = (
+    "this part of the file was already returned less than 90 seconds ago, so it is not sent again; "
+    "read a different part with offset/max_lines, or ask again shortly to re-read it."
+)
+_DEDUP_NOTE_IMAGE = "this image was already returned less than 90 seconds ago, so it is not sent again."
+# The characters str.splitlines() breaks on, so streamed lines match it exactly.
+_LINE_BREAKS = "\n\r\x0b\x0c\x1c\x1d\x1e\x85  "
 
 
 def _file_read_max_bytes() -> int:
@@ -45,29 +81,190 @@ def _pdf_max_bytes() -> int:
     return tunables.get_tunable("files.pdf_max_bytes", _FILE_PDF_MAX_BYTES)
 
 
-def _window_lines(
-    lines: list[str], *, max_lines: int | None, offset: int
-) -> tuple[str, int, int, bool]:
-    """Apply the ranged-read / head-cap policy shared by text and PDF reads.
+def _encoded_len(text: str) -> int:
+    """Characters ``text`` takes inside the JSON the MCP handler sends (ensure_ascii=False)."""
+    return len(json.dumps(text, ensure_ascii=False)) - 2
 
-    Returns (sliced_text, start, window_len, truncated).
+
+def _encoded_prefix(text: str, room: int) -> str:
+    """The longest prefix of ``text`` whose encoded form fits in ``room`` characters."""
+    lo, hi = 0, min(len(text), room)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _encoded_len(text[:mid]) <= room:
+            lo = mid
+        else:
+            hi = mid - 1
+    return text[:lo]
+
+
+class _Window:
+    """The ranged-read policy shared by text and PDF reads, fed one line at a time.
+
+    Keeps lines [offset, offset + max_lines) — max_lines defaults to _DEFAULT_HEAD_LINES —
+    up to _WINDOW_MAX_CHARS characters, and counts every line fed. A first line longer
+    than the budget is cut to it; any later line that would pass it ends the window.
+    Line ``offset`` is shown from character ``char_offset`` (#735): every line is fed as it
+    is shown, so the feeder drops those characters (``_from_char``).
     """
-    total = len(lines)
-    start = max(0, int(offset or 0))
-    if max_lines is not None:
-        window = lines[start : start + max(0, int(max_lines))]
-        truncated = (start + len(window)) < total or start > 0
-    elif total > _DEFAULT_HEAD_LINES:
-        window = lines[:_DEFAULT_HEAD_LINES]
-        truncated = True
-    else:
-        window = lines[start:] if start else lines
-        truncated = start > 0
-    return "".join(window), start, len(window), truncated
+
+    def __init__(self, *, max_lines: int | None, offset: int, char_offset: int = 0) -> None:
+        self.start = max(0, int(offset or 0))
+        self.start_char = max(0, int(char_offset or 0))
+        count = _DEFAULT_HEAD_LINES if max_lines is None else max(0, int(max_lines))
+        self.end = self.start + count
+        self.budget = _WINDOW_MAX_CHARS
+        self.parts: list[str] = []
+        self.used = 0
+        self.total = 0
+        self.full = False
+        self.cut_line: int | None = None
+        self.cut_at = 0  # the character of the cut line where the next read starts
+
+    def add(self, line: str, *, cut: bool = False) -> None:
+        index = self.total
+        self.total += 1
+        if self.full or not self.start <= index < self.end:
+            return
+        room = self.budget - self.used
+        size = _encoded_len(line)
+        if size > room:
+            self.full = True
+            if self.parts:
+                return
+            line, cut = _encoded_prefix(line, room), True
+            size = _encoded_len(line)
+        self.parts.append(line)
+        self.used += size
+        if cut:
+            self.cut_line = index
+            self.cut_at = (self.start_char if index == self.start else 0) + len(line)
+            self.full = True
+
+    @property
+    def done(self) -> bool:
+        """No later line can be kept: the budget is spent, or the next line is past the range."""
+        return self.full or self.total >= self.end
+
+    def skip(self, count: int) -> None:
+        """Count ``count`` lines that are not kept (outside the window, #735)."""
+        self.total += count
+
+    @property
+    def dedup_suffix(self) -> str:
+        """Appended to the read-dedup key, so reading the next range of a file in the same
+        turn is not mistaken for re-reading the range already shown (#590)."""
+        return f"#lines={self.start}:{self.end}" + (f"@{self.start_char}" if self.start_char else "")
+
+    @property
+    def truncated(self) -> bool:
+        return (
+            self.start > 0
+            or self.start_char > 0
+            or self.start + len(self.parts) < self.total
+            or self.cut_line is not None
+        )
+
+    def note(self, *, pages: int | None = None) -> str:
+        across = f" across {pages} page(s)" if pages is not None else ""
+        if self.start >= self.total:
+            return f"offset {self.start} is past the end: there are {self.total} lines{across}"
+        where = f"of {self.total}{across}"
+        text = f"showing lines {self.start}-{self.start + len(self.parts)} {where}"
+        if self.start_char:
+            text += f" (line {self.start} from character {self.start_char})"
+        if self.cut_line is not None:
+            return text + (
+                f"; line {self.cut_line} is longer than {self.budget} characters and was cut at character "
+                f"{self.cut_at}; pass offset={self.cut_line}, char_offset={self.cut_at} to read on"
+            )
+        if self.full:
+            text += f"; stopped at {self.budget} characters"
+        return text + "; pass offset/max_lines to read more"
+
+
+def _line_break_len(text: str) -> int:
+    """Length of the line break ``text`` ends with (2 for \\r\\n), or 0."""
+    if text.endswith("\r\n"):
+        return 2
+    return 1 if text and text[-1] in _LINE_BREAKS else 0
+
+
+def _from_char(line: str, start_char: int) -> str:
+    """``line`` from character ``start_char`` of its text; its line break is never dropped (#735)."""
+    body = len(line) - _line_break_len(line)
+    return line[min(start_char, body):]
+
+
+def _breaks(text: str) -> int:
+    """How many lines end in ``text``, as str.splitlines counts them (a \\r\\n is one)."""
+    return sum(text.count(c) for c in _LINE_BREAKS) - text.count("\r\n")
+
+
+def _scan_text(fh, window: _Window) -> None:
+    """Feed ``window`` the lines of a UTF-8 byte stream, as str.splitlines(keepends=True) would split the decoded
+    text, holding at most ``window.budget`` characters of any line.
+
+    Reads _READ_CHUNK_BYTES at a time, so memory is bounded by the chunk and the budget, never the file. Only a chunk
+    that reaches the window is split line by line; a chunk wholly before or after it is decoded and its line breaks
+    counted (#735: the per-line loop cost ~3 s on 20 MiB of bare newlines). Every chunk is still decoded, so invalid
+    UTF-8 anywhere raises UnicodeDecodeError, and the line count is the same either way.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")()
+    limit = window.budget
+    line, cut, carry = "", False, ""
+    open_line = False  # a line has begun and not yet ended
+    to_drop = window.start_char  # characters of line `window.start` not to show (#735), dropped as they stream
+    while True:
+        chunk = fh.read(_READ_CHUNK_BYTES)
+        text = carry + decoder.decode(chunk, final=not chunk)
+        carry = ""
+        if chunk and text.endswith("\r"):
+            carry, text = "\r", text[:-1]  # it may pair with a "\n" in the next chunk
+        if text:
+            ended = _breaks(text)
+            # The lines ending here are numbered total .. total+ended-1, and the one still open after it total+ended.
+            before = window.total + ended < window.start
+            if before or window.done:
+                # Nothing here is kept, an open line included: drop what was built of it and just count (#735
+                # review: keeping it per-line made every later chunk per-line when chunks ended mid-line).
+                window.skip(ended)
+                open_line = (text[-1] not in _LINE_BREAKS) if ended else True
+                line, cut = "", False
+            else:
+                start_dropped = False  # the start line has begun, all of it so far before char_offset
+                for part in text.splitlines(keepends=True):
+                    if to_drop and window.total == window.start:
+                        drop = min(to_drop, len(part) - _line_break_len(part))
+                        part, to_drop = part[drop:], to_drop - drop
+                        if _line_break_len(part):
+                            to_drop = 0  # the start line ends here: a char_offset past its end shows its break alone
+                        if not part:
+                            start_dropped = True
+                            continue  # this whole piece of the start line is before char_offset
+                    if not cut:
+                        room = limit - len(line)
+                        if len(part) > room:
+                            line, cut = line + part[:room], True
+                        else:
+                            line += part
+                    if part[-1] in _LINE_BREAKS:
+                        window.add(line, cut=cut)
+                        line, cut = "", False
+                # A start line dropped whole so far is still open (#735 review: an unterminated last line read past
+                # its end must still be counted).
+                open_line = bool(line or cut) or (start_dropped and window.total == window.start)
+        if not chunk:
+            if line or cut or open_line:
+                # An open line with nothing built is either outside the window (add keeps nothing then) or the
+                # start line read from at or past its end, which is shown as empty, as a terminated one shows its
+                # break alone.
+                window.add(line, cut=cut)
+            return
 
 
 def _read_pdf(
-    p: Path, *, raw: str, persona_dir: Path, max_lines: int | None, offset: int
+    p: Path, *, raw: str, persona_dir: Path, max_lines: int | None, offset: int, char_offset: int = 0
 ) -> dict:
     """#126: return a PDF's text layer, page-marked and windowed like a text file.
 
@@ -80,13 +277,14 @@ def _read_pdf(
         _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=size, ok=False, error="too large")
         return {"error": f"PDF too large ({size} bytes > {cap} cap) — not shown"}
 
-    _dedup_key = os.path.normcase(os.path.realpath(str(p)))
+    window = _Window(max_lines=max_lines, offset=offset, char_offset=char_offset)
+    _dedup_key = os.path.normcase(os.path.realpath(str(p))) + window.dedup_suffix
     if _read_cache.seen_recently(_dedup_key):
         _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=0, ok=True, error="deduped")
         return {
             "path": str(p),
             "deduped": True,
-            "note": "you already read this file moments ago this turn — its content is above.",
+            "note": _DEDUP_NOTE,
         }
     _read_cache.mark(_dedup_key)
 
@@ -116,16 +314,13 @@ def _read_pdf(
     joined = "".join(
         (f"--- page {i} ---\n" if i > 1 else "") + text + "\n" for i, text in enumerate(page_texts, 1)
     )
-    lines = joined.splitlines(keepends=True)
-    sliced, start, window_len, truncated = _window_lines(lines, max_lines=max_lines, offset=offset)
+    for i, line in enumerate(joined.splitlines(keepends=True)):
+        window.add(_from_char(line, window.start_char) if i == window.start and window.start_char else line)
     _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=size, ok=True)
-    out: dict = {"path": str(p), "content": sliced, "pages": pages, "total_lines": len(lines)}
-    if truncated:
+    out: dict = {"path": str(p), "content": "".join(window.parts), "pages": pages, "total_lines": window.total}
+    if window.truncated:
         out["truncated"] = True
-        out["note"] = (
-            f"showing lines {start}-{start + window_len} of {len(lines)} across {pages} page(s); "
-            "pass offset/max_lines to read more"
-        )
+        out["note"] = window.note(pages=pages)
     return out
 
 
@@ -161,33 +356,34 @@ def _audit(
     error: str | None = None,
 ) -> None:
     try:
-        persona_dir.mkdir(parents=True, exist_ok=True)
-        with (persona_dir / "file_access.jsonl").open("a", encoding="utf-8") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "ts": datetime.now(UTC).isoformat(),
-                        "tool": tool,
-                        "path": path,
-                        "resolved_path": resolved,
-                        "bytes": bytes_,
-                        "ok": ok,
-                        "error": error,
-                    }
-                )
-                + "\n"
-            )
+        append_jsonl(
+            persona_dir / "file_access.jsonl",
+            {
+                "ts": datetime.now(UTC).isoformat(),
+                "tool": tool,
+                "path": path,
+                "resolved_path": resolved,
+                "bytes": bytes_,
+                "ok": ok,
+                "error": error,
+            },
+            on_error="log",
+            nonfinite="null",
+        )
     except Exception:  # noqa: BLE001
         pass
 
 
 def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
-              offset: int = 0, **_) -> dict:
+              offset: int = 0, char_offset: int = 0, **_) -> dict:
     """Read a text file's contents (read-only). Refuses files over the size cap.
 
     max_lines: optional — return at most this many lines (ranged read).
-    offset: 0-based line to start reading from (used with max_lines).
-    Large files without max_lines are head-capped at _DEFAULT_HEAD_LINES.
+    offset: 0-based line to start reading from.
+    char_offset: 0-based character of line ``offset`` to start from, to read past a line
+    cut at the window budget (#735); the cut note names it.
+    Without max_lines a read shows _DEFAULT_HEAD_LINES lines from offset; any read
+    shows at most _WINDOW_MAX_CHARS characters (#590).
     """
     raw = path
     try:
@@ -195,6 +391,13 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
     except Exception as exc:  # noqa: BLE001
         _audit(persona_dir, tool="read_file", path=raw, resolved="", bytes_=0, ok=False, error=str(exc))
         return {"error": f"bad path: {exc}"}
+    if (why := unusable(p)) is not None:  # #695: too long, no permission, a loop: refuse before anything stats it
+        _audit(persona_dir, tool="read_file", path=raw, resolved="", bytes_=0, ok=False, error=why)
+        return {"error": f"bad path: {why}"}
+
+    if is_read_denied(p, persona_dir=persona_dir):
+        _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=0, ok=False, error=PROTECTED)
+        return {"error": f"refused: {p} is in a {PROTECTED}"}
 
     if not p.exists() or not p.is_file():
         suggestions = _suggest(p)
@@ -210,7 +413,7 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
         return {"error": f"not a readable file: {p}", "did_you_mean": suggestions}
 
     # Image branch — MUST run BEFORE the text size-cap check below so a real
-    # photo (larger than the 256KB text cap but within files.image_max_bytes)
+    # photo (larger than the text cap but within files.image_max_bytes)
     # is returned as a viewable image, not refused by the text cap (P0 red-team
     # F-1 cap-ordering). Sniff the media type from a small magic-byte prefix.
     try:
@@ -242,7 +445,7 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
             return {
                 "path": str(p),
                 "deduped": True,
-                "note": "you already read this file moments ago this turn — its content is above.",
+                "note": _DEDUP_NOTE_IMAGE,
             }
         _read_cache.mark(_dedup_key)
         try:
@@ -293,7 +496,9 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
     # PDF branch (#126) — also BEFORE the text cap: a PDF is binary-large but
     # text-small, same cap-ordering reasoning as the image branch above.
     if _prefix.startswith(_PDF_MAGIC):
-        return _read_pdf(p, raw=raw, persona_dir=persona_dir, max_lines=max_lines, offset=offset)
+        return _read_pdf(
+            p, raw=raw, persona_dir=persona_dir, max_lines=max_lines, offset=offset, char_offset=char_offset
+        )
 
     cap = _file_read_max_bytes()
     size = p.stat().st_size
@@ -314,20 +519,25 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
     # canonicalises case on the case-insensitive macOS FS and keeps genuinely
     # distinct files distinct on case-sensitive Linux. Do NOT casefold here — on
     # Linux that would collide two different files (Notes.md vs notes.md).
-    _dedup_key = os.path.normcase(os.path.realpath(str(p)))
+    window = _Window(max_lines=max_lines, offset=offset, char_offset=char_offset)
+    _dedup_key = os.path.normcase(os.path.realpath(str(p))) + window.dedup_suffix
     if _read_cache.seen_recently(_dedup_key):
         _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=0, ok=True, error="deduped")
         return {
             "path": str(p),
             "deduped": True,
-            "note": "you already read this file moments ago this turn — its content is above.",
+            "note": _DEDUP_NOTE,
         }
     _read_cache.mark(_dedup_key)
 
     try:
-        data = p.read_bytes()
+        # #590: stream the file a chunk at a time; only the window's lines are kept.
+        # The whole file is still decoded, to count its lines and to call it binary
+        # if any of it is not UTF-8, as the old whole-file decode did; #735: only the
+        # chunks that reach the window are split line by line.
         try:
-            content = data.decode("utf-8")
+            with p.open("rb") as fh:
+                _scan_text(fh, window)
         except UnicodeDecodeError:
             _audit(
                 persona_dir,
@@ -340,19 +550,11 @@ def read_file(path: str, *, persona_dir: Path, max_lines: int | None = None,
             )
             return {"path": str(p), "note": f"(binary file, {size} bytes — not shown)"}
 
-        lines = content.splitlines(keepends=True)
-        total = len(lines)
-        sliced, start, window_len, truncated = _window_lines(
-            lines, max_lines=max_lines, offset=offset
-        )
         _audit(persona_dir, tool="read_file", path=raw, resolved=str(p), bytes_=size, ok=True)
-        out: dict = {"path": str(p), "content": sliced, "total_lines": total}
-        if truncated:
+        out: dict = {"path": str(p), "content": "".join(window.parts), "total_lines": window.total}
+        if window.truncated:
             out["truncated"] = True
-            out["note"] = (
-                f"showing lines {start}-{start + window_len} of {total}; "
-                "pass offset/max_lines to read more"
-            )
+            out["note"] = window.note()
         return out
 
     except OSError as exc:

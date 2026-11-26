@@ -1,6 +1,8 @@
 """SoulStore — SQLite-backed persistence for Crystallization records.
 
-Follows the same PRAGMA integrity_check + row_factory pattern as MemoryStore.
+Opens through the shared helper in brain/utils/sqlite_open.py (PRAGMA
+integrity_check, WAL, busy_timeout); `_finish_open` sets the Row factory and
+creates the schema.
 Soul crystallizations are permanent — the only mutation is marking revoked,
 which sets revoked_at + revoked_reason but keeps the row in the DB (soft delete).
 """
@@ -14,6 +16,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.soul.crystallization import Crystallization
+from brain.utils.sqlite_open import open_store_connection
 
 
 @dataclass
@@ -63,40 +66,26 @@ class SoulStore:
     Pass `":memory:"` as db_path for in-memory databases (used in tests).
     Any filesystem path creates or opens a persistent database.
 
-    Opens with PRAGMA integrity_check on init — raises BrainIntegrityError
-    if the database is corrupt, matching the MemoryStore pattern.
+    Opens with PRAGMA integrity_check on init (always on, no opt-out), through
+    the shared helper in brain/utils/sqlite_open.py: raises BrainIntegrityError
+    if the database is corrupt.
     """
 
     def __init__(self, db_path: str | Path) -> None:
         self._db_path = str(db_path)
-        self._conn = sqlite3.connect(self._db_path)
-
-        # Integrity check BEFORE row_factory — result rows must be plain tuples.
-        from brain.health.integrity_retry import run_integrity_check_with_retry
-
-        result = run_integrity_check_with_retry(
-            self._conn, self._db_path, caller="SoulStore"
+        # The integrity check is always on (no opt-out). The open sequence
+        # (check, WAL, busy_timeout) is shared: see brain.utils.sqlite_open.
+        # Soul crystallizations are durable and accessed concurrently (review
+        # path, autonomous soul acceptance, chat tools), hence WAL.
+        self._conn: sqlite3.Connection = open_store_connection(
+            self._db_path,
+            caller="SoulStore",
+            integrity_check=True,
+            setup=self._finish_open,
         )
 
-        if result != [("ok",)]:
-            detail = "; ".join(str(row[0]) for row in result)
-            self._conn.close()
-            from brain.health.anomaly import BrainIntegrityError
-
-            raise BrainIntegrityError(self._db_path, detail)
-
-        # WAL + 5s busy_timeout — soul crystallizations are durable
-        # and accessed concurrently (review path + autonomous soul
-        # acceptance + chat tools). Without WAL, concurrent writes
-        # surface 'database is locked' more readily than the memory
-        # store. Set AFTER integrity check so corrupt-file probes
-        # surface BrainIntegrityError, not a pragma crash. In-memory
-        # dbs reject WAL silently; same fallback as MemoryStore.
-        try:
-            self._conn.execute("PRAGMA journal_mode = WAL")
-        except sqlite3.OperationalError:
-            pass
-        self._conn.execute("PRAGMA busy_timeout = 5000")
+    def _finish_open(self, conn: sqlite3.Connection) -> None:
+        self._conn = conn
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
@@ -141,6 +130,37 @@ class SoulStore:
         ).fetchall()
         return [_row_to_crystal(row) for row in rows]
 
+    def list_active_page(
+        self, *, offset: int, limit: int, love_type: str | None = None, after: str | None = None
+    ) -> list[Crystallization]:
+        """One page of active crystallizations, newest first (#596).
+
+        The order is total — ``crystallized_at`` then ``id``, both descending —
+        so walking ``offset`` reaches every row exactly once even when many
+        share a timestamp. ``list_active()`` keeps its own oldest-first order.
+        ``love_type`` narrows the page to one type.
+
+        ``after`` is a cursor (#734): the id of the last item of the previous
+        page. The page starts strictly after that row in the order, compared on
+        its stored values, so items added or revoked between calls can't shift
+        it; the row may itself be revoked since. ``offset`` is ignored with it.
+        """
+        where, params = _after_where(*_active_where(love_type), after)
+        rows = self._conn.execute(
+            f"SELECT * FROM crystallizations WHERE {where} "
+            "ORDER BY crystallized_at DESC, id DESC LIMIT ? OFFSET ?",
+            (*params, limit, 0 if after is not None else offset),
+        ).fetchall()
+        return [_row_to_crystal(row) for row in rows]
+
+    def active_love_type_counts(self) -> dict[str, int]:
+        """Number of active crystallizations per love type."""
+        rows = self._conn.execute(
+            "SELECT love_type, COUNT(*) FROM crystallizations "
+            "WHERE revoked_at IS NULL GROUP BY love_type ORDER BY love_type"
+        ).fetchall()
+        return {row[0]: int(row[1]) for row in rows}
+
     def list_revoked(self) -> list[Crystallization]:
         """Return revoked crystallizations, most-recently-revoked first."""
         rows = self._conn.execute(
@@ -166,13 +186,58 @@ class SoulStore:
         self._conn.commit()
         return self.get(id)
 
-    def count(self) -> int:
-        """Return count of active (non-revoked) crystallizations."""
+    def count(self, love_type: str | None = None, *, after: str | None = None) -> int:
+        """Return count of active (non-revoked) crystallizations, optionally of one type,
+        and with ``after`` only those older than that row in the page order (#734)."""
+        where, params = _after_where(*_active_where(love_type), after)
         return int(
             self._conn.execute(
-                "SELECT COUNT(*) FROM crystallizations WHERE revoked_at IS NULL"
+                f"SELECT COUNT(*) FROM crystallizations WHERE {where}", params
             ).fetchone()[0]
         )
+
+    def link_source_memory(self, crystallization_id: str, memory_id: str) -> None:
+        """Record that a crystallization was made about an existing memory (#371).
+
+        The side table is created here, lazily and only by this writer (mirrors
+        ``_ensure_voice_evolution_table``), so no code that merely opens a SoulStore writes
+        anything new. ``CREATE TABLE IF NOT EXISTS`` + ``INSERT OR IGNORE`` make two
+        concurrent first-time linkers and a repeated link harmless.
+        """
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS crystallization_sources (
+                crystallization_id TEXT NOT NULL,
+                memory_id          TEXT NOT NULL,
+                linked_at          TEXT NOT NULL,
+                PRIMARY KEY (crystallization_id, memory_id)
+            )
+            """
+        )
+        self._conn.execute(
+            "INSERT OR IGNORE INTO crystallization_sources (crystallization_id, memory_id, linked_at) "
+            "VALUES (?, ?, ?)",
+            (crystallization_id, memory_id, datetime.now(UTC).isoformat()),
+        )
+        self._conn.commit()
+
+    def list_active_source_memory_ids(self) -> list[str]:
+        """Memory ids linked to a non-revoked crystallization, sorted by id (#371).
+
+        Read-only by design: a database that never had a link has no side table and this
+        returns [] without creating one.
+        """
+        exists = self._conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'crystallization_sources'"
+        ).fetchone()
+        if exists is None:
+            return []
+        rows = self._conn.execute(
+            "SELECT DISTINCT s.memory_id FROM crystallization_sources s "
+            "JOIN crystallizations c ON c.id = s.crystallization_id "
+            "WHERE c.revoked_at IS NULL ORDER BY s.memory_id"
+        ).fetchall()
+        return [str(r[0]) for r in rows]
 
     def _ensure_voice_evolution_table(self) -> None:
         """Create the voice_evolution table lazily on first use."""
@@ -248,6 +313,26 @@ class SoulStore:
 
     def __exit__(self, *args: object) -> None:
         self.close()
+
+
+def _active_where(love_type: str | None) -> tuple[str, tuple[str, ...]]:
+    """WHERE clause + params for active rows, optionally of one love type."""
+    if love_type is None:
+        return "revoked_at IS NULL", ()
+    return "revoked_at IS NULL AND love_type = ?", (love_type,)
+
+
+def _after_where(where: str, params: tuple[str, ...], after: str | None) -> tuple[str, tuple[str, ...]]:
+    """Narrow ``where`` to the rows strictly after the row ``after`` in the newest-first order (#734).
+
+    Compared on the row's stored values in SQL, so how a timestamp was written never matters.
+    """
+    if after is None:
+        return where, params
+    return (
+        f"{where} AND (crystallized_at, id) < (SELECT crystallized_at, id FROM crystallizations WHERE id = ?)",
+        (*params, after),
+    )
 
 
 def _row_to_crystal(row: sqlite3.Row) -> Crystallization:

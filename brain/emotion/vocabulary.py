@@ -16,6 +16,7 @@ Decay half-lives per spec Section 10.1:
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Literal
 
@@ -82,7 +83,7 @@ _BASELINE: tuple[Emotion, ...] = (
         30.0,
     ),
     # ── body (4) ──
-    # Spec docs/superpowers/specs/2026-04-29-body-state-design.md §2.1.
+    # Spec docs/source-spec/2026-04-29-body-state-design.md §2.1.
     # Existing `arousal` (core, 0.5d) and `desire` (core, 2.0d) reused;
     # they're already body-coded by description, no need to duplicate.
     Emotion(
@@ -140,6 +141,20 @@ def canonical_name(name: str) -> str:
         parts = key[: -len(_BLEND_SUFFIX)].split("_")
         key = "_".join(sorted(parts)) + _BLEND_SUFFIX
     return key
+
+
+def pool_by_canonical_name(values: Mapping[str, float]) -> dict[str, float]:
+    """Key a name-to-value mapping by canonical name; spellings of one emotion keep the larger value.
+
+    A max-per-emotion rule over spellings. Names outside the
+    vocabulary are only normalised, so unrelated names stay separate keys. Returns a new dict.
+    """
+    pooled: dict[str, float] = {}
+    for name, value in values.items():
+        key = canonical_name(name)
+        if key not in pooled or value > pooled[key]:
+            pooled[key] = value
+    return pooled
 
 
 def get(name: str) -> Emotion | None:

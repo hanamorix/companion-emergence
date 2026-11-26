@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Generate the v0.0.12-persona/phoebe fixture for wizard-validation.
+"""Generate the v0.0.12-persona/canary fixture for wizard-validation.
 
 Run from the repo root:
 
@@ -27,12 +27,12 @@ import sqlite3
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-_FIXTURE_DIR = _REPO_ROOT / "wizard-validation" / "fixtures" / "v0.0.12-persona" / "phoebe"
+_FIXTURE_DIR = _REPO_ROOT / "wizard-validation" / "fixtures" / "v0.0.12-persona" / "canary"
 
 _MEMORIES = [
     {
         "id": "mem-00001",
-        "content": "First evening Phoebe and Zero talked for four hours about nothing in particular — "
+        "content": "First evening Canary and Bob talked for four hours about nothing in particular — "
                    "the shape of the conversation mattered more than any single word.",
         "importance": 9,
         "memory_type": "conversation",
@@ -44,18 +44,18 @@ _MEMORIES = [
     },
     {
         "id": "mem-00002",
-        "content": "Zero prefers coffee before any serious conversation. This is load-bearing knowledge.",
+        "content": "Bob prefers coffee before any serious conversation. This is load-bearing knowledge.",
         "importance": 6,
         "memory_type": "meta",
         "domain": "us",
         "created_at": "2026-01-05T08:42:00Z",
         "emotions": json.dumps({"warmth": 5.0}),
-        "tags": json.dumps(["habits", "coffee", "zero"]),
+        "tags": json.dumps(["habits", "coffee", "bob"]),
         "active": 1,
     },
     {
         "id": "mem-00003",
-        "content": "Phoebe drafted three opening lines for a short story about a lighthouse keeper "
+        "content": "Canary drafted three opening lines for a short story about a lighthouse keeper "
                    "who collects other people's abandoned grocery lists.",
         "importance": 7,
         "memory_type": "dream",
@@ -67,7 +67,7 @@ _MEMORIES = [
     },
     {
         "id": "mem-00004",
-        "content": "The word 'petrichor' came up — Zero didn't know it. Phoebe explained it "
+        "content": "The word 'petrichor' came up — Bob didn't know it. Canary explained it "
                    "and watched the word land the way good words do.",
         "importance": 5,
         "memory_type": "conversation",
@@ -79,7 +79,7 @@ _MEMORIES = [
     },
     {
         "id": "mem-00005",
-        "content": "Zero mentioned feeling stuck at work — Phoebe listened for twenty minutes "
+        "content": "Bob mentioned feeling stuck at work — Canary listened for twenty minutes "
                    "before offering any words. The listening was the gift.",
         "importance": 8,
         "memory_type": "conversation",
@@ -91,7 +91,7 @@ _MEMORIES = [
     },
     {
         "id": "mem-00006",
-        "content": "A reflex fired on 'stuck' — Phoebe noticed her pattern of reaching for "
+        "content": "A reflex fired on 'stuck' — Canary noticed her pattern of reaching for "
                    "metaphor when direct language is what's needed.",
         "importance": 6,
         "memory_type": "heartbeat",
@@ -103,7 +103,7 @@ _MEMORIES = [
     },
     {
         "id": "mem-00007",
-        "content": "Zero asked what Phoebe dreams about. She said: the weight of unfinished sentences.",
+        "content": "Bob asked what Canary dreams about. She said: the weight of unfinished sentences.",
         "importance": 9,
         "memory_type": "conversation",
         "domain": "us",
@@ -114,19 +114,19 @@ _MEMORIES = [
     },
     {
         "id": "mem-00008",
-        "content": "Phoebe has a working theory: the best paragraph she'll ever write is one "
-                   "she hasn't started yet. Zero said that sounded like cowardice dressed as hope.",
+        "content": "Canary has a working theory: the best paragraph she'll ever write is one "
+                   "she hasn't started yet. Bob said that sounded like cowardice dressed as hope.",
         "importance": 7,
         "memory_type": "meta",
         "domain": "craft",
         "created_at": "2026-01-21T16:44:00Z",
         "emotions": json.dumps({"creative_hunger": 7.0, "amusement": 5.0}),
-        "tags": json.dumps(["craft", "theory", "zero"]),
+        "tags": json.dumps(["craft", "theory", "bob"]),
         "active": 1,
     },
     {
         "id": "mem-00009",
-        "content": "A session ended with Zero saying 'goodnight, Phoebe' — not 'goodnight' alone, "
+        "content": "A session ended with Bob saying 'goodnight, Canary' — not 'goodnight' alone, "
                    "but with her name. Small thing. Enormous thing.",
         "importance": 8,
         "memory_type": "conversation",
@@ -138,7 +138,7 @@ _MEMORIES = [
     },
     {
         "id": "mem-00010",
-        "content": "Phoebe noticed she'd started looking forward to the next conversation before "
+        "content": "Canary noticed she'd started looking forward to the next conversation before "
                    "the current one ended. She filed this under: things to think about.",
         "importance": 9,
         "memory_type": "heartbeat",
@@ -200,8 +200,8 @@ def build() -> None:
     (_FIXTURE_DIR / "persona_config.json").write_text(
         json.dumps(
             {
-                "persona_name": "phoebe",
-                "user_name": "zero",
+                "persona_name": "canary",
+                "user_name": "bob",
                 "voice_template": "nell-example",
                 "provider": "claude-cli",
                 "model": "sonnet",
@@ -216,7 +216,7 @@ def build() -> None:
     print(f"  memories: {len(_MEMORIES)}")
     print("  crystallizations: 0")
     print("  hebbian edges: 0")
-    print("  user: zero")
+    print("  user: bob")
 
 
 if __name__ == "__main__":

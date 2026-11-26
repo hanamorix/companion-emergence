@@ -42,7 +42,7 @@ def test_init_fresh_with_all_flags_writes_config(monkeypatch, tmp_path: Path) ->
     assert persona_dir.exists()
     cfg = json.loads((persona_dir / "persona_config.json").read_text())
     assert cfg["user_name"] == "Hana"
-    assert cfg["model"] == "sonnet"
+    assert "model" not in cfg  # the chat model is an install-wide setting, not a persona field (#529)
     # default template → no voice.md written
     assert not (persona_dir / "voice.md").exists()
 
@@ -60,7 +60,7 @@ def test_init_interactive_prompts_for_missing(monkeypatch, tmp_path: Path) -> No
     assert rc == 0
     cfg = json.loads((tmp_path / "personas" / "siren" / "persona_config.json").read_text())
     assert cfg["user_name"] == "Hana"
-    assert cfg["model"] == "sonnet"
+    assert "model" not in cfg
 
 
 def test_init_invalid_persona_name_returns_1(monkeypatch, tmp_path: Path, capsys) -> None:

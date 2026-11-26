@@ -5,16 +5,18 @@ reflection. No peer-derived content may flip a hold/revise into a send (parent
 §5). Fails closed to hold on any uncertainty.
 
 Tool-path isolation (carried from Phase 3): this module imports ONLY stdlib +
-{gate, limits, cli_throttle}. The conformance oracle enforces it by AST."""
+{gate, dev_constants, cli_throttle}. The conformance oracle checks its `from brain.X import Y` imports by AST."""
 from __future__ import annotations
 
 import json
 import logging
 import re
 from datetime import datetime
+from pathlib import Path
 
+from brain import dev_constants
 from brain.bridge import cli_throttle as _default_throttle
-from brain.kindled_link import limits
+from brain.health.parse_failures import record_parse_failure
 from brain.kindled_link.gate import GateDecision, OutboundPayload
 
 log = logging.getLogger(__name__)
@@ -132,14 +134,17 @@ def _build_gate_prompt(*, body: str, relationship_hint_json: str,
     return "\n\n".join(parts)
 
 
-def _parse_verdict(raw: str) -> GateDecision:
-    """Parse the model's JSON verdict; any malformation → hold (fail closed)."""
+def _parse_verdict(raw: str, persona_dir: Path | None = None) -> GateDecision:
+    """Parse the model's JSON verdict; any malformation → hold (fail closed),
+    and the verdict is kept in the parse-failure log (#364)."""
     try:
         start = raw.index("{")
         end = raw.rindex("}") + 1
         data = json.loads(raw[start:end])
         action = data.get("decision")
         if action not in {"send", "revise", "hold", "end_or_pause"}:
+            record_parse_failure(persona_dir, site="privacy_gate", raw=raw,
+                                 error="unknown decision", keep_raw=False)
             return GateDecision(action="hold", reason="gate: unparseable decision")
         # MISSING or malformed texture_score → 1.0 (safe/high): an unknown
         # disclosure magnitude is treated as maximal so the budget depletes
@@ -155,8 +160,8 @@ def _parse_verdict(raw: str) -> GateDecision:
             revision_constraints=data.get("revision_constraints"),
             texture_score=score,
         )
-    except Exception:  # noqa: BLE001 — fail closed
-        log.warning("privacy gate: malformed verdict; holding", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 — fail closed
+        record_parse_failure(persona_dir, site="privacy_gate", raw=raw, error=type(exc).__name__, keep_raw=False)
         return GateDecision(action="hold", reason="gate: malformed verdict")
 
 
@@ -167,13 +172,13 @@ def _apply_budget(decision: GateDecision, *, budget: float) -> GateDecision:
         # m10: a fully depleted budget hard-stops to hold (more restrictive than
         # the tighten band). Checked FIRST — DEPLETED (0.02) < TIGHTEN (0.25), so a
         # sub-floor budget also satisfies the tighten test; the hold must win.
-        if budget < limits.BUDGET_DEPLETED_THRESHOLD:
+        if budget < dev_constants.KINDLED_LINK_BUDGET_DEPLETED_THRESHOLD:
             return GateDecision(
                 action="hold",
                 reason="budget: disclosure budget depleted; holding",
                 texture_score=decision.texture_score,
             )
-        if budget < limits.BUDGET_TIGHTEN_THRESHOLD:
+        if budget < dev_constants.KINDLED_LINK_BUDGET_TIGHTEN_THRESHOLD:
             return GateDecision(
                 action="revise",
                 reason="budget: disclosure budget low; reduce user-referencing texture",
@@ -184,10 +189,11 @@ def _apply_budget(decision: GateDecision, *, budget: float) -> GateDecision:
 
 
 class PrivacyGate:
-    def __init__(self, *, provider, store, throttle=_default_throttle):
+    def __init__(self, *, provider, store, throttle=_default_throttle, persona_dir=None):
         self._provider = provider
         self._store = store
         self._throttle = throttle
+        self._persona_dir = persona_dir
 
     @staticmethod
     def _payload_text(payload: OutboundPayload) -> str:
@@ -217,7 +223,7 @@ class PrivacyGate:
         # gate/reflection call for the same peer); refund below if the LLM call
         # never completes, so only completed calls net-count (defer ≠ failure).
         if not self._store.try_reserve_provider(
-            peer_id, today, cap=limits.DAILY_PROVIDER_CAP
+            peer_id, today, cap=dev_constants.KINDLED_LINK_DAILY_PROVIDER_CAP
         ):
             return GateDecision(action="hold", reason="gate: provider cap spent")
         # Slot reserved — from here, EVERY non-completing exit must release it.
@@ -231,7 +237,7 @@ class PrivacyGate:
                 relationship_hint_json=json.dumps(payload.relationship_hint or {},
                                                   sort_keys=True),
                 transcript_summary=transcript_summary, reason=reason, stage=stage,
-                budget_ok=budget >= limits.BUDGET_TIGHTEN_THRESHOLD,
+                budget_ok=budget >= dev_constants.KINDLED_LINK_BUDGET_TIGHTEN_THRESHOLD,
             )
             with self._throttle.background_slot() as granted:
                 if not granted:
@@ -242,5 +248,5 @@ class PrivacyGate:
             self._store.release_provider_slot(peer_id, today)  # no completed call → refund
             log.warning("privacy gate: provider error; holding", exc_info=True)
             return GateDecision(action="hold", reason="gate: provider error")
-        decision = _parse_verdict(raw)
+        decision = _parse_verdict(raw, self._persona_dir)
         return _apply_budget(decision, budget=budget)

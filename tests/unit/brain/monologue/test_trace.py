@@ -19,7 +19,7 @@ def _trace_candidate(store):
 
 def test_write_trace_memory_persists_verbatim_as_active(tmp_path):
     store = MemoryStore(tmp_path / "memories.db")
-    mem_id = write_trace_memory(store, "i kept thinking about the lighthouse")
+    mem_id = write_trace_memory(store, "i kept thinking about the lighthouse", feed_digest="a digest", persona_dir=None)
     # Enqueued as a candidate, not a memories.db row.
     assert store.get(mem_id) is None
     mem = _trace_candidate(store)
@@ -30,10 +30,9 @@ def test_write_trace_memory_persists_verbatim_as_active(tmp_path):
     assert mem.state == "active"
 
 
-def test_write_trace_memory_seeds_current_emotion_aggregate(tmp_path):
+def test_write_trace_memory_off_stores_the_raw_thought_with_no_feelings(tmp_path):
+    # B1 PR 7: with the engine not reading, the old aggregate seed of recent memories is gone. The raw thought is kept.
     store = MemoryStore(tmp_path / "memories.db")
-    # Seed an emotionally-charged active memory so the aggregate is non-empty.
-    # Use a baseline (registered) emotion — aggregate_state skips unregistered names.
     store.create(
         Memory.create_new(
             content="a charged moment",
@@ -42,10 +41,10 @@ def test_write_trace_memory_seeds_current_emotion_aggregate(tmp_path):
             emotions={"love": 8.0},
         )
     )
-    write_trace_memory(store, "drifting again")
+    write_trace_memory(store, "drifting again", feed_digest="a digest", persona_dir=None)
     mem = _trace_candidate(store)
-    assert mem.emotions, "trace should inherit the current emotional aggregate"
-    assert "love" in mem.emotions
+    assert mem.content == "drifting again"
+    assert mem._stored_emotions == {}
 
 
 def test_capture_writes_trace_memory_and_surfaced_digest(tmp_path):

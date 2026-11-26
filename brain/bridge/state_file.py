@@ -1,12 +1,14 @@
 """Bridge daemon state file — bridge.json.
 
 The file is persistent across restarts. `pid`/`port` get cleared on graceful
-shutdown; `shutdown_clean` flips to True as the very last step. On the next
-`bridge start`, if `shutdown_clean: false` AND the recorded pid is dead, the
-previous bridge crashed — caller should run dirty-shutdown recovery.
+shutdown; `shutdown_clean` flips to True as the very last step. A record left
+with `shutdown_clean: false` whose bridge is gone (identity token, not the bare
+pid) is a dirty end: `recovery_needed` reports it (status output only). Nothing
+runs at start to recover it; the next bridge's first idle pass saves the open
+conversations whatever ended the last one (#456 D12).
 
-Atomic writes go through brain.health.attempt_heal.save_with_backup so
-partial writes don't corrupt state. Reads use attempt_heal so corrupted
+Atomic writes go through brain.health.json_io.write_json so
+partial writes don't corrupt state. Reads use read_json_result (HEAL) so corrupted
 files restore from .bak1.
 
 OG reference: NellBrain/nell_supervisor.py:53-101 (state file machinery,
@@ -17,11 +19,13 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from brain.health.adaptive import compute_treatment
-from brain.health.attempt_heal import attempt_heal, save_with_backup
+from brain.health.json_io import Recovery, read_json_result, write_json
 from brain.state_compat import from_known_fields
 
 logger = logging.getLogger(__name__)
@@ -45,13 +49,22 @@ class BridgeState:
     # committed to git or logged. None for legacy state files (auth disabled
     # for backward compat — runner.py always generates one in real use).
     auth_token: str | None = None
-    # Number of session-ingest errors during the last shutdown drain.
-    # Set by the FastAPI lifespan finally block when reports[i].errors > 0.
-    # `_write_clean_shutdown` honours this: a process with drain_errors > 0
-    # is treated as dirty (shutdown_clean=False) so the next bridge start
-    # re-runs `run_recovery_if_needed` and retries the orphan buffers.
-    # Default 0 for legacy state files written before this field existed.
+    # Ingest errors of the last shutdown drain, written by versions before #456 (no drain any more, Q-B). Kept so an
+    # older file of that shape still reads as "recovery needed" (#471); the next start's first idle pass saves the
+    # sessions either way.
     drain_errors: int = 0
+    # Process identity (#456): the token brain.process_identity computes for this bridge at start, so a reused pid
+    # is never taken for the bridge. `identity` is "token" when pid_token is set, "unavailable" when this platform
+    # could not read the bridge's own token (liveness then uses the command-line proof), and None in a file written
+    # before this field existed (a pre-PR bridge, owner's decision D22).
+    pid_token: str | None = None
+    identity: str | None = None
+    # Stop record (#456): "running" | "stopping" | "stopped"; why it stopped; when the stop was requested.
+    phase: str | None = None
+    stop_reason: str | None = None
+    stop_requested_at: str | None = None
+    # The supervisor's state (#456 Q6: SupervisorStatus.as_dict), so `status --json` reports it without HTTP.
+    supervisor: dict | None = None
 
 
 def _state_path(persona_dir: Path) -> Path:
@@ -62,7 +75,7 @@ def _default_factory() -> dict:
     """Returned when bridge.json is missing AND all .bak files are corrupt.
 
     A "missing" bridge.json (never written) returns None from read() — we
-    only fall through to default_factory in attempt_heal when the file
+    only fall through to default_factory in the heal when the file
     exists but is unrecoverable. In that case we return a stub that
     recovery_needed() sees as 'not running, not dirty'.
     """
@@ -88,39 +101,57 @@ def write(persona_dir: Path, state: BridgeState) -> None:
     except Exception:
         logger.warning("compute_treatment failed; defaulting to backup_count=3")
         backup_count = 3
-    save_with_backup(path, asdict(state), backup_count=backup_count)
-    _protect_state_files(path, backup_count)
+    # mode=0o600 applies to the file and to every rotated backup (the token must never be wider).
+    write_json(path, asdict(state), backups=backup_count, mode=0o600)
+    _protect_state_dir(path)
 
 
-def _protect_state_files(path: Path, backup_count: int) -> None:
-    """Keep bridge state/token files owner-only after atomic rotation."""
+# One read-modify-write of bridge.json at a time inside this process (C18 a). `_update_between` is a test hook called
+# between the read and the write.
+_update_lock = threading.Lock()
+_update_between: Callable[[], None] | None = None
+
+
+def update(persona_dir: Path, fn: Callable[[BridgeState], None]) -> bool:
+    """Read-modify-write bridge.json for THIS bridge only (main's ruling: bridge.json is written only by its owner).
+
+    Writes when the record's pid is this process and its token is this process's own token (both None on a platform
+    where identity is unavailable); otherwise skips and returns False. Serialized under a module lock, so two updates
+    in this process never lose each other.
+    """
+    from brain import process_identity
+
+    with _update_lock:
+        cur = read(persona_dir)
+        if cur is None or not process_identity.is_own_identity(cur.pid, cur.pid_token):
+            return False
+        if _update_between is not None:
+            _update_between()
+        fn(cur)
+        write(persona_dir, cur)
+        return True
+
+
+def _protect_state_dir(path: Path) -> None:
+    """Keep the bridge state directory owner-only (the files get 0o600 from write_json)."""
     try:
         path.parent.chmod(0o700)
     except OSError as exc:
         logger.warning("failed to chmod bridge state dir %s: %s", path.parent, exc)
-    for candidate in [
-        path,
-        *(path.with_name(f"{path.name}.bak{i}") for i in range(1, backup_count + 1)),
-    ]:
-        if not candidate.exists():
-            continue
-        try:
-            candidate.chmod(0o600)
-        except OSError as exc:
-            logger.warning("failed to chmod bridge state file %s: %s", candidate, exc)
 
 
 def read(persona_dir: Path) -> BridgeState | None:
     """Read bridge.json. Returns None if file does not exist.
 
-    If the file exists but is corrupt, attempt_heal restores from .bak rotation
+    If the file exists but is corrupt, the heal restores from .bak rotation
     and returns the recovered data. If all backups are corrupt, returns the
     default-factory output (treated as 'not running, clean shutdown').
     """
     path = _state_path(persona_dir)
     if not path.exists():
         return None
-    data, anomaly = attempt_heal(path, _default_factory)
+    res = read_json_result(path, default=_default_factory, recover=Recovery.HEAL)
+    data, anomaly = res.data, res.anomaly
     if anomaly is not None:
         logger.warning(
             "bridge.json anomaly: %s (%s) — using recovered/default state",
@@ -159,7 +190,11 @@ def _windows_pid_is_alive(pid: int) -> bool:
 
 def pid_is_alive(pid: int) -> bool:
     """Return True if the given pid is a live process owned by this user."""
-    if pid <= 0:
+    from brain import process_identity
+
+    # #755: a pid outside the platform's range (a damaged or hand-edited file) names no process, and the OS calls
+    # below refuse it with OverflowError (os.kill) or ctypes.ArgumentError (OpenProcess), which no caller expects.
+    if not process_identity.is_pid_number(pid):
         return False
     if os.name == "nt":
         return _windows_pid_is_alive(pid)
@@ -177,31 +212,108 @@ def pid_is_alive(pid: int) -> bool:
 
 
 def recovery_needed(persona_dir: Path) -> bool:
-    """True iff the previous bridge process exited dirty.
+    """True iff the previous bridge process exited dirty and is gone.
 
-    Predicate: state file exists AND (``shutdown_clean=False`` OR the
-    last shutdown drain reported ingest errors) AND the recorded pid is
-    dead.
-
-    The drain_errors arm covers the "clean shutdown that happened to
-    have a failed drain" case — extraction blew up during shutdown and
-    the buffer was retained, but the lifespan still ran to completion
-    and so shutdown_clean=True. Without this arm, those buffers would
-    sit forever on disk.
-    """
+    Dirty = ``shutdown_clean`` False, or (in a file written before #456) a shutdown drain that reported ingest
+    errors. A dirty record whose pid was cleared (older versions cleared it on the way out, also after drain errors,
+    #471) is gone by construction; one with a pid is gone when its identity says so (``bridge_liveness``).
+    "Recovery" is the next start's first idle pass (the gated job ``session_snapshot_prune``), not a step at start."""
     state = read(persona_dir)
     if state is None:
         return False
-    if state.pid is None:
+    if state.shutdown_clean and state.drain_errors <= 0:
         return False
-    if not state.shutdown_clean or state.drain_errors > 0:
-        return not pid_is_alive(state.pid)
-    return False
+    if state.pid is None:
+        return True
+    return bridge_liveness(state, persona_dir) == GONE
 
 
 def is_running(persona_dir: Path) -> bool:
-    """True iff a live bridge daemon is recorded for this persona."""
-    state = read(persona_dir)
-    if state is None or state.pid is None:
+    """True iff the recorded bridge is ALIVE (identity confirmed). UNKNOWN is not "running": start decisions then go
+    to the OS lock, which a live bridge holds (#177 S2)."""
+    return liveness(persona_dir) == ALIVE
+
+
+# ---- process identity (#456, #177 S2, owner's decision D22) ----------------------------------------------------
+
+ALIVE = "alive"
+GONE = "gone"
+UNKNOWN = "unknown"
+
+
+def _norm(path: str | os.PathLike) -> str:
+    return os.path.normcase(os.path.realpath(os.path.expanduser(str(path))))
+
+
+def home_from_env(env: dict[str, str], platform: str | None = None) -> str | None:
+    """The companion-emergence home a process with environment ``env`` uses (normalised): ``brain.paths.home_for_env``,
+    the one rule ``get_home`` also uses (#456 review S15). None when it cannot be computed from that environment."""
+    from brain import paths
+
+    home = paths.home_for_env(env, platform)
+    return _norm(home) if home is not None else None
+
+
+def prove_bridge_cmdline(pid: int | None, persona_dir: Path, persona: str) -> bool:
+    """True when ``pid`` runs a bridge for THIS persona, judged by its command line: ``brain.bridge.runner`` with
+    ``--persona-dir`` equal to ``persona_dir``, or ``supervisor run --persona <persona>`` whose effective home (from
+    its own environment) equals ours. Anything unreadable is "not proven" (never a name-only match)."""
+    if pid is None or pid <= 0:
         return False
-    return pid_is_alive(state.pid)
+    try:
+        import psutil
+
+        proc = psutil.Process(pid)
+        argv = [str(a) for a in proc.cmdline()]
+    except Exception:  # noqa: BLE001 - NoSuchProcess / AccessDenied / ZombieProcess: unproven
+        return False
+    if "brain.bridge.runner" in argv and "--persona-dir" in argv:
+        i = argv.index("--persona-dir")
+        return i + 1 < len(argv) and _norm(argv[i + 1]) == _norm(persona_dir)
+    for i in range(len(argv) - 3):
+        if argv[i] == "supervisor" and argv[i + 1] == "run":
+            rest = argv[i + 2 :]
+            if (
+                "--persona" in rest
+                and rest.index("--persona") + 1 < len(rest)
+                and rest[rest.index("--persona") + 1] == persona
+            ):
+                try:
+                    env = proc.environ()
+                except Exception:  # noqa: BLE001 - unreadable environment: unproven
+                    return False
+                from brain.paths import get_home
+
+                theirs = home_from_env(env)
+                return theirs is not None and theirs == _norm(get_home())
+    return False
+
+
+def bridge_liveness(state: BridgeState | None, persona_dir: Path) -> str:
+    """ALIVE / GONE / UNKNOWN for the bridge recorded in ``state``.
+
+    A record with a token: the live process must carry that token. A pre-PR record (no ``identity``) or a bridge whose
+    identity was unavailable: the pid must be alive AND its command line must prove it is a bridge for this persona;
+    an unproven live pid is GONE (stale) for start, stop and kill decisions."""
+    from brain import process_identity as pi
+
+    if state is None or state.pid is None:
+        return GONE
+    if state.pid_token:
+        result = pi.matches(state.pid, state.pid_token)
+        return ALIVE if result == "alive" else result
+    if not pid_is_alive(state.pid):
+        return GONE
+    return (
+        ALIVE
+        if prove_bridge_cmdline(state.pid, persona_dir, state.persona or persona_dir.name)
+        else GONE
+    )
+
+
+def liveness(persona_dir: Path) -> str:
+    return bridge_liveness(read(persona_dir), persona_dir)
+
+
+def is_legacy(state: BridgeState | None) -> bool:
+    return state is not None and state.identity is None and not state.pid_token

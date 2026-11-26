@@ -88,7 +88,7 @@ from tests.harness import ingest_version
 
 build = ingest_version(
     source=Path("<version-under-test repo root, contains brain/>"),
-    dest=Path("<stable sandbox copy dir>"),   # e.g. /home/zero/.dropin/symptom-cluster
+    dest=Path("<stable sandbox copy dir>"),   # e.g. /home/<user>/.dropin/symptom-cluster
     on_existing="archive",   # or "delete"; NEVER "prompt" in an autonomous run
     deps="auto",             # uv pip install -e on the copy — NEEDS NETWORK
 )

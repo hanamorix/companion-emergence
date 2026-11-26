@@ -4,7 +4,7 @@ Stores each work as `persona/<name>/data/works/<id>.md` with YAML
 frontmatter mirroring the SQLite row, so the file is self-describing
 if extracted from the index.
 
-Atomic writes via brain.health.attempt_heal.save_with_backup_text. ID
+Atomic writes via brain.utils.atomic_write.save_with_backup_text. ID
 is validated at read time to defend against path traversal even though
 make_work_id guarantees hex-only by construction.
 """
@@ -14,7 +14,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from brain.health.attempt_heal import save_with_backup_text
+from brain.utils.atomic_write import save_with_backup_text
 from brain.works import Work
 
 _ID_REGEX = re.compile(r"^[0-9a-f]{12}$")

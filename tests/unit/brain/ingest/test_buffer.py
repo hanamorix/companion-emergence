@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
+from brain.ingest import buffer as buffer_mod
 from brain.ingest.buffer import (
     delete_backoff,
     delete_cursor,
@@ -22,6 +27,7 @@ from brain.ingest.buffer import (
     write_backoff,
     write_cursor,
 )
+from brain.utils import file_ops
 
 
 def test_ingest_turn_appends_to_session_file(tmp_path: Path) -> None:
@@ -128,7 +134,6 @@ def test_delete_session_buffer_retries_transient_permission_error(
     must retry briefly instead of failing close_session with ingest_failed."""
     from pathlib import Path as _PathCls
 
-    from brain.ingest import buffer as buffer_mod
 
     ingest_turn(tmp_path, {"session_id": "sess_retry", "speaker": "x", "text": "y"})
     path = tmp_path / "active_conversations" / "sess_retry.jsonl"
@@ -144,45 +149,11 @@ def test_delete_session_buffer_retries_transient_permission_error(
         return real_unlink(self, missing_ok=missing_ok)
 
     monkeypatch.setattr(_PathCls, "unlink", flaky_unlink)
-    monkeypatch.setattr(buffer_mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(file_ops.time, "sleep", lambda _s: None)
 
     delete_session_buffer(tmp_path, "sess_retry")
     assert attempts["n"] == 3
     assert not path.exists()
-
-
-def test_pid_alive_delegates_to_windows_safe_probe(monkeypatch) -> None:
-    """Windows CI regression: the compaction lock's dead-pid probe used a raw
-    ``os.kill(pid, 0)`` — on Windows signal 0 is CTRL_C_EVENT, and probing a
-    bogus pid delivers a REAL Ctrl+C to our own console group (this aborted
-    the whole pytest session at ~42% on windows-latest). The probe must
-    delegate to state_file.pid_is_alive, which carries the Windows-safe
-    branch — and brain/ingest must contain no direct os.kill at all."""
-    from brain.bridge import state_file
-    from brain.ingest import buffer as buffer_mod
-
-    # Through-path: the delegate is what answers.
-    sentinel_calls = []
-    monkeypatch.setattr(
-        state_file, "pid_is_alive", lambda pid: sentinel_calls.append(pid) or True
-    )
-    assert buffer_mod._pid_alive(4242) is True
-    assert sentinel_calls == [4242]
-    # pid <= 0 short-circuits without touching the delegate.
-    assert buffer_mod._pid_alive(0) is False
-    assert sentinel_calls == [4242]
-
-    # Source-pin: no direct os.kill CALLS anywhere in brain/ingest (the footgun
-    # class). Doc mentions (backtick-quoted) are allowed. Scanned in-process —
-    # shelling out to ``grep`` failed on stock Windows (#262).
-    ingest_dir = Path(__file__).resolve().parents[4] / "brain" / "ingest"
-    code_hits = [
-        f"{py.relative_to(ingest_dir.parent.parent).as_posix()}:{lineno}:{line}"
-        for py in sorted(ingest_dir.rglob("*.py"))
-        for lineno, line in enumerate(py.read_text(encoding="utf-8").splitlines(), 1)
-        if "os.kill(" in line and "``" not in line
-    ]
-    assert code_hits == [], f"raw os.kill call in brain/ingest:\n{code_hits}"
 
 
 # ---- I-2 follow-up audit: session_id validation ----
@@ -428,8 +399,8 @@ def test_write_backoff_rejects_malformed_ts(tmp_path: Path) -> None:
 
 # ── #198: rewrite_session_atomic survives a transient os.replace refusal ─────
 # Windows refuses os.replace over a file another handle holds open (a GET
-# /chat/history streaming the buffer). Mirror _unlink_with_retry: bounded
-# retry, and never leave the .jsonl.tmp behind.
+# /chat/history streaming the buffer). Same bounded retry as the shared
+# file_ops.retry_transient, and never leave the .jsonl.tmp behind.
 
 
 def _seed_session(persona_dir: Path, sid: str) -> Path:
@@ -456,7 +427,7 @@ def test_rewrite_session_atomic_retries_transient_permission_error(tmp_path, mon
         return real_replace(src, dst)
 
     monkeypatch.setattr(buf.os, "replace", flaky)
-    monkeypatch.setattr(buf, "_UNLINK_RETRY_SLEEP_S", 0.0)
+    monkeypatch.setattr(dev_constants, "FILE_RETRY_SLEEP_S", 0.0)
     buf.rewrite_session_atomic(tmp_path, sid, [{"speaker": "assistant", "text": "rewritten"}])
     assert calls["n"] == 3
     assert path.read_text(encoding="utf-8").strip() == '{"speaker": "assistant", "text": "rewritten"}'
@@ -474,8 +445,632 @@ def test_rewrite_session_atomic_gives_up_and_removes_tmp(tmp_path, monkeypatch):
         raise PermissionError(32, "in use")
 
     monkeypatch.setattr(buf.os, "replace", always)
-    monkeypatch.setattr(buf, "_UNLINK_RETRY_SLEEP_S", 0.0)
+    monkeypatch.setattr(dev_constants, "FILE_RETRY_SLEEP_S", 0.0)
     with pytest.raises(PermissionError):
         buf.rewrite_session_atomic(tmp_path, sid, [{"speaker": "assistant", "text": "x"}])
     assert path.read_text(encoding="utf-8") == before  # old buffer untouched
     assert not path.with_suffix(".jsonl.tmp").exists()  # no litter
+
+
+# --- archive_once: the one archive-with-dedup write (#556) ------------------------------------------------------
+
+
+def _turns(n: int, *, tag: str = "t") -> list[dict]:
+    return [
+        {"session_id": "s1", "speaker": "user" if i % 2 == 0 else "assistant", "text": f"{tag}-{i}", "ts": f"2026-01-01T00:00:{i:02d}+00:00"}
+        for i in range(n)
+    ]
+
+
+def test_archive_once_writes_a_batch_once_per_marker_key(tmp_path):
+    from brain.ingest.buffer import archive_once, read_archive
+
+    rows = _turns(3)
+    assert archive_once(tmp_path, "s1", rows, new_gen=1) > 0
+    # The identical batch again (a crash-retry) is proven archived by the marker: no second write, still success.
+    assert archive_once(tmp_path, "s1", rows, new_gen=1) > 0
+    assert read_archive(tmp_path, "s1") == rows
+
+
+def test_archive_once_writes_a_different_batch(tmp_path):
+    from brain.ingest.buffer import archive_once, read_archive
+
+    rows = _turns(3)
+    archive_once(tmp_path, "s1", rows, new_gen=1)
+    archive_once(tmp_path, "s1", rows, new_gen=2)  # same rows, other generation: a different batch
+    more = _turns(2, tag="u")
+    archive_once(tmp_path, "s1", more, new_gen=2)
+    assert read_archive(tmp_path, "s1") == rows + rows + more
+
+
+def test_archive_once_empty_batch_writes_nothing(tmp_path):
+    from brain.ingest.buffer import archive_once, read_archive, read_archive_marker
+
+    assert archive_once(tmp_path, "s1", [], new_gen=1) == 0
+    assert read_archive(tmp_path, "s1") == []
+    assert read_archive_marker(tmp_path, "s1") is None
+
+
+def test_archive_once_keeps_two_byte_identical_turns(tmp_path):
+    from brain.ingest.buffer import archive_once, read_archive
+
+    row = _turns(1)[0]
+    archive_once(tmp_path, "s1", [row, dict(row)], new_gen=1)
+    assert read_archive(tmp_path, "s1") == [row, row]
+
+
+# --- session_append_lock (#556) ---------------------------------------------------------------------------------
+
+
+def test_session_append_lock_excludes_a_lock_respecting_appender(tmp_path):
+    from brain.health.json_io import append_jsonl
+    from brain.ingest.buffer import session_append_lock
+
+    sid = "sess_lock"
+    path = tmp_path / "active_conversations" / f"{sid}.jsonl"
+    with session_append_lock(tmp_path, sid):
+        assert append_jsonl(path, {"text": "while held"}, lock="try") is None
+    assert append_jsonl(path, {"text": "after"}, lock="try") > 0
+    assert [r["text"] for r in read_session(tmp_path, sid)] == ["after"]
+
+
+@pytest.mark.parametrize("raise_on", ["call", "enter"])
+def test_session_append_lock_runs_the_body_once_unlocked_when_the_lock_is_refused(tmp_path, monkeypatch, caplog, raise_on):
+    from contextlib import contextmanager
+
+    from brain.ingest import buffer as buf
+
+    if raise_on == "call":
+
+        def refuse(path, **kw):
+            raise OSError("no locks here")
+
+    else:
+
+        @contextmanager
+        def refuse(path, **kw):
+            raise OSError("no locks here")
+            yield  # pragma: no cover
+
+    monkeypatch.setattr(buf, "file_lock", refuse)
+    runs: list[int] = []
+    with caplog.at_level("WARNING", logger=buf.logger.name):
+        with buf.session_append_lock(tmp_path, "sess_lock"):
+            runs.append(1)
+    assert runs == [1]
+    assert any("without it" in r.getMessage() for r in caplog.records)
+
+
+def test_session_append_lock_propagates_a_body_error_once(tmp_path):
+    from brain.ingest.buffer import session_append_lock
+
+    runs: list[int] = []
+    with pytest.raises(OSError, match="body failed"):
+        with session_append_lock(tmp_path, "sess_lock"):
+            runs.append(1)
+            raise OSError("body failed")
+    assert runs == [1]
+
+
+@pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off")
+def test_read_session_raises_a_named_error_on_an_over_long_integer_line(tmp_path: Path) -> None:
+    """A line holding an integer past the interpreter's digit limit stops the read with ``UnloadableJsonlLineError`` (a known
+    defect, kept as it was before #643 and filed as #646; it is a ``ValueError``, so the bridge's ``read_session`` handler
+    still skips the session). A fix for #646 that makes the read skip the line must change this test on purpose."""
+    from brain.health import jsonl_reader
+
+    folder = tmp_path / "active_conversations"
+    folder.mkdir()
+    huge = '{"speaker": "user", "n": ' + "9" * (sys.get_int_max_str_digits() + 1) + "}"
+    good1 = json.dumps({"speaker": "user", "text": "one"})
+    good2 = json.dumps({"speaker": "assistant", "text": "two"})
+    session = folder / "sess_big.jsonl"
+    session.write_text("\n".join([good1, huge, good2]) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError) as exc:
+        read_session(tmp_path, "sess_big")
+    assert type(exc.value).__name__ == "UnloadableJsonlLineError"
+    assert type(exc.value) is jsonl_reader.UnloadableJsonlLineError
+    assert (exc.value.code, exc.value.line, exc.value.path) == ("jsonl_unloadable_line", 2, session)
+    assert type(exc.value.__cause__) is ValueError
+
+
+# ---------------------------------------------------------------------------
+# last_user_turn_ts (Engine 6 G3): the one place the time of the user's last turn is computed
+# ---------------------------------------------------------------------------
+
+_T0 = datetime(2026, 3, 10, 12, 0, 0, tzinfo=UTC)
+
+
+def _hours(n: float) -> datetime:
+    return _T0 + timedelta(hours=n)
+
+
+def _row(speaker: str, ts: object, **extra: object) -> dict:
+    stamp = ts.isoformat() if isinstance(ts, datetime) else ts
+    return {"session_id": "s", "speaker": speaker, "text": "t", "ts": stamp, **extra}
+
+
+def _put(path: Path, rows: list[dict]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    return path
+
+
+def _active(root: Path, sid: str, rows: list[dict]) -> Path:
+    return _put(root / "active_conversations" / f"{sid}.jsonl", rows)
+
+
+def _archived(root: Path, name: str, rows: list[dict], *, mtime: datetime | None = None) -> Path:
+    path = _put(root / "archived_conversations" / name, rows)
+    if mtime is not None:
+        stamp_ns = int(mtime.timestamp()) * 10**9 + mtime.microsecond * 1000
+        os.utime(path, ns=(stamp_ns, stamp_ns))
+    return path
+
+
+@pytest.fixture
+def fresh_throttle():
+    """The fail-soft warnings are throttled per key for the life of the process; a test that reads the log starts clean."""
+    from brain.utils import log_throttle
+
+    log_throttle._last.clear()
+    yield
+    log_throttle._last.clear()
+
+
+@pytest.fixture
+def reads(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """The file names ``iter_jsonl_reversed`` is asked to read inside the buffer module, in order."""
+    seen: list[str] = []
+    real = buffer_mod.iter_jsonl_reversed
+
+    def spy(path, *args, **kwargs):
+        seen.append(Path(path).name)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(buffer_mod, "iter_jsonl_reversed", spy)
+    return seen
+
+
+def test_last_user_turn_ts_skips_trailing_assistant_summary_and_image_rows(tmp_path: Path) -> None:
+    _active(
+        tmp_path,
+        "sess_a",
+        [
+            _row("user", _hours(1)),
+            _row("user", _hours(2)),
+            _row("assistant", _hours(3)),
+            _row("summary", _hours(4)),
+            _row("assistant", _hours(5), image_shas=["abc"]),
+        ],
+    )
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(2)
+
+
+def test_last_user_turn_ts_finds_a_user_row_behind_many_later_rows(tmp_path: Path) -> None:
+    rows = [_row("user", _hours(1))] + [_row("assistant", _hours(2 + i / 100)) for i in range(300)]
+    _active(tmp_path, "sess_long", rows)
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(1)
+
+
+def test_last_user_turn_ts_takes_the_newest_across_active_files(tmp_path: Path) -> None:
+    _active(tmp_path, "sess_old", [_row("user", _hours(1))])
+    _active(tmp_path, "sess_new", [_row("user", _hours(7)), _row("assistant", _hours(8))])
+    _active(tmp_path, "sess_mid", [_row("user", _hours(3))])
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(7)
+
+
+def test_last_user_turn_ts_skips_a_corrupt_line(tmp_path: Path) -> None:
+    path = tmp_path / "active_conversations" / "sess_c.jsonl"
+    path.parent.mkdir()
+    path.write_text(
+        json.dumps(_row("user", _hours(2))) + "\nnot json at all\n" + json.dumps(_row("user", _hours(4))) + "\n",
+        encoding="utf-8",
+    )
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(4)
+
+
+def test_last_user_turn_ts_reads_a_naive_ts_as_utc(tmp_path: Path) -> None:
+    _active(tmp_path, "sess_n", [_row("user", "2026-03-10T15:00:00")])
+    result = buffer_mod.last_user_turn_ts(tmp_path)
+    assert result == datetime(2026, 3, 10, 15, 0, 0, tzinfo=UTC)
+    assert result.tzinfo is not None
+
+
+def test_last_user_turn_ts_converts_an_offset_ts_to_utc(tmp_path: Path) -> None:
+    _active(tmp_path, "sess_o", [_row("user", "2026-03-10T10:00:00Z"), _row("user", "2026-03-10T15:00:00+02:00")])
+    assert buffer_mod.last_user_turn_ts(tmp_path) == datetime(2026, 3, 10, 13, 0, 0, tzinfo=UTC)
+
+
+def test_last_user_turn_ts_skips_a_row_whose_ts_does_not_parse_with_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, fresh_throttle
+) -> None:
+    rows = [
+        _row("user", _hours(2)),
+        _row("user", "not a time"),
+        _row("user", 12345),
+        {"session_id": "s", "speaker": "user", "text": "no ts"},
+    ]
+    _active(tmp_path, "sess_b", rows)
+    with caplog.at_level(logging.WARNING, logger="brain.ingest.buffer"):
+        assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(2)
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_last_user_turn_ts_ignores_a_row_that_is_not_the_user_speaker(tmp_path: Path) -> None:
+    _active(tmp_path, "sess_s", [_row("assistant", _hours(5)), _row("User", _hours(6)), _row("kestrel", _hours(7))])
+    assert buffer_mod.last_user_turn_ts(tmp_path) is None
+
+
+def test_last_user_turn_ts_returns_none_with_no_folders_and_creates_nothing(tmp_path: Path) -> None:
+    assert buffer_mod.last_user_turn_ts(tmp_path) is None
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_last_user_turn_ts_returns_none_with_no_user_turn_anywhere_and_creates_no_archive(tmp_path: Path) -> None:
+    _active(tmp_path, "sess_x", [_row("assistant", _hours(1))])
+    assert buffer_mod.last_user_turn_ts(tmp_path) is None
+    assert not (tmp_path / "archived_conversations").exists()
+
+
+def test_last_user_turn_ts_reads_the_archive_when_no_active_file_holds_a_user_turn(tmp_path: Path) -> None:
+    _active(tmp_path, "sess_now", [_row("summary", _hours(30))])
+    _archived(tmp_path, "sess_legacy.jsonl", [_row("user", _hours(5)), _row("assistant", _hours(6))])
+    _archived(tmp_path, "sess_seg.000.jsonl", [_row("user", _hours(2))])
+    _archived(tmp_path, "sess_seg.001.jsonl", [_row("user", _hours(9)), _row("assistant", _hours(10))])
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(9)
+
+
+def test_last_user_turn_ts_takes_the_latest_ts_across_sessions_not_the_newest_file(tmp_path: Path) -> None:
+    # Session ids are not in time order, and the file touched last is not the session whose user spoke last.
+    _archived(tmp_path, "zzz_first.jsonl", [_row("user", _hours(9))], mtime=_hours(9.5))
+    _archived(tmp_path, "aaa_second.jsonl", [_row("user", _hours(2)), _row("assistant", _hours(20))], mtime=_hours(20))
+    _archived(tmp_path, "mmm_third.jsonl", [_row("user", _hours(4))], mtime=_hours(4.5))
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(9)
+
+
+def test_last_user_turn_ts_takes_a_newer_archived_turn_over_an_older_active_one(tmp_path: Path, reads: list[str]) -> None:
+    # A stale buffer that lingers in the active folder (a wedged finalise, an orphan) must not hide a newer archived session.
+    _active(tmp_path, "sess_stale", [_row("user", _hours(3))])
+    _archived(tmp_path, "sess_newer.jsonl", [_row("user", _hours(99))], mtime=_hours(100))
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(99)
+    assert reads == ["sess_stale.jsonl", "sess_newer.jsonl"]
+
+
+@pytest.mark.no_base_failure(
+    reason="retained behaviour: a newer active turn won on the old code too (it never opened the archive); this pins that the seeded walk still wins and opens nothing"
+)
+def test_last_user_turn_ts_keeps_a_newer_active_turn_over_an_older_archive_and_opens_no_archive_file(
+    tmp_path: Path, reads: list[str]
+) -> None:
+    _active(tmp_path, "sess_live", [_row("user", _hours(50))])
+    _archived(tmp_path, "sess_old.jsonl", [_row("user", _hours(3))], mtime=_hours(4))
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(50)
+    assert reads == ["sess_live.jsonl"]  # the archive file's mtime is not newer than the active best: never opened
+
+
+@pytest.mark.no_base_failure(
+    reason="boundary of retained behaviour: the old code opened no archive file when an active turn existed; this pins that the walk's break rule still stops at an equal mtime"
+)
+def test_last_user_turn_ts_opens_no_archive_file_whose_mtime_equals_the_active_best(tmp_path: Path, reads: list[str]) -> None:
+    _active(tmp_path, "sess_live", [_row("user", _hours(5))])
+    _archived(tmp_path, "sess_a.jsonl", [_row("user", _hours(1))], mtime=_hours(5))
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(5)
+    assert reads == ["sess_live.jsonl"]
+
+
+def test_last_user_turn_ts_keeps_the_active_turn_when_a_newer_archive_file_holds_only_an_older_user_turn(
+    tmp_path: Path, reads: list[str]
+) -> None:
+    _active(tmp_path, "sess_live", [_row("user", _hours(50))])
+    _archived(tmp_path, "sess_a.jsonl", [_row("user", _hours(3)), _row("assistant", _hours(60)), _row("summary", _hours(61))], mtime=_hours(61))
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(50)
+    assert reads == ["sess_live.jsonl", "sess_a.jsonl"]  # the file is newer by mtime, so it is read, and holds nothing newer
+
+
+@pytest.mark.no_base_failure(
+    reason="failure path of the new archive step: the old code never listed the archive when an active turn existed, so it passes there; this pins that the new always-run step keeps the active answer"
+)
+def test_last_user_turn_ts_keeps_the_active_turn_when_the_archive_cannot_be_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _active(tmp_path, "sess_live", [_row("user", _hours(3))])
+
+    def unlistable(folder):
+        raise OSError("cannot list")
+
+    monkeypatch.setattr(buffer_mod, "list_dir", unlistable)
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(3)
+
+
+def test_last_user_turn_ts_never_opens_a_session_whose_last_file_is_not_newer_than_the_best_found(
+    tmp_path: Path, reads: list[str]
+) -> None:
+    _archived(tmp_path, "sess_a.000.jsonl", [_row("user", _hours(9)), _row("assistant", _hours(10))], mtime=_hours(10))
+    _archived(tmp_path, "sess_b.jsonl", [_row("user", _hours(7.5))], mtime=_hours(8))
+    _archived(tmp_path, "sess_c.jsonl", [_row("user", _hours(9.25))], mtime=_hours(9.5))
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(9.25)
+    # a (mtime 10) first, c (9.5) is newer than a's best 9 so it is read, b (8) is not newer than 9.25: never opened.
+    assert reads == ["sess_a.000.jsonl", "sess_c.jsonl"]
+
+
+def test_last_user_turn_ts_visits_sessions_newest_file_first_by_modification_time(tmp_path: Path, reads: list[str]) -> None:
+    _archived(tmp_path, "a_old.jsonl", [_row("user", _hours(1))], mtime=_hours(1))
+    _archived(tmp_path, "z_new.jsonl", [_row("user", _hours(6))], mtime=_hours(6))
+    _archived(tmp_path, "m_mid.jsonl", [_row("user", _hours(3))], mtime=_hours(3))
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(6)
+    assert reads == ["z_new.jsonl"]
+
+
+def test_last_user_turn_ts_reads_a_session_from_its_last_file_backwards_and_stops_at_the_first_user_turn(
+    tmp_path: Path, reads: list[str]
+) -> None:
+    _archived(tmp_path, "sess_s.jsonl", [_row("user", _hours(1))])  # the legacy file, the oldest
+    _archived(tmp_path, "sess_s.000.jsonl", [_row("user", _hours(2))])
+    _archived(tmp_path, "sess_s.001.jsonl", [_row("user", _hours(3))])
+    _archived(tmp_path, "sess_s.002.jsonl", [_row("assistant", _hours(4)), _row("summary", _hours(4.5))])
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(3)
+    assert reads == ["sess_s.002.jsonl", "sess_s.001.jsonl"]
+
+
+def test_last_user_turn_ts_reads_segments_in_numeric_order_and_the_legacy_file_first(tmp_path: Path, reads: list[str]) -> None:
+    _archived(tmp_path, "sess_t.jsonl", [_row("user", _hours(5))])  # legacy: before every numbered segment
+    _archived(tmp_path, "sess_t.002.jsonl", [_row("assistant", _hours(6))])
+    _archived(tmp_path, "sess_t.010.jsonl", [_row("assistant", _hours(7))])
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(5)
+    assert reads == ["sess_t.010.jsonl", "sess_t.002.jsonl", "sess_t.jsonl"]
+
+
+def test_last_user_turn_ts_ignores_archive_entries_that_are_not_session_files(tmp_path: Path) -> None:
+    _archived(tmp_path, "sess_ok.jsonl", [_row("user", _hours(2))])
+    folder = tmp_path / "archived_conversations"
+    (folder / "sess_ok.archived").write_text("marker", encoding="utf-8")
+    (folder / "notes.txt").write_text("hello", encoding="utf-8")
+    _put(folder / "bad name!.jsonl", [_row("user", _hours(50))])
+    _put(folder / "sess_ok.tmp.jsonl", [_row("user", _hours(60))])  # not a numbered segment of sess_ok
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(2)
+
+
+def test_last_user_turn_ts_skips_a_session_whose_last_file_vanished_since_the_listing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _archived(tmp_path, "gone.jsonl", [_row("user", _hours(9))])
+    _archived(tmp_path, "here.jsonl", [_row("user", _hours(2))])
+    real = buffer_mod.stat_path
+    monkeypatch.setattr(buffer_mod, "stat_path", lambda p: None if Path(p).name == "gone.jsonl" else real(p))
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(2)
+
+
+def test_last_user_turn_ts_skips_a_session_whose_stat_fails_with_a_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, fresh_throttle
+) -> None:
+    _archived(tmp_path, "locked.jsonl", [_row("user", _hours(9))])
+    _archived(tmp_path, "open.jsonl", [_row("user", _hours(2))])
+    real = buffer_mod.stat_path
+
+    def flaky(path):
+        if Path(path).name == "locked.jsonl":
+            raise PermissionError("denied")
+        return real(path)
+
+    monkeypatch.setattr(buffer_mod, "stat_path", flaky)
+    with caplog.at_level(logging.WARNING, logger="brain.ingest.buffer"):
+        assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(2)
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_last_user_turn_ts_returns_none_with_a_warning_when_the_archive_folder_cannot_be_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, fresh_throttle
+) -> None:
+    _active(tmp_path, "sess_q", [_row("assistant", _hours(1))])
+    _archived(tmp_path, "sess_old.jsonl", [_row("user", _hours(2))])
+
+    def denied(folder):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(buffer_mod, "list_dir", denied)
+    with caplog.at_level(logging.WARNING, logger="brain.ingest.buffer"):
+        assert buffer_mod.last_user_turn_ts(tmp_path) is None
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+def test_last_user_turn_ts_goes_on_to_the_archive_when_the_active_folder_cannot_be_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, fresh_throttle
+) -> None:
+    _archived(tmp_path, "sess_old.jsonl", [_row("user", _hours(2))])
+
+    def denied(persona_dir):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(buffer_mod, "list_active_sessions", denied)
+    with caplog.at_level(logging.WARNING, logger="brain.ingest.buffer"):
+        assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(2)
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+
+@pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off")
+def test_last_user_turn_ts_reads_back_from_the_end_so_an_unloadable_line_before_the_last_user_row_is_never_reached(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, fresh_throttle
+) -> None:
+    huge = '{"speaker": "user", "n": ' + "9" * (sys.get_int_max_str_digits() + 1) + "}"
+    path = tmp_path / "active_conversations" / "sess_big.jsonl"
+    path.parent.mkdir()
+    path.write_text(
+        json.dumps(_row("user", _hours(2))) + "\n" + huge + "\n" + json.dumps(_row("user", _hours(9))) + "\n",
+        encoding="utf-8",
+    )
+    _active(tmp_path, "sess_fine", [_row("user", _hours(1))])
+    with caplog.at_level(logging.DEBUG):
+        assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(9)
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+@pytest.mark.skipif(sys.get_int_max_str_digits() == 0, reason="the interpreter's integer digit limit is off")
+def test_last_user_turn_ts_skips_an_unloadable_line_after_the_last_user_row_with_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, fresh_throttle
+) -> None:
+    huge = '{"speaker": "assistant", "n": ' + "9" * (sys.get_int_max_str_digits() + 1) + "}"
+    path = tmp_path / "active_conversations" / "sess_big.jsonl"
+    path.parent.mkdir()
+    path.write_text(
+        json.dumps(_row("user", _hours(2))) + "\n" + json.dumps(_row("user", _hours(5))) + "\n" + huge + "\n",
+        encoding="utf-8",
+    )
+    with caplog.at_level(logging.WARNING, logger="brain.health.json_io"):
+        assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(5)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert warnings[0].name == "brain.health.json_io"  # the reader's own warning, not the caller's
+    assert "sess_big.jsonl" in warnings[0].getMessage()
+    assert "from the end" in warnings[0].getMessage()
+
+
+def test_last_user_turn_ts_takes_the_last_user_row_not_the_largest_ts(tmp_path: Path) -> None:
+    _active(tmp_path, "sess_order", [_row("user", _hours(9)), _row("assistant", _hours(10)), _row("user", _hours(4))])
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(4)
+
+
+def test_last_user_turn_ts_finds_a_user_row_more_than_one_read_chunk_from_the_end(tmp_path: Path, reads: list[str]) -> None:
+    filler = [_row("assistant", _hours(2 + i / 1000), text="x" * 200) for i in range(120)]  # about 30 KB, over three 8 KB chunks
+    _active(tmp_path, "sess_deep", [_row("user", _hours(1))] + filler)
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(1)
+    assert reads == ["sess_deep.jsonl"]  # read through the backward reader
+
+
+def test_last_user_turn_ts_reads_a_line_longer_than_a_read_chunk(tmp_path: Path, reads: list[str]) -> None:
+    _active(tmp_path, "sess_long", [_row("user", _hours(3), text="y" * 30000), _row("assistant", _hours(4))])
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(3)
+    assert reads == ["sess_long.jsonl"]
+
+
+def test_last_user_turn_ts_skips_a_torn_last_line(tmp_path: Path, reads: list[str], fresh_throttle) -> None:
+    path = _active(tmp_path, "sess_torn", [_row("user", _hours(2))])
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write('{"speaker": "user", "ts": "2026-03-1')  # a write cut short: no newline, not JSON
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(2)
+    assert reads == ["sess_torn.jsonl"]
+
+
+def test_last_user_turn_ts_of_an_empty_file_is_none(tmp_path: Path, reads: list[str]) -> None:
+    _active(tmp_path, "sess_empty", [])
+    assert buffer_mod.last_user_turn_ts(tmp_path) is None
+    assert reads == ["sess_empty.jsonl"]
+
+
+def test_last_user_turn_ts_of_a_file_with_no_user_row_is_none(tmp_path: Path, reads: list[str]) -> None:
+    _active(tmp_path, "sess_none", [_row("assistant", _hours(1)), _row("summary", _hours(2))])
+    assert buffer_mod.last_user_turn_ts(tmp_path) is None
+    assert reads == ["sess_none.jsonl"]
+
+
+def test_last_user_turn_ts_goes_back_past_a_user_row_with_an_unusable_ts_to_a_good_one(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, reads: list[str], fresh_throttle
+) -> None:
+    _active(tmp_path, "sess_bad", [_row("user", _hours(2)), _row("user", "not a time"), _row("assistant", _hours(5))])
+    with caplog.at_level(logging.WARNING, logger="brain.ingest.buffer"):
+        assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(2)
+    assert [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert reads == ["sess_bad.jsonl"]
+
+
+def test_last_user_turn_ts_reads_a_file_deleted_after_it_was_listed_as_no_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gone = _active(tmp_path, "gone", [_row("user", _hours(9))])
+    _active(tmp_path, "kept", [_row("user", _hours(2))])
+    real = buffer_mod.iter_jsonl_reversed
+
+    def delete_then_read(path, *args, **kwargs):
+        if Path(path).name == "gone.jsonl":
+            gone.unlink()
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(buffer_mod, "iter_jsonl_reversed", delete_then_read)
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(2)
+
+
+def test_last_user_turn_ts_of_an_archived_session_goes_back_a_segment_when_the_last_has_no_user_row(
+    tmp_path: Path, reads: list[str]
+) -> None:
+    _archived(tmp_path, "sess_s.000.jsonl", [_row("user", _hours(3)), _row("assistant", _hours(3.5))])
+    _archived(tmp_path, "sess_s.001.jsonl", [_row("assistant", _hours(4)), _row("summary", _hours(4.5))])
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(3)
+    assert reads == ["sess_s.001.jsonl", "sess_s.000.jsonl"]
+
+
+def test_last_user_turn_ts_stops_reading_a_file_at_its_last_user_row(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain.health import json_io
+
+    monkeypatch.setattr(json_io, "_TAIL_CHUNK", 64)
+    rows = [_row("user", _hours(1))] + [_row("assistant", _hours(2), text="z" * 60)] + [_row("user", _hours(3))]
+    _active(tmp_path, "sess_stop", rows + [_row("assistant", _hours(4))])
+    seen: list[int] = []
+    real_read = json_io._lines_backwards
+
+    def counting(fh):
+        for line in real_read(fh):
+            seen.append(len(line))
+            yield line
+
+    monkeypatch.setattr(json_io, "_lines_backwards", counting)
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(3)
+    assert len(seen) == 2  # the last assistant row, then the user row; the older rows were not read
+
+
+def test_last_user_turn_ts_reads_a_listed_file_that_cannot_be_opened_as_no_turn_and_goes_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from brain.health import json_io
+
+    _active(tmp_path, "locked", [_row("user", _hours(9))])
+    _active(tmp_path, "open", [_row("user", _hours(2))])
+    real_open = open
+
+    def refuse(path, *args, **kwargs):
+        if Path(path).name == "locked.jsonl":
+            raise PermissionError("denied")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(json_io, "open", refuse, raising=False)
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(2)
+
+
+def test_last_user_turn_ts_ignores_an_active_file_whose_name_is_not_a_session_id(tmp_path: Path) -> None:
+    _active(tmp_path, "a.b", [_row("user", _hours(9))])  # a.b.jsonl: the stem has a dot, so it is not a session buffer
+    _active(tmp_path, "ok", [_row("user", _hours(2))])
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(2)
+
+
+def test_last_user_turn_ts_takes_a_sessions_mtime_from_its_last_numbered_segment_not_its_legacy_file(
+    tmp_path: Path, reads: list[str]
+) -> None:
+    # Session x: an old legacy file and a newer segment. Its last file is the segment (mtime 9), so x is visited first.
+    # z sits between the two mtimes of x: if x were ordered by its legacy file (mtime 20) it would be visited first and z
+    # never read; ordered by its last segment (mtime 9) z (mtime 12) comes first and x is not newer than z's best (10).
+    _archived(tmp_path, "x.jsonl", [_row("user", _hours(1))], mtime=_hours(20))  # the legacy file was touched last
+    _archived(tmp_path, "x.000.jsonl", [_row("user", _hours(9))], mtime=_hours(9))
+    _archived(tmp_path, "z.jsonl", [_row("user", _hours(10))], mtime=_hours(12))
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(10)
+    assert reads == ["z.jsonl"]
+
+
+def test_last_user_turn_ts_stops_when_the_best_found_equals_the_next_files_modification_time(
+    tmp_path: Path, reads: list[str]
+) -> None:
+    # "Not older than": a file last written at hour 9 cannot hold a turn after hour 9, so it cannot beat a turn at hour 9.
+    _archived(tmp_path, "a.jsonl", [_row("user", _hours(9))], mtime=_hours(10))
+    _archived(tmp_path, "b.jsonl", [_row("user", _hours(5))], mtime=_hours(9))
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(9)
+    assert reads == ["a.jsonl"]
+
+
+def test_last_user_turn_ts_does_not_raise_on_a_segment_name_with_a_non_ascii_digit(tmp_path: Path) -> None:
+    _archived(tmp_path, "s.jsonl", [_row("user", _hours(3))])
+    _put(tmp_path / "archived_conversations" / "s.².jsonl", [_row("user", _hours(50))])  # "s.².jsonl"
+    assert buffer_mod.last_user_turn_ts(tmp_path) == _hours(3)
+
+
+def test_last_user_turn_ts_reads_a_folder_where_a_session_file_should_be_as_no_turn(tmp_path: Path) -> None:
+    (tmp_path / "active_conversations" / "s.jsonl").mkdir(parents=True)
+    (tmp_path / "archived_conversations" / "t.jsonl").mkdir(parents=True)
+    assert buffer_mod.last_user_turn_ts(tmp_path) is None

@@ -12,7 +12,6 @@ Layer 3 (decision): send_notify | send_quiet | hold | drop? Sees only the
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,7 +19,9 @@ from pathlib import Path
 from typing import Any
 
 from brain import prompt_strings
+from brain.health.parse_failures import record_parse_failure
 from brain.initiate.schemas import Decision, InitiateCandidate
+from brain.utils.llm_output import loads_json_object
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,7 @@ def compose_subject(
     provider: Any,
     candidate: InitiateCandidate,
     semantic_memory_excerpts: list[str],
-    companion_name: str = "Nell",
+    companion_name: str,
 ) -> str:
     """Return a single-sentence subject for this candidate.
 
@@ -70,7 +71,7 @@ def compose_tone(
     candidate: InitiateCandidate,
     voice_template: str,
     user_name: str = "my user",
-    companion_name: str = "Nell",
+    companion_name: str,
     persona_dir: Path | None = None,
 ) -> str:
     """Render the subject in Nell's voice, coloured by current emotional state.
@@ -112,7 +113,8 @@ def compose_decision(
     recent_send_history: list[dict],
     current_local_time: datetime,
     voice_edit_acceptance_rate: float | None,
-    companion_name: str = "Nell",
+    companion_name: str,
+    persona_dir: Path | None = None,
 ) -> DecisionResult:
     """Decide send_notify | send_quiet | hold | drop on the finished message.
 
@@ -149,7 +151,7 @@ def compose_decision(
     )
     raw = provider.complete(prompt).strip()
     try:
-        parsed = json.loads(raw)
+        parsed = loads_json_object(raw)
         decision = parsed["decision"]
         reasoning = parsed.get("reasoning", "")
         if decision not in ("send_notify", "send_quiet", "hold", "drop"):
@@ -158,7 +160,8 @@ def compose_decision(
                 reasoning=f"unrecognised decision value: {decision!r}",
             )
         return DecisionResult(decision=decision, reasoning=reasoning)
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        record_parse_failure(persona_dir, site="initiate_compose", raw=raw, error=str(exc))
         return DecisionResult(
             decision="hold",
             reasoning=f"malformed decision output, parse error: {exc}",
@@ -172,7 +175,8 @@ def compose_decision_voice_edit(
     current_voice_template: str,
     recent_voice_evolutions: list[dict],
     current_local_time: datetime,
-    companion_name: str = "Nell",
+    companion_name: str,
+    persona_dir: Path | None = None,
 ) -> DecisionResult:
     """Decision prompt specifically for voice_edit_proposal candidates.
 
@@ -208,7 +212,7 @@ def compose_decision_voice_edit(
     )
     raw = provider.complete(prompt).strip()
     try:
-        parsed = json.loads(raw)
+        parsed = loads_json_object(raw)
         decision = parsed["decision"]
         reasoning = parsed.get("reasoning", "")
         if decision not in ("send_quiet", "hold", "drop"):
@@ -217,7 +221,8 @@ def compose_decision_voice_edit(
                 reasoning=f"voice-edit decision not in allowed set: {decision!r}",
             )
         return DecisionResult(decision=decision, reasoning=reasoning)
-    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        record_parse_failure(persona_dir, site="initiate_voice_edit", raw=raw, error=str(exc))
         return DecisionResult(
             decision="hold",
             reasoning=f"voice-edit decision parse failure: {exc}",

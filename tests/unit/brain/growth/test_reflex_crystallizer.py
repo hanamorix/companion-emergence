@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json as _json
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -382,6 +383,13 @@ def test_crystallize_reflex_returns_empty_on_malformed_json(persona_dir: Path, s
         persona_pronouns=None,
     )
     assert result == ReflexCrystallizationResult(emergences=[], prunings=[])
+    # #364: the reply that caused the empty result is kept.
+    import json as _json
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+
+    (row,) = [_json.loads(line) for line in (persona_dir / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    assert row["site"] == "reflex" and row["raw"].startswith("Sure, I'll think about that.")
 
 
 def test_crystallize_reflex_skips_malformed_proposal_keeps_others(
@@ -607,6 +615,103 @@ def test_emergence_gate_8_accepts_partial_overlap(persona_dir):
         total_cap=16,
     )
     assert accepted is True
+
+
+def test_emergence_gate_8_compares_canonical_keys_for_a_subset(persona_dir):
+    """Existing arcs are keyed by canonical name; a differently spelled proposal is still a subset."""
+    proposal = _good_proposal(name="new_arc", trigger={"comfort-seeking": 7.0})
+    accepted, reason = _validate_emergence_proposal(
+        proposal_dict=proposal,
+        current_arc_names={"existing"},
+        removed_arc_names=set(),
+        emotion_vocabulary={"comfort-seeking", "love"},
+        existing_trigger_keysets=[frozenset({"comfort_seeking", "love"})],
+        active_arc_count=4,
+        total_cap=16,
+    )
+    assert accepted is False
+    assert "gate 8" in reason and "subset" in reason
+
+
+def test_emergence_gate_8_compares_canonical_keys_for_a_superset(persona_dir):
+    proposal = _good_proposal(
+        name="new_arc",
+        trigger={"comfort-seeking": 7.0, "Love": 7.0, "creative_hunger": 7.0},
+    )
+    accepted, reason = _validate_emergence_proposal(
+        proposal_dict=proposal,
+        current_arc_names={"existing"},
+        removed_arc_names=set(),
+        emotion_vocabulary={"comfort-seeking", "Love", "creative_hunger"},
+        existing_trigger_keysets=[frozenset({"comfort_seeking", "love"})],
+        active_arc_count=4,
+        total_cap=16,
+    )
+    assert accepted is False
+    assert "gate 8" in reason and "superset" in reason
+
+
+def _loaded_arc(name: str, trigger: dict[str, float]) -> ReflexArc:
+    """An arc as the production loader builds it (`from_dict` keys the trigger by canonical name)."""
+    return ReflexArc.from_dict(
+        {
+            "name": name,
+            "description": f"description of {name}",
+            "trigger": trigger,
+            "days_since_human_min": 0.0,
+            "cooldown_hours": 12.0,
+            "action": "generate_journal",
+            "output_memory_type": "reflex_journal",
+            "prompt_template": "You are nell. {emotion_summary}",
+            "created_by": "og_migration",
+            "created_at": "2026-04-28T00:00:00+00:00",
+        }
+    )
+
+
+def _run_crystallizer_with_proposal(persona_dir, store, current_arcs, trigger):
+    _seed_vocab(persona_dir, ["comfort-seeking", "love", "creative_hunger"])
+    response = _json.dumps({"emergences": [_good_proposal(trigger=trigger)], "prunings": []})
+    return crystallize_reflex(
+        store=store,
+        persona_dir=persona_dir,
+        current_arcs=current_arcs,
+        removed_arc_names=set(),
+        provider=_FakeProvider(response),
+        persona_name="nell",
+        persona_pronouns="she/her",
+    )
+
+
+def test_crystallize_reflex_rejects_a_differently_spelled_subset_of_a_loaded_arc(
+    persona_dir: Path, store: MemoryStore, caplog
+):
+    arc = _loaded_arc("comfort_arc", {"Comfort_Seeking": 5.0, "love": 5.0})
+    assert set(arc.trigger) == {"comfort_seeking", "love"}
+    with caplog.at_level(logging.INFO, logger="brain.growth.crystallizers.reflex"):
+        result = _run_crystallizer_with_proposal(
+            persona_dir, store, [arc], {"comfort-seeking": 7.0}
+        )
+    assert result.emergences == []
+    assert any("gate 8" in r.getMessage() for r in caplog.records)
+
+    # Control, same setup: a proposal whose keys do not overlap the arc's is accepted, so the
+    # rejection above came from gate 8 and not from some other gate or a broken harness.
+    control = _run_crystallizer_with_proposal(persona_dir, store, [arc], {"creative_hunger": 7.0})
+    assert [e.name for e in control.emergences] == ["manuscript_obsession"]
+
+
+def test_crystallize_reflex_rejects_a_differently_spelled_subset_of_a_directly_built_arc(
+    persona_dir: Path, store: MemoryStore, caplog
+):
+    # `ReflexArc` accepts any keys when built directly; the gate must not depend on the loader.
+    arc = _arc("comfort_arc", trigger={"Comfort_Seeking": 5.0, "love": 5.0})
+    with caplog.at_level(logging.INFO, logger="brain.growth.crystallizers.reflex"):
+        result = _run_crystallizer_with_proposal(
+            persona_dir, store, [arc], {"comfort-seeking": 7.0}
+        )
+    assert result.emergences == []
+    assert any("gate 8" in r.getMessage() for r in caplog.records)
 
 
 def test_emergence_gate_9_rejects_when_at_total_cap(persona_dir):
@@ -960,3 +1065,86 @@ def test_render_prompt_uses_user_name_not_hana(tmp_path: Path):
     )
     assert "Henryk" in rendered
     assert "Hana" not in rendered
+
+
+def test_live_reflex_candidate_carries_short_averages(persona_dir: Path) -> None:
+    """Emotion rework B1 PR 5: once the engine is live, the candidate's vector is the engine's short averages."""
+    from brain.emotion import engine as emotion_engine
+    from brain.initiate.emit import read_candidates
+    from brain.memory.store import Memory
+    from tests.unit.brain.emotion._engine_support import make_live
+
+    _seed_vocab(persona_dir, ["creative_hunger", "love", "vulnerability"])
+    disk = MemoryStore(persona_dir / "memories.db")
+    try:
+        disk.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"love": 6.0}))
+        # A making counts for the engine; the old conversation-only aggregate never saw it.
+        disk.create(Memory.create_new(content="made", memory_type="making", domain="interior", emotions={"joy": 8.0}))
+        make_live(persona_dir, datetime.now(UTC))
+        eng = emotion_engine.engine_for(persona_dir)
+        eng.note_active(datetime.now(UTC))
+        expected = {name: r.short for name, r in eng.read().items() if r.short > 0}
+        assert "joy" in expected
+
+        response = _json.dumps(
+            {
+                "emergences": [
+                    {
+                        "name": "manuscript_obsession",
+                        "description": "creative drive narrowed to one project",
+                        "trigger": {"creative_hunger": 7.0, "love": 6.0},
+                        "cooldown_hours": 24.0,
+                        "output_memory_type": "reflex_pitch",
+                        "prompt_template": "You are {persona_name}. {emotion_summary}",
+                        "reasoning": "Fired creative_pitch four times this month.",
+                    }
+                ],
+                "prunings": [],
+            }
+        )
+        crystallize_reflex(
+            store=disk,
+            persona_dir=persona_dir,
+            current_arcs=[_arc("creative_pitch")],
+            removed_arc_names=set(),
+            provider=_FakeProvider(response),
+            persona_name="nell",
+            persona_pronouns="she/her",
+        )
+    finally:
+        disk.close()
+
+    [candidate] = [c for c in read_candidates(persona_dir) if c.source_id == "reflex_emergence:manuscript_obsession"]
+    assert candidate.emotional_snapshot is not None
+    assert candidate.emotional_snapshot.vector == pytest.approx(expected)
+
+
+def test_corpus_fire_log_excerpt_does_not_count_as_a_recall(persona_dir: Path, store: MemoryStore):
+    """#587: the crystallizer reads a fire's output memory for its log excerpt; that judging pass shows her nothing."""
+    from brain.engines.reflex import ArcFire
+    from brain.memory.store import Memory
+
+    mem = Memory.create_new(content="a journal entry the arc wrote", memory_type="reflex_journal", domain="brain")
+    store.create(mem)
+    fire = ArcFire(
+        arc_name="creative_pitch",
+        fired_at=datetime(2026, 4, 27, tzinfo=UTC),
+        trigger_state={"vulnerability": 8.0},
+        output_memory_id=mem.id,
+    )
+    (persona_dir / "reflex_log.json").write_text(_json.dumps({"fires": [fire.to_dict()]}), encoding="utf-8")
+
+    corpus = _build_corpus(
+        store=store,
+        persona_dir=persona_dir,
+        persona_name="nell",
+        persona_pronouns="she/her",
+        current_arcs=[_arc("creative_pitch")],
+        removed_arc_names=set(),
+        emotion_vocabulary=["vulnerability"],
+        now=datetime(2026, 4, 28, tzinfo=UTC),
+        look_back_days=30,
+    )
+    assert corpus["fire_log_30d"][0]["output_excerpt"] == "a journal entry the arc wrote"
+    row = store.get(mem.id, bump=False)
+    assert (row.recall_count, row.last_accessed_at) == (0.0, None)

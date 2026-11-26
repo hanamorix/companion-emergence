@@ -8,6 +8,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 // two distinct credential payloads, asserted both ways.
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async (cmd: string, args: { persona: string }) => {
+    if (cmd === "force_restart_bridge") return undefined;
     if (cmd !== "get_bridge_credentials") throw new Error(`unexpected cmd ${cmd}`);
     if (args.persona === "alice") {
       return { port: 41001, auth_token: "alice-tok" };
@@ -20,19 +21,25 @@ vi.mock("@tauri-apps/api/core", () => ({
 }));
 
 import { invoke } from "@tauri-apps/api/core";
+import { REQUEST_TIMEOUT_MS } from "./lib/requestTimeout";
 import {
   acceptVoiceEdit,
   approvePendingWrite,
   closeSession,
   declinePendingWrite,
   fetchPersonaFeed,
+  fetchHealth,
   fetchPersonaState,
   getBridgeCredentials,
+  invokeForceRestart,
   newSession,
   rejectVoiceEdit,
   resetBridgeCredentialCache,
+  sendChat,
   setPersonaModel,
+  setPersonaModelFull,
   setPersonaPronouns,
+  shutdownBridge,
   snapshotSession,
   uploadImage,
 } from "./bridge";
@@ -186,6 +193,99 @@ describe("getBridgeCredentials", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(invoke).toHaveBeenCalledTimes(2);
   });
+
+  // #365: a request that failed in flight may already have reached the
+  // bridge, so a non-idempotent POST must not be sent a second time.
+  it.each([
+    ["sendChat", () => sendChat("alice", "session-1", "hi")],
+    ["newSession", () => newSession("alice")],
+    ["snapshotSession", () => snapshotSession("alice", "session-1")],
+    ["shutdownBridge", () => shutdownBridge("alice")],
+  ])("does not replay %s after a network failure at an unchanged address", async (_name, call) => {
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new TypeError("connection reset"))
+      .mockResolvedValue(new Response(JSON.stringify({ entries: [] }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(call()).rejects.toThrow("connection reset");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // The stale credentials were dropped, so the next call re-reads them.
+    await fetchPersonaFeed("alice");
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("replays a chat POST when the re-read credentials name a new address (the old bridge is gone)", async () => {
+    await getBridgeCredentials("alice"); // cached: port 41001
+    vi.mocked(invoke).mockImplementationOnce(async () => ({ port: 41009, auth_token: "alice-tok-2" }));
+    const fetchMock = vi.fn()
+      .mockRejectedValueOnce(new TypeError("connection refused"))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ reply: "hi", turn: 1 }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(sendChat("alice", "session-1", "hi")).resolves.toMatchObject({ reply: "hi" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls[1][0]).toBe("http://127.0.0.1:41009/chat");
+  });
+
+  it("replays a chat POST the bridge rejected with 401 (auth runs before the handler)", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response("invalid token", { status: 401 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ reply: "hi", turn: 1 }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(sendChat("alice", "session-1", "hi")).resolves.toMatchObject({ reply: "hi" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops cached credentials when the app force-restarts the bridge", async () => {
+    await getBridgeCredentials("alice");
+    await invokeForceRestart("alice");
+    await getBridgeCredentials("alice");
+    const credentialReads = vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "get_bridge_credentials");
+    expect(credentialReads).toHaveLength(2);
+  });
+
+  it("(#456 review M1) a /health probe that never answers is cut after the request time limit", async () => {
+    vi.useFakeTimers();
+    try {
+      const hang = vi.fn(
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((_resolve, reject) => {
+            const sig = init?.signal;
+            if (sig?.aborted) return reject(new DOMException("aborted", "AbortError"));
+            sig?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")));
+          }),
+      );
+      vi.stubGlobal("fetch", hang);
+      const probe = fetchHealth("alice");
+      const settled = vi.fn();
+      probe.then(settled, settled);
+      await vi.advanceTimersByTimeAsync(REQUEST_TIMEOUT_MS - 100);
+      expect(settled).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(200);
+      await expect(probe).rejects.toThrow();
+    } finally {
+      vi.useRealTimers();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("(#456 C17 m) the forced path passes skipHardExitRequest to the kill helper command", async () => {
+    await invokeForceRestart("alice");
+    await invokeForceRestart("alice", true);
+    await invokeForceRestart("alice", true, false);
+    await invokeForceRestart("alice", true, true, { pid: 4242, pid_token: "linux:b:4242:1" });
+    const calls = vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "force_restart_bridge");
+    expect(calls.map(([, args]) => args)).toEqual([
+      { persona: "alice", skipHardExitRequest: false, startAfter: true, pid: null, pidToken: null },
+      { persona: "alice", skipHardExitRequest: true, startAfter: true, pid: null, pidToken: null },
+      // #456 review M4: end only, for an install
+      { persona: "alice", skipHardExitRequest: true, startAfter: false, pid: null, pidToken: null },
+      // #456 review S8: kill only the watched bridge
+      { persona: "alice", skipHardExitRequest: true, startAfter: true, pid: 4242, pidToken: "linux:b:4242:1" },
+    ]);
+  });
 });
 
 describe("fetchPersonaFeed", () => {
@@ -271,12 +371,105 @@ describe("setPersonaModel", () => {
     await expect(setPersonaModel("alice", "haiku")).resolves.toBeUndefined();
   });
 
+  it("setPersonaModelFull resolves to the checked flag alone (no fallbacks or unchecked-tier fields any more)", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true }), { status: 200 }),
+    ));
+    await expect(setPersonaModelFull("alice", "claude-sonnet-5")).resolves.toEqual({ checked: true });
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-opus-5" }), { status: 200 }),
+    ));
+    await expect(setPersonaModelFull("alice", "opus")).resolves.toEqual({ checked: undefined });
+  });
+
+  it("explains a refusal for a persona that does not use Claude", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: false, error: "model_not_applicable" }), { status: 400 }),
+    ));
+    await expect(setPersonaModel("alice", "opus")).rejects.toThrow(/does not use Claude/);
+  });
+
+  it("explains a settings file that could not be saved", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: false, error: "tunables_unwritable", detail: "x" }), { status: 500 }),
+    ));
+    const err = await setPersonaModel("alice", "opus").catch((e: Error) => e);
+    expect((err as Error).message).toMatch(/settings file/);
+    expect((err as Error).message).not.toContain("\u2014");
+  });
+
+  it("resolves to the bridge's checked flag for a custom id", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true }), { status: 200 }),
+    ));
+    await expect(setPersonaModel("alice", "claude-sonnet-5")).resolves.toBe(true);
+
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: false }), { status: 200 }),
+    ));
+    await expect(setPersonaModel("alice", "claude-sonnet-5")).resolves.toBe(false);
+  });
+
   it("throws on a non-2xx response", async () => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ ok: false, error: "unknown_model" }), { status: 400 }),
     ));
 
     await expect(setPersonaModel("alice", "sonnet")).rejects.toThrow("setPersonaModel failed: 400");
+  });
+
+  // #440: a full id is checked by the bridge before it is saved.
+  it("sends a full model id as written", async () => {
+    const spy = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, model: "claude-sonnet-5", checked: true }), { status: 200 }),
+    );
+    vi.stubGlobal("fetch", spy);
+
+    await setPersonaModel("alice", "claude-sonnet-5");
+
+    expect(JSON.parse(spy.mock.calls[0]![1]!.body as string)).toEqual({ model: "claude-sonnet-5" });
+  });
+
+  it("turns a refused model into the specific message naming it", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({ ok: false, error: "model_unavailable", model: "claude-sonet-5" }),
+        { status: 400 },
+      ),
+    ));
+
+    const err = await setPersonaModel("alice", "claude-sonet-5").catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toContain('"claude-sonet-5"');
+    expect((err as Error).message).toMatch(/doesn't recognise/i);
+    expect((err as Error).message).not.toMatch(/setPersonaModel failed/);
+  });
+
+  it("does not replay a custom id after a network failure (a replay would run a second check)", async () => {
+    const spy = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+    vi.stubGlobal("fetch", spy);
+
+    await expect(setPersonaModel("alice", "claude-sonnet-5")).rejects.toThrow("Failed to fetch");
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["sonnet", "haiku"])("still replays the check-free word %s after a network failure", async (word) => {
+    const spy = vi
+      .fn()
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValue(new Response(JSON.stringify({ ok: true, model: word }), { status: 200 }));
+    vi.stubGlobal("fetch", spy);
+
+    await expect(setPersonaModel("alice", word)).resolves.toBeUndefined();
+    expect(spy).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not replay opus after a network failure (it is checked like a full id, so a replay would run a second check)", async () => {
+    const spy = vi.fn().mockRejectedValue(new TypeError("Failed to fetch"));
+    vi.stubGlobal("fetch", spy);
+
+    await expect(setPersonaModel("alice", "opus")).rejects.toThrow("Failed to fetch");
+    expect(spy).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -444,5 +637,23 @@ describe("acceptVoiceEdit / rejectVoiceEdit", () => {
       }),
     );
     expect(r).toMatchObject({ closed: false });
+  });
+
+  it("passes the bridge's deferred and busy flags through (a 200 that saved nothing yet)", async () => {
+    const body = { session_id: "session-1", closed: false, committed: 0, deduped: 0, soul_candidates: 0, soul_queue_errors: 0, errors: 0 };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...body, deferred: true, busy: false }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ ...body, deferred: false, busy: true }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify(body), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const deferred = await snapshotSession("alice", "session-1");
+    const busy = await snapshotSession("alice", "session-1");
+    const older = await snapshotSession("alice", "session-1"); // a bridge that does not send the flags
+    expect(deferred.deferred).toBe(true);
+    expect(busy.busy).toBe(true);
+    expect(older.deferred).toBeUndefined();
+    expect(older.busy).toBeUndefined();
   });
 });

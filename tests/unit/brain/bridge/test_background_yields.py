@@ -62,8 +62,8 @@ def reset_throttle():
 
 
 @pytest.fixture
-def store() -> MemoryStore:
-    s = MemoryStore(db_path=":memory:")
+def store(tmp_path: Path) -> MemoryStore:
+    s = MemoryStore(tmp_path / "memories.db")
     # Need at least one conversation memory for DreamEngine to pick a seed.
     s.create(_mem("a memory about writing and late nights"))
     return s

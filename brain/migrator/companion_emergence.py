@@ -15,7 +15,6 @@ What we do:
 """
 from __future__ import annotations
 
-import json
 import os
 import shutil
 import sqlite3
@@ -27,6 +26,8 @@ from pathlib import Path
 from typing import Any
 
 from brain import app_config
+from brain.health.json_io import JsonFileError, Recovery, read_json, write_json
+from brain.migrator.install_swap import install_over, refuse_if_in_use
 from brain.migrator.report import MigrationReport
 from brain.paths import get_persona_dir
 
@@ -61,6 +62,13 @@ def _count_rows(db: Path, table: str) -> int:
     if not db.is_file():
         return 0
     try:
+        # This connection opens the database (memories.db among them) in normal read-write mode,
+        # and the code below only reads from it. SQLite read-only mode is deliberately not used,
+        # because it can behave differently while another process is writing. So nothing here
+        # enforces read-only.
+        # memdb-single-writer reader exception: only a SELECT COUNT(*) of a SOURCE persona's
+        # tables (memories.db among them) for the migrate preflight. It stays outside
+        # MemoryStore for now (owner ruling); the scanner is tests/unit/test_memories_db_single_writer.py.
         conn = sqlite3.connect(db)
         try:
             return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -73,13 +81,10 @@ def _count_rows(db: Path, table: str) -> int:
 def _read_source_lived_age(input_dir: Path) -> float:
     """Read lived_age_hours from the source's felt_time_state.json without
     mutating it. 0.0 if absent or unreadable (fresh-brain default)."""
-    p = input_dir / "felt_time_state.json"
-    if not p.is_file():
-        return 0.0
+    data = read_json(input_dir / "felt_time_state.json", default=dict, expect=dict)
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
         return float(data.get("lived_age_hours", 0.0))
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return 0.0
 
 
@@ -133,8 +138,8 @@ def preflight_companion_emergence(input_dir: Path) -> dict[str, Any]:
         return result
 
     try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        config = read_json(config_path, recover=Recovery.RAISE, expect=dict)
+    except JsonFileError as exc:
         result["errors"].append({
             "code": "bad_persona_config",
             "message": f"`persona_config.json` is not valid JSON: {exc}",
@@ -155,6 +160,22 @@ def preflight_companion_emergence(input_dir: Path) -> dict[str, Any]:
 
 
 def migrate_companion_emergence(args: CompanionEmergenceMigrateArgs) -> MigrationReport:
+    """Copy a companion-emergence persona in as `args.install_as`, under the migrate lock for that name.
+
+    #754: the copy is built in `<name>.new`, so a second run for the same name would delete and refill the first
+    run's build while the first swaps it in. The migrate lock (as `run_migrate` takes) keeps the runs apart.
+    """
+    from brain.migrator.cli import _acquire_migrate_lock, _migrate_lock_path, _release_migrate_lock
+
+    lock_path = _migrate_lock_path(get_persona_dir(args.install_as))
+    lock_fd = _acquire_migrate_lock(lock_path)
+    try:
+        return _migrate_companion_emergence_locked(args)
+    finally:
+        _release_migrate_lock(lock_path, lock_fd)
+
+
+def _migrate_companion_emergence_locked(args: CompanionEmergenceMigrateArgs) -> MigrationReport:
     started = time.monotonic()
 
     preflight = preflight_companion_emergence(args.input_dir)
@@ -169,12 +190,13 @@ def migrate_companion_emergence(args: CompanionEmergenceMigrateArgs) -> Migratio
                 f"A Kindled named `{args.install_as}` already exists at {target_dir}. "
                 "Re-run with --force to back up and overwrite."
             )
-        backup = target_dir.with_name(
-            f"{target_dir.name}.backup-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}"
-        )
-        shutil.move(str(target_dir), str(backup))
+        refuse_if_in_use(target_dir)  # #754: before any work; install_over checks again at the swap
 
-    shutil.copytree(args.input_dir, target_dir, dirs_exist_ok=False)
+    # #754: build the copy in <name>.new and swap it in under the start lock, so nothing starts in a half-copied folder.
+    work_dir = target_dir.with_name(f"{target_dir.name}.new")
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
+    shutil.copytree(args.input_dir, work_dir, dirs_exist_ok=False)
 
     manifest = {
         "generated_at_utc": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
@@ -187,9 +209,8 @@ def migrate_companion_emergence(args: CompanionEmergenceMigrateArgs) -> Migratio
         "hebbian_edge_count": preflight["hebbian_edge_count"],
         "lived_age_hours_at_migration": _read_source_lived_age(args.input_dir),
     }
-    (target_dir / "source-manifest.json").write_text(
-        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
-    )
+    write_json(work_dir / "source-manifest.json", manifest, indent=2, fsync=False)
+    install_over(target_dir, work_dir)  # raises PersonaInUseError while the start lock is held
 
     app_config.write_if_missing(args.install_as)
 

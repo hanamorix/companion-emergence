@@ -2,7 +2,8 @@
 """#344 — a record stranded in 'committing' (crash between the #101 claim and the
 final 'committed' mark) is reconciled against the target file, never retried.
 
-Criteria are docs/guarded-change/pending-committing-recovery/1.5-criteria.md.
+The criteria are the #344 guarded-change criteria, a private record that is not
+committed (#797).
 The through-the-supervisor tests (C1, C2, C11, C15) live in
 tests/bridge/test_supervisor_pending_sweep.py.
 """
@@ -720,16 +721,19 @@ def test_a_hung_commit_that_lands_after_reconcile_corrects_the_record_and_nell(e
     t = out / "n.md"
     rid = pending.create(persona, op="create", resolved_path=str(t.resolve()), content="body",
                          now=_now())
-    real_mkdir, fired = Path.mkdir, []
+    from brain.files import commit as commit_mod
 
-    def _mkdir_while_the_commit_is_hung(self, *a, **k):
-        if self == t.parent and not fired:
-            fired.append(1)  # we are between the claim and the write: reconcile runs now
+    real_mark, fired = commit_mod.pending.mark, []
+
+    def _mark_then_hang(persona_dir, record_id, *, status, **k):
+        ok = real_mark(persona_dir, record_id, status=status, **k)
+        if status == "committing" and not fired:
+            fired.append(1)  # claimed, not yet written: reconcile runs now (#699: commit no longer calls Path.mkdir)
             _backdate(persona, rid, 11)
             assert _reconcile(persona) == 1
-        return real_mkdir(self, *a, **k)
+        return ok
 
-    monkeypatch.setattr(Path, "mkdir", _mkdir_while_the_commit_is_hung)
+    monkeypatch.setattr(commit_mod.pending, "mark", _mark_then_hang)
     store = MemoryStore(persona / "memories.db")
     try:
         assert commit_write(persona, rid, store=store)["ok"] is True

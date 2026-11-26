@@ -1,10 +1,26 @@
 import { useState } from "react";
-import { setPersonaModel, type ChatModel } from "../../bridge";
+import { setPersonaModelFull, type ChatModel } from "../../bridge";
+import { MODEL_ID_MAX_LENGTH, isChatModelAlias, isValidChatModel } from "../../lib/modelId";
+
+/** Radio value for the custom-id option; never sent to the bridge (the typed id is). */
+const CUSTOM = "__custom__";
 
 interface Props {
+  /** The model the chat job runs now (the bridge's effective id). */
   current: ChatModel;
+  /** The word that model means (the bridge's `model_choice`): highlights its radio; null for a custom id, which
+   *  opens the custom field instead. */
+  choice: string | null;
   persona: string;
-  onClose: (newModel?: ChatModel) => void;
+  /** `info` is only passed when the bridge could not confirm the model (#440). */
+  onClose: (newModel?: ChatModel, info?: ModelApplyInfo) => void;
+  /** Let Apply be pressed for the model that is already current (an unsupported setting fell back to it, #446). */
+  allowReapply?: boolean;
+}
+
+export interface ModelApplyInfo {
+  /** false: the bridge could not confirm the model (it was saved anyway). */
+  checked?: false;
 }
 
 interface ModelOption {
@@ -31,17 +47,32 @@ const OPTIONS: ModelOption[] = [
   },
 ];
 
-export function ModelPicker({ current, persona, onClose }: Props) {
-  const [selected, setSelected] = useState<ChatModel>(current);
+export function ModelPicker({ current, choice, persona, onClose, allowReapply = false }: Props) {
+  const choiceIsWord = choice !== null && isChatModelAlias(choice);
+  const [selected, setSelected] = useState<string>(choiceIsWord ? choice : CUSTOM);
+  const [customText, setCustomText] = useState(choiceIsWord ? "" : current);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const isCustom = selected === CUSTOM;
+  // Surrounding whitespace is dropped (a pasted id often has some); the rest is validated as written.
+  const value = isCustom ? customText.trim() : selected;
+  const valid = isValidChatModel(value);
+  // allowReapply: the shown model is the fallback for an unsupported setting, so applying it again is how the
+  // user replaces (and clears) that setting. A word equal to the highlighted choice is no change; a typed id
+  // is a change unless the setting already holds that very id. While a word is highlighted, typing the id of its model still counts
+  // as a change, so the save-time check runs; a value equal to the shipped default follows later default changes.
+  const unchanged = isCustom ? choice === null && value === current : value === choice;
+  const canApply = !busy && valid && (!unchanged || allowReapply);
+  const showFormatHint = isCustom && value !== "" && !valid;
 
   async function onConfirm() {
     setBusy(true);
     setError(null);
     try {
-      await setPersonaModel(persona, selected);
-      onClose(selected);
+      const { checked } = await setPersonaModelFull(persona, value);
+      if (checked === false) onClose(value, { checked: false });
+      else onClose(value);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       setBusy(false);
@@ -87,6 +118,67 @@ export function ModelPicker({ current, persona, onClose }: Props) {
         </label>
       ))}
 
+      <label
+        style={{
+          display: "flex",
+          alignItems: "flex-start",
+          gap: 8,
+          cursor: "pointer",
+          fontSize: 11,
+          lineHeight: 1.5,
+          color: "var(--text)",
+          fontFamily: "var(--font-ui)",
+        }}
+      >
+        <input
+          type="radio"
+          name="model"
+          value={CUSTOM}
+          checked={isCustom}
+          onChange={() => setSelected(CUSTOM)}
+          style={{ marginTop: 2, flexShrink: 0 }}
+        />
+        <span>
+          <strong>Custom model ID</strong>
+          {": "}
+          <span style={{ color: "var(--text-mute)" }}>pin a specific version</span>
+        </span>
+      </label>
+      <input
+        type="text"
+        aria-label="Model ID"
+        aria-describedby={showFormatHint ? "model-id-hint" : undefined}
+        placeholder="claude-..."
+        maxLength={MODEL_ID_MAX_LENGTH}
+        value={customText}
+        spellCheck={false}
+        autoCapitalize="off"
+        autoComplete="off"
+        onFocus={() => setSelected(CUSTOM)}
+        onChange={(e) => {
+          setCustomText(e.target.value);
+          setSelected(CUSTOM);
+        }}
+        style={{
+          marginLeft: 22,
+          padding: "4px 6px",
+          fontSize: 11,
+          fontFamily: "var(--font-ui)",
+          color: "var(--text)",
+          background: "transparent",
+          border: "1px solid var(--hairline)",
+          borderRadius: 4,
+        }}
+      />
+      {showFormatHint && (
+        <div
+          id="model-id-hint"
+          style={{ marginLeft: 22, fontSize: 10.5, color: "var(--text-mute)", lineHeight: 1.45 }}
+        >
+          Model IDs start with claude- and use lowercase letters, digits, dots and dashes.
+        </div>
+      )}
+
       <div
         style={{
           display: "flex",
@@ -96,7 +188,7 @@ export function ModelPicker({ current, persona, onClose }: Props) {
       >
         <button
           onClick={onConfirm}
-          disabled={busy || selected === current}
+          disabled={!canApply}
           style={{
             flex: 1,
             padding: "6px 10px",
@@ -106,11 +198,11 @@ export function ModelPicker({ current, persona, onClose }: Props) {
             color: "var(--text)",
             border: "1px solid color-mix(in srgb, var(--accent) 30%, transparent)",
             borderRadius: 5,
-            cursor: busy || selected === current ? "not-allowed" : "pointer",
-            opacity: busy || selected === current ? 0.55 : 1,
+            cursor: canApply ? "pointer" : "not-allowed",
+            opacity: canApply ? 1 : 0.55,
           }}
         >
-          {busy ? "Applying..." : "Apply"}
+          {busy ? (isCustom ? "Checking..." : "Applying...") : "Apply"}
         </button>
         <button
           onClick={() => onClose()}

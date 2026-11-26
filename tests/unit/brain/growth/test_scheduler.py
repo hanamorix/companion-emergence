@@ -192,7 +192,7 @@ def test_run_growth_tick_corrupt_vocabulary_logs_warning(
 ) -> None:
     """A corrupt emotion_vocabulary.json is detected and surfaces a WARNING.
 
-    Post-T10 the scheduler routes through attempt_heal, which quarantines the
+    Post-T10 the scheduler routes through json_io (HEAL), which quarantines the
     corrupt file and resets to default. The scheduler still completes (returns
     empty set) but the anomaly surfaces a WARNING so the user / forensic-grep
     has a thread to pull on rather than silent degradation.
@@ -233,7 +233,7 @@ def test_run_growth_tick_invalid_vocabulary_schema_logs_warning(
     result = run_growth_tick(persona_dir, store, datetime.now(UTC))
     assert result.emotions_added == 0
 
-    # Post-T10: schema mismatch goes through attempt_heal; warning message
+    # Post-T10: schema mismatch goes through json_io HEAL; warning message
     # contains "anomaly" and identifies the file.
     schema_warnings = [
         r
@@ -243,7 +243,7 @@ def test_run_growth_tick_invalid_vocabulary_schema_logs_warning(
     assert len(schema_warnings) == 1
 
 
-# ---- Health T10: attempt_heal wiring ----
+# ---- Health T10: json_io HEAL wiring ----
 
 
 def test_read_current_vocabulary_names_corrupt_quarantines_restores_bak(
@@ -289,7 +289,7 @@ def test_read_current_vocabulary_names_corrupt_no_bak_resets_to_default(
     assert names == set()
     assert anomaly is not None
     assert anomaly.action == "reset_to_default"
-    # Some warning surfaced (either from attempt_heal or existing path)
+    # Some warning surfaced (either from json_io or the existing path)
     assert any(r.levelno >= logging.WARNING for r in caplog.records)
 
 
@@ -444,3 +444,112 @@ def test_vocabulary_crystallization_emits_initiate_candidate(
         c.source == "crystallization" and c.source_id == "vocabulary_emotion:lingering"
         for c in candidates
     )
+
+
+# ---- emotion rework B1 PR 5: a live persona's growth reads the engine ----
+
+
+def _go_live(persona_dir: Path, store: MemoryStore, **seed: float):
+    from brain.emotion import engine as emotion_engine
+    from brain.memory.store import Memory
+    from tests.unit.brain.emotion._engine_support import make_live
+
+    store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions=seed or {"joy": 5.0}))
+    make_live(persona_dir, datetime.now(UTC))
+    return emotion_engine.engine_for(persona_dir)
+
+
+def _blend_rows(store: MemoryStore, emotions: dict[str, float]) -> None:
+    from brain.memory.store import Memory
+
+    for i in range(3):
+        store.create(
+            Memory.create_new(content=f"braided {i}", memory_type="conversation", domain="us", emotions=emotions, importance=8.0)
+        )
+
+
+def _added_names(persona_dir: Path) -> list[str]:
+    log_path = persona_dir / "emotion_growth.log.jsonl"
+    if not log_path.exists():
+        return []
+    return [json.loads(line)["name"] for line in log_path.read_text(encoding="utf-8").splitlines()]
+
+
+def test_live_initiate_candidate_carries_short_averages(persona_dir: Path) -> None:
+    from brain.initiate.emit import read_candidates
+    from brain.memory.store import Memory
+
+    _seed_vocab(persona_dir, ["love", "joy", "grief"])
+    disk = MemoryStore(persona_dir / "memories.db")
+    try:
+        eng = _go_live(persona_dir, disk, love=6.0)
+        # A making counts for the engine; the old conversation-only aggregate never saw it.
+        disk.create(Memory.create_new(content="made", memory_type="making", domain="interior", emotions={"joy": 8.0}))
+        _blend_rows(disk, {"love": 9.0, "grief": 8.0})
+        eng.note_active(datetime.now(UTC))
+        expected = {name: r.short for name, r in eng.read().items() if r.short > 0}
+        assert "joy" in expected
+
+        run_growth_tick(persona_dir, disk, datetime.now(UTC))
+    finally:
+        disk.close()
+
+    [candidate] = [c for c in read_candidates(persona_dir) if c.source_id.startswith("vocabulary_emotion:")]
+    assert candidate.emotional_snapshot is not None
+    assert candidate.emotional_snapshot.vector == pytest.approx(expected)
+
+
+def test_old_memories_do_not_form_a_blend_when_live(persona_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain.emotion import engine_utils
+    from tests.unit.brain.emotion._engine_support import half_fade
+
+    _seed_vocab(persona_dir, ["love", "joy", "grief"])
+    disk = MemoryStore(persona_dir / "memories.db")
+    try:
+        _go_live(persona_dir, disk)
+        _blend_rows(disk, {"love": 7.0, "grief": 7.0})
+        # Faded to 3.5 each: below the 6.0 floor, so no blend.
+        monkeypatch.setattr(engine_utils, "faded_emotion", half_fade)
+
+        result = run_growth_tick(persona_dir, disk, datetime.now(UTC))
+    finally:
+        disk.close()
+
+    assert result.emotions_added == 0
+    assert _added_names(persona_dir) == []
+
+
+def test_top_two_are_chosen_by_faded_value(persona_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from brain.emotion import engine_utils
+
+    _seed_vocab(persona_dir, ["love", "joy", "grief"])
+    disk = MemoryStore(persona_dir / "memories.db")
+    try:
+        _go_live(persona_dir, disk)
+        _blend_rows(disk, {"love": 9.0, "grief": 8.0, "joy": 7.0})
+        # love fades to 4.5 while grief and joy hold, so the strongest two are grief and joy.
+        monkeypatch.setattr(
+            engine_utils,
+            "faded_emotion",
+            lambda memory, emotion, half_lives, switch_over_at, now: memory._stored_emotions[emotion]
+            * (0.5 if emotion == "love" else 1.0),
+        )
+
+        run_growth_tick(persona_dir, disk, datetime.now(UTC))
+    finally:
+        disk.close()
+
+    assert _added_names(persona_dir) == ["grief_joy_blend"]
+
+
+@pytest.mark.no_base_failure(reason="pins the switch-off tick, which is today's")
+def test_off_tick_is_unchanged(persona_dir: Path) -> None:
+    _seed_vocab(persona_dir, ["love", "joy", "grief"])
+    disk = MemoryStore(persona_dir / "memories.db")
+    try:
+        _blend_rows(disk, {"love": 9.0, "grief": 8.0, "joy": 7.0})
+        run_growth_tick(persona_dir, disk, datetime.now(UTC))
+    finally:
+        disk.close()
+
+    assert _added_names(persona_dir) == ["grief_love_blend"]

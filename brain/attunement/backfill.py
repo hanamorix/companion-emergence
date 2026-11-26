@@ -9,7 +9,6 @@ add the sampling, state-resume, trigger, and orchestration logic.
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 import time
@@ -18,8 +17,9 @@ from datetime import UTC
 from datetime import datetime as _datetime
 from pathlib import Path
 
+from brain import dev_constants
 from brain.attunement.store import BufferTurn
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import Recovery, iter_jsonl, read_json, write_json
 
 _log = logging.getLogger(__name__)
 _STATE_FILE = "backfill_state.json"
@@ -133,22 +133,21 @@ def _load_state(persona_dir: Path):  # -> BackfillState | None
     from brain.attunement.schemas import BackfillState
     from brain.state_compat import from_known_fields
 
-    p = _state_path(persona_dir)
-    if not p.exists():
+    # CONTENT: an unreadable file still raises (as it always did); a missing or corrupt one is "no state".
+    raw = read_json(
+        _state_path(persona_dir), default=lambda: None, recover=Recovery.CONTENT, expect=dict
+    )
+    if raw is None:
         return None
     try:
-        return from_known_fields(BackfillState, json.loads(p.read_text()))
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        return from_known_fields(BackfillState, raw)
+    except (TypeError, ValueError) as exc:
         _log.warning("attunement backfill: corrupt state file: %s", exc)
         return None
 
 
 def _save_state(persona_dir: Path, state) -> None:  # state: BackfillState
-    p = _state_path(persona_dir)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(asdict(state), indent=2, sort_keys=True))
-    tmp.replace(p)
+    write_json(_state_path(persona_dir), asdict(state), indent=2, sort_keys=True, fsync=False)
 
 
 def _read_buffer_turns(persona_dir: Path) -> list[BufferTurn]:
@@ -158,7 +157,7 @@ def _read_buffer_turns(persona_dir: Path) -> list[BufferTurn]:
         return []
     rows: list[tuple[str, BufferTurn]] = []
     for jsonl_file in sorted(convs.glob("*.jsonl")):
-        for row in read_jsonl_skipping_corrupt(jsonl_file):
+        for row in iter_jsonl(jsonl_file, recover=Recovery.RAISE):
             if row.get("role") != "user":
                 continue
             tid = str(row.get("id") or row.get("ts") or "")
@@ -206,7 +205,13 @@ def should_run_backfill(persona_dir: Path) -> bool:
     existing = _load_state(persona_dir)
     if existing is not None and existing.status == "complete":
         return False
+    if _unfinished_supplementary(existing):
+        return False  # #473: resumed by should_run_supplementary_backfill, never as a full pass
     return True
+
+
+def _unfinished_supplementary(state) -> bool:  # state: BackfillState | None
+    return state is not None and state.pass_kind == "supplementary" and state.status != "complete"
 
 
 def should_run_supplementary_backfill(persona_dir: Path) -> bool:
@@ -215,16 +220,16 @@ def should_run_supplementary_backfill(persona_dir: Path) -> bool:
     The new category dimensions (topic_affinity, response_shape, relational)
     need a supplementary bootstrap from history.  Returns False when there is
     no prior completed state or when the completed state is already at the
-    current SCHEMA_VERSION.
+    current dev_constants.ATTUNEMENT_SCHEMA_VERSION.
     """
-    from brain.attunement.schemas import SCHEMA_VERSION
-
     existing = _load_state(persona_dir)
+    if _unfinished_supplementary(existing):
+        return True  # #473: a supplementary pass that stopped early (refused, deferred, yielded) resumes
     if existing is None or existing.status != "complete":
         return False
-    old, new = _schema_key(existing.schema_version), _schema_key(SCHEMA_VERSION)
+    old, new = _schema_key(existing.schema_version), _schema_key(dev_constants.ATTUNEMENT_SCHEMA_VERSION)
     if old is None or new is None:  # unparseable: re-run on any difference, as before
-        return existing.schema_version != SCHEMA_VERSION
+        return existing.schema_version != dev_constants.ATTUNEMENT_SCHEMA_VERSION
     # Only OLDER: a newer version is what a rolled-back brain finds (#295).
     return old < new
 
@@ -268,10 +273,10 @@ def run_backfill(
     tone/cadence patterns are not double-counted.
     """
     from brain.attunement.budget import consume_call as _attunement_consume_call
+    from brain.attunement.budget import get_remaining as _attunement_budget_remaining
+    from brain.attunement.budget import lock as _attunement_budget_lock
     from brain.attunement.crystallise import check_crystallisations
     from brain.attunement.schemas import (
-        DAILY_BUDGET_DEFAULT,
-        SCHEMA_VERSION,
         BackfillState,
     )
     from brain.attunement.store import merge_into_learned
@@ -284,7 +289,23 @@ def run_backfill(
     # signal emotion_backfill's _user_recently_active wraps.
 
     if cap is None:
-        cap = DAILY_BUDGET_DEFAULT
+        cap = dev_constants.ATTUNEMENT_DAILY_BUDGET_DEFAULT
+
+    now_dt = now_dt or _datetime.now(UTC)
+    now_iso = _now_iso_str(now_dt)
+
+    existing = _load_state(persona_dir)
+    # Normal path: short-circuit if already complete.
+    # Supplementary path: bypass the early-return — the whole point is to
+    # re-run after a prior completion, starting fresh at cursor=0.
+    if not supplementary and existing is not None and existing.status == "complete":
+        return existing
+
+    # #473: a supplementary pass that stopped early resumes as itself: from its cursor, with the categories it
+    # was started for (never tone / cadence), whatever this call asked for.
+    resuming_supplementary = supplementary and _unfinished_supplementary(existing)
+    if resuming_supplementary and existing.categories:
+        only_categories = frozenset(existing.categories)
 
     if detector_fn is None:
         from brain.attunement.detector import run_detector as _default_detector
@@ -321,35 +342,26 @@ def run_backfill(
                     user_pronouns=_upron,
                 )
 
-    now_dt = now_dt or _datetime.now(UTC)
-    now_iso = _now_iso_str(now_dt)
-
-    existing = _load_state(persona_dir)
-    # Normal path: short-circuit if already complete.
-    # Supplementary path: bypass the early-return — the whole point is to
-    # re-run after a prior completion, starting fresh at cursor=0.
-    if not supplementary and existing is not None and existing.status == "complete":
-        return existing
-
     turns = _read_buffer_turns(persona_dir)
     all_windows = window_buffer(turns)
     sampled = select_sample(all_windows)
 
-    if supplementary:
+    if resuming_supplementary:
+        start_idx = _cursor_index(sampled, existing.last_cursor)
+        last_cursor = existing.last_cursor
+    elif supplementary:
         # Reprocess every window for the new categories (fresh cursor at index 0),
         # but PRESERVE the prior completed record — a supplementary pass augments
         # an existing backfill, it must not clobber the original started_at or
-        # reset patterns_emitted. Counts accumulate; only the cursor resets (the
-        # cursor itself is cleared in the BackfillState construction below).
+        # reset patterns_emitted. Counts accumulate; only the cursor resets.
         start_idx = 0
-        processed_so_far = existing.processed_windows if existing else 0
-        started_at = existing.started_at if existing else now_iso
-        patterns_emitted_so_far = existing.patterns_emitted if existing else 0
+        last_cursor = ""
     else:
         start_idx = _cursor_index(sampled, existing.last_cursor) if existing else 0
-        processed_so_far = existing.processed_windows if existing else 0
-        started_at = existing.started_at if existing else now_iso
-        patterns_emitted_so_far = existing.patterns_emitted if existing else 0
+        last_cursor = existing.last_cursor if existing else ""
+    processed_so_far = existing.processed_windows if existing else 0
+    started_at = existing.started_at if existing else now_iso
+    patterns_emitted_so_far = existing.patterns_emitted if existing else 0
 
     state = BackfillState(
         started_at=started_at,
@@ -358,10 +370,13 @@ def run_backfill(
         processed_windows=processed_so_far,
         patterns_emitted=patterns_emitted_so_far,
         status="running",
-        last_cursor=("" if supplementary else (existing.last_cursor if existing else "")),
-        schema_version=SCHEMA_VERSION,
+        last_cursor=last_cursor,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
+        pass_kind="supplementary" if supplementary else "full",
+        categories=tuple(sorted(only_categories)) if supplementary and only_categories is not None else None,
     )
-    _save_state(persona_dir, state)
+    # #473: the start-of-run save is deferred to the first window whose detector call was not refused (or to the
+    # budget deferral below), so a run refused at its first window leaves the state file exactly as it was.
 
     # #144: mirror emotion_backfill's zero-tagged guard — count detector
     # outcomes so a run where every call errored is not marked complete.
@@ -400,19 +415,33 @@ def run_backfill(
                 )
                 return state
 
-            if not _attunement_consume_call(persona_dir, now=now_dt, cap=cap):
-                state = replace(state, status="deferred_to_next_day")
-                _save_state(persona_dir, state)
-                return state
+            # #473: check the budget now (read-only) and charge it only after a call that was not refused. The budget
+            # lock is held from the check to the charge, so pass-2 attunement (or another process) cannot check and
+            # charge in between and push the day over its cap (review O-7).
+            with _attunement_budget_lock(persona_dir):
+                if _attunement_budget_remaining(persona_dir, now=now_dt, cap=cap) <= 0:
+                    state = replace(state, status="deferred_to_next_day")
+                    _save_state(persona_dir, state)
+                    return state
 
-            attempted_this_run += 1
-            try:
-                output = detector_fn(buffer_slice=list(window.turns), reply_text="")
-            except Exception as exc:  # noqa: BLE001
-                _log.warning(
-                    "attunement backfill: detector error on %s: %s", window.id, exc
-                )
-                continue
+                attempted_this_run += 1
+                try:
+                    output = detector_fn(buffer_slice=list(window.turns), reply_text="")
+                except cli_throttle.ThrottleDeferred as exc:
+                    # #473: "not now" (login expired, or the bridge is stopping): nothing of this window is written
+                    # and no later window runs; the state on disk is as it was before this window's call.
+                    _log.info(
+                        "attunement backfill: detector call refused on %s (%s); stopping this run", window.id, exc
+                    )
+                    return state
+                except Exception as exc:  # noqa: BLE001
+                    _attunement_consume_call(persona_dir, now=now_dt, cap=cap)  # a call that failed still cost one
+                    _save_state(persona_dir, state)  # the deferred start-of-run save, unchanged otherwise
+                    _log.warning(
+                        "attunement backfill: detector error on %s: %s", window.id, exc
+                    )
+                    continue
+                _attunement_consume_call(persona_dir, now=now_dt, cap=cap)
             succeeded_this_run += 1
 
             merge_into_learned(
@@ -462,7 +491,7 @@ def run_supplementary_backfill(
 
     Extracts ONLY the new category dimensions (topic_affinity, response_shape,
     relational) from history. tone + cadence are already learned — no
-    double-counting. Writes a fresh state at the current SCHEMA_VERSION so the
+    double-counting. Writes a fresh state at the current dev_constants.ATTUNEMENT_SCHEMA_VERSION so the
     feed-source will not fire another backfill_complete for the same completion.
     """
     return run_backfill(

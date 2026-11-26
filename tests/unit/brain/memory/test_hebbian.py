@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import logging
+
 import pytest
 
 from brain.memory.hebbian import MAX_WEIGHT, HebbianMatrix
+from brain.utils import log_throttle
+
+HEBB_LOG = "brain.memory.hebbian"
 
 
 @pytest.fixture
@@ -235,3 +240,196 @@ def test_ensure_edge_inserts_once_no_weight_inflation(tmp_path):
         assert h.neighbors("x") == []
     finally:
         h.close()
+
+
+@pytest.fixture
+def fresh_throttle(monkeypatch):
+    monkeypatch.setattr(log_throttle, "_last", {})
+    monkeypatch.setattr(log_throttle, "_counts", {}, raising=False)
+
+
+def _cap_records(caplog):
+    return [r for r in caplog.records if r.name == HEBB_LOG and "MAX_WEIGHT" in r.getMessage()]
+
+
+def test_strengthen_records_when_the_cap_binds(matrix, caplog, fresh_throttle) -> None:
+    # #368: the cap used to bind silently. It only bites a pathological edge,
+    # so the first firing warns; later ones log at DEBUG with the count.
+    with caplog.at_level(logging.DEBUG, logger=HEBB_LOG):
+        matrix.strengthen("a", "b", delta=9.5)  # 9.5: below the cap, no record
+        assert _cap_records(caplog) == []
+        matrix.strengthen("a", "b", delta=0.5)  # exactly 10.0: reaches, does not exceed
+        assert _cap_records(caplog) == []
+        matrix.strengthen("b", "a", delta=0.5)  # 10.5 -> 10.0: binds
+        matrix.strengthen("x", "y", delta=MAX_WEIGHT + 5.0)  # fresh edge, binds on INSERT
+    recs = _cap_records(caplog)
+    assert [r.levelno for r in recs] == [logging.WARNING, logging.DEBUG]
+    assert "a-b" in recs[0].getMessage() and "10.500" in recs[0].getMessage()
+    assert "2 since start" in recs[1].getMessage()
+    # Behaviour unchanged: stored weights still saturate at the cap.
+    assert matrix.weight("a", "b") == MAX_WEIGHT
+    assert matrix.weight("x", "y") == MAX_WEIGHT
+
+
+def test_set_edge_weight_records_when_the_cap_binds(matrix, caplog, fresh_throttle) -> None:
+    with caplog.at_level(logging.DEBUG, logger=HEBB_LOG):
+        matrix.set_edge_weight("a", "b", MAX_WEIGHT)  # at the cap: no record
+        assert _cap_records(caplog) == []
+        matrix.set_edge_weight("d", "c", MAX_WEIGHT + 2.0)  # binds
+    (rec,) = _cap_records(caplog)
+    assert rec.levelno == logging.WARNING
+    assert "c-d" in rec.getMessage() and "12.000" in rec.getMessage() and "set_edge_weight" in rec.getMessage()
+    # Behaviour unchanged.
+    assert matrix.weight("a", "b") == MAX_WEIGHT
+    assert matrix.weight("c", "d") == MAX_WEIGHT
+
+
+_WRITES = {
+    "strengthen": lambda m: m.strengthen("p", "q", delta=0.5),
+    "set_edge_weight": lambda m: m.set_edge_weight("p", "q", 1.0),
+    "ensure_edge": lambda m: m.ensure_edge("p", "q", 1.0),
+    "decay_all": lambda m: m.decay_all(0.1),
+    "garbage_collect": lambda m: m.garbage_collect(5.0),
+    "remove_memory": lambda m: m.remove_memory("a"),
+}
+
+
+@pytest.mark.parametrize("write", sorted(_WRITES))
+def test_a_failed_write_releases_the_write_lock(tmp_path, write) -> None:
+    """Regression (found during #368): a HebbianMatrix write that raised left its
+    transaction open, holding the SQLite write lock. search_memories swallows the
+    error, so every other writer then failed with "database is locked" until this
+    connection committed or closed. Every write must roll back what it opened."""
+    import sqlite3
+
+    db = tmp_path / "h.db"
+    m = HebbianMatrix(db, integrity_check=False)
+    m.strengthen("a", "b", delta=1.0)
+    m._conn.executescript(
+        """
+        CREATE TABLE probe (x INTEGER);
+        CREATE TRIGGER no_ins BEFORE INSERT ON hebbian_edges BEGIN SELECT RAISE(ABORT, 'boom'); END;
+        CREATE TRIGGER no_upd BEFORE UPDATE ON hebbian_edges BEGIN SELECT RAISE(ABORT, 'boom'); END;
+        CREATE TRIGGER no_del BEFORE DELETE ON hebbian_edges BEGIN SELECT RAISE(ABORT, 'boom'); END;
+        """
+    )
+    with pytest.raises(sqlite3.DatabaseError, match="boom"):
+        _WRITES[write](m)
+    assert not m._conn.in_transaction
+    other = sqlite3.connect(db, timeout=0.2)
+    try:
+        other.execute("INSERT INTO probe VALUES (1)")  # fails fast if still locked
+        other.commit()
+    finally:
+        other.close()
+    assert m.weight("a", "b") == 1.0  # the failed write changed nothing
+    m.close()
+
+
+def test_a_failed_commit_releases_the_write_lock(tmp_path) -> None:
+    """Regression (#368 review): _write() committed outside its try, so a COMMIT
+    that raised (a full disk in WAL mode most likely surfaces there; here a
+    deferred foreign-key violation) left the transaction open, holding the write
+    lock, and every other writer got "database is locked"."""
+    import sqlite3
+
+    db = tmp_path / "h.db"
+    m = HebbianMatrix(db, integrity_check=False)
+    m._conn.execute("PRAGMA foreign_keys = ON")
+    m._conn.executescript(
+        """
+        CREATE TABLE parent (id TEXT PRIMARY KEY);
+        CREATE TABLE child (pid TEXT REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+        CREATE TRIGGER orphan AFTER INSERT ON hebbian_edges BEGIN INSERT INTO child VALUES ('nope'); END;
+        """
+    )
+    with pytest.raises(sqlite3.IntegrityError):
+        m.strengthen("a", "b", delta=0.5)  # the FK check fails at COMMIT
+    assert not m._conn.in_transaction
+    other = sqlite3.connect(db, timeout=0.2)
+    try:
+        other.execute("CREATE TABLE probe (x INTEGER)")  # fails fast if still locked
+        other.commit()
+    finally:
+        other.close()
+    assert m.weight("a", "b") == 0.0  # the failed write was rolled back
+    m.close()
+
+
+class _ConnProxy:
+    """Delegates to a real sqlite3 connection (whose methods cannot be patched)
+    so a test can intercept execute() or rollback()."""
+
+    def __init__(self, conn, *, on_execute=None, rollback_error=None) -> None:
+        self._c = conn
+        self._on_execute = on_execute
+        self._rollback_error = rollback_error
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+    def execute(self, sql, *args):
+        if self._on_execute is not None:
+            self._on_execute(sql)
+        return self._c.execute(sql, *args)
+
+    def rollback(self):
+        if self._rollback_error is not None:
+            raise self._rollback_error
+        return self._c.rollback()
+
+
+def test_a_failed_rollback_does_not_mask_the_write_error(tmp_path, caplog) -> None:
+    """Regression (#368 review): if the rollback after a failed write also raised,
+    the rollback's error replaced the write's, hiding the real cause. The write's
+    own error must propagate and the rollback failure must be logged."""
+    import sqlite3
+
+    m = HebbianMatrix(tmp_path / "h.db", integrity_check=False)
+    real = m._conn
+    real.execute("CREATE TRIGGER no_ins BEFORE INSERT ON hebbian_edges BEGIN SELECT RAISE(ABORT, 'boom'); END")
+    real.commit()
+    m._conn = _ConnProxy(real, rollback_error=sqlite3.OperationalError("rollback broke"))
+    with caplog.at_level(logging.WARNING, logger=HEBB_LOG):
+        with pytest.raises(sqlite3.DatabaseError, match="boom"):
+            m.strengthen("a", "b", delta=0.5)
+    assert any("rollback" in r.getMessage() and r.exc_info for r in caplog.records if r.name == HEBB_LOG)
+    real.rollback()
+    real.close()
+
+
+def test_strengthen_holds_the_write_lock_across_its_pre_read(tmp_path) -> None:
+    """Regression (#368): strengthen's cap check compares the pre-read weight plus
+    delta against MAX_WEIGHT. If the pre-read ran outside the UPSERT's write
+    transaction (a plain or deferred BEGIN), another writer could change the edge
+    in between and the cap record would be wrong. While the pre-read runs, no
+    other connection may take the write lock."""
+    import sqlite3
+
+    db = tmp_path / "h.db"
+    m = HebbianMatrix(db, integrity_check=False)
+    outcome: list[str] = []
+
+    def _try_other_writer(sql: str) -> None:
+        if sql.lstrip().startswith("SELECT weight FROM hebbian_edges"):
+            other = sqlite3.connect(db, timeout=0, isolation_level=None)
+            try:
+                other.execute("BEGIN IMMEDIATE")
+                other.execute("ROLLBACK")
+                outcome.append("other writer got the lock")
+            except sqlite3.OperationalError as exc:
+                outcome.append(str(exc))
+            finally:
+                other.close()
+
+    real = m._conn
+    m._conn = _ConnProxy(real, on_execute=_try_other_writer)
+    try:
+        m.strengthen("a", "b", delta=0.5)
+    finally:
+        m._conn = real
+    try:
+        assert outcome == ["database is locked"]
+        assert m.weight("a", "b") == 0.5
+    finally:
+        m.close()

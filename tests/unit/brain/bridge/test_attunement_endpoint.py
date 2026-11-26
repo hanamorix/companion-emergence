@@ -6,7 +6,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from brain.attunement.schemas import SCHEMA_VERSION
+from brain import dev_constants
 from brain.bridge.server import build_app
 
 
@@ -149,7 +149,7 @@ def test_endpoint_returns_backfill_state_when_present(tmp_path: Path) -> None:
         "patterns_emitted": 3,
         "status": "complete",
         "last_cursor": "turn_xyz",
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     }
     (attunement_dir / "backfill_state.json").write_text(
         json.dumps(backfill_data), encoding="utf-8"

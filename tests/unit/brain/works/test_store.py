@@ -9,6 +9,7 @@ import pytest
 
 from brain import works
 from brain.works.store import WorksStore
+from tests.thread_support import finish_threads
 
 
 def _w(
@@ -195,6 +196,9 @@ def test_list_recent_returns_empty_on_operational_error(
         def __exit__(self, *a):
             self._conn.__exit__(*a)
 
+        def close(self):
+            self._conn.close()
+
         def execute(self, *a, **kw):
             raise sqlite3.OperationalError("simulated DB corruption")
 
@@ -225,6 +229,9 @@ def test_get_returns_none_on_operational_error(
 
         def __exit__(self, *a):
             self._conn.__exit__(*a)
+
+        def close(self):
+            self._conn.close()
 
         def execute(self, *a, **kw):
             raise sqlite3.OperationalError("simulated DB corruption")
@@ -308,7 +315,7 @@ def test_insert_concurrent_dedup_under_load(tmp_path: Path) -> None:
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=10.0)
+        finish_threads(t)
 
     assert errors == [], f"unexpected errors: {errors[:3]}"
     # Exactly one row in works AND exactly one in works_fts
@@ -335,7 +342,7 @@ def test_works_store_connect_sets_busy_timeout(
 
     def low_default_connect(*args, **kwargs):  # type: ignore[no-untyped-def]
         # Force a tiny default so a missing PRAGMA leaves busy_timeout low.
-        kwargs.setdefault("timeout", 0.001)
+        kwargs["timeout"] = 0.001
         return original_connect(*args, **kwargs)
 
     monkeypatch.setattr(_sqlite3, "connect", low_default_connect)

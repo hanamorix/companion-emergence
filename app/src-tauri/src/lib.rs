@@ -43,7 +43,9 @@ pub struct InitArgs {
     pub voice_template: String,
     pub migrate_from: Option<String>,
     pub force: bool,
-    pub model: String,
+    /// The chat model the user typed in the wizard, or None to keep the install's current setting (the model is
+    /// one install-wide setting the brain owns, so the app never names a default of its own).
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -493,6 +495,63 @@ async fn bridge_healthy(persona: &str) -> bool {
     matches!(req.send().await, Ok(r) if r.status().is_success())
 }
 
+/// How long the app waits for `nell supervisor start` while no engine progress is shown (Audit 2026-05-07 P2-9: without a
+/// bound a hung start would freeze the renderer). The clock stands still while the status shows a live rebuild
+/// (`wait_for_start`); the user otherwise gets `supervisor_start_timeout`.
+const START_TIMEOUT_S: u64 = 60;
+/// How often `ensure_bridge_running` reads the bridge status while it waits for the start command (the app's STATUS_POLL_MS,
+/// useRestartBridge.ts).
+const START_STATUS_POLL_MS: u64 = 5000;
+
+/// The start command did not finish within its budget.
+#[derive(Debug, PartialEq)]
+struct StartWaitTimeout;
+
+/// What one `bridge_status` reading says about a rebuild: `Some(true)` an engine progress record names a live writer,
+/// `Some(false)` the field is there and empty, `None` the reading has no such field (a status read that timed out is
+/// `{"alive": "unknown"}`) so the previous reading stands.
+fn engine_progress_shown(status: &serde_json::Value) -> Option<bool> {
+    status.get("engine_progress").map(|v| !v.is_null())
+}
+
+/// Waits for `run` (the start command), reading the status between steps of `poll`; gives up after `budget` of waiting
+/// that was not spent while engine progress was shown (Engine 6, HR5 part 4, owner S101: the start waits until a rebuild is
+/// finished). Time before the record appears counts. `run` is polled across steps, not restarted, and dropped only when
+/// this gives up (which kills the command, `kill_on_drop`).
+async fn wait_for_start<T, R, S, SF>(
+    budget: std::time::Duration,
+    poll: std::time::Duration,
+    run: R,
+    mut read_status: S,
+) -> Result<T, StartWaitTimeout>
+where
+    R: std::future::Future<Output = T>,
+    S: FnMut() -> SF,
+    SF: std::future::Future<Output = Option<bool>>,
+{
+    tokio::pin!(run);
+    let mut remaining = budget;
+    let mut paused = false;
+    loop {
+        let step = if paused { poll } else { poll.min(remaining) };
+        let began = std::time::Instant::now();
+        if let Ok(done) = tokio::time::timeout(step, &mut run).await {
+            return Ok(done);
+        }
+        // A reading with no field (a timed-out status read) leaves the previous one standing. The step and the read both
+        // count against the budget, unless the reading says a rebuild is running.
+        if let Some(shown) = read_status().await {
+            paused = shown;
+        }
+        if !paused {
+            remaining = remaining.saturating_sub(began.elapsed());
+            if remaining.is_zero() {
+                return Err(StartWaitTimeout);
+            }
+        }
+    }
+}
+
 #[tauri::command]
 async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result<(), String> {
     validate_persona_name(&persona)?;
@@ -504,11 +563,9 @@ async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result
     // start command — it blocks until /health returns 200, so when
     // the subprocess exits we can trust the bridge is up.
     //
-    // Audit 2026-05-07 P2-9: 60s timeout. Without a bound, a hung
-    // Python init / supervisor stall would freeze the Tauri renderer
-    // through `await ensureBridgeRunning(...)` indefinitely. 60s is
-    // generous against typical 5-15s startup; if it triggers, the
-    // user gets `supervisor_start_timeout` instead of a stuck UI.
+    // Bounded by START_TIMEOUT_S of waiting that is not spent on a live
+    // rebuild (see `wait_for_start`); if it triggers, the user gets
+    // `supervisor_start_timeout` instead of a stuck UI.
     let started = std::time::Instant::now();
     let std_cmd = nell_command(&app)?;
     let mut cmd = tokio::process::Command::from(std_cmd);
@@ -517,7 +574,22 @@ async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let output = match tokio::time::timeout(std::time::Duration::from_secs(60), cmd.output()).await
+    let output = match wait_for_start(
+        std::time::Duration::from_secs(START_TIMEOUT_S),
+        std::time::Duration::from_millis(START_STATUS_POLL_MS),
+        cmd.output(),
+        || {
+            let app = app.clone();
+            let persona = persona.clone();
+            async move {
+                match bridge_status(app, persona).await {
+                    Ok(status) => engine_progress_shown(&status),
+                    Err(_) => None,
+                }
+            }
+        },
+    )
+    .await
     {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
@@ -525,7 +597,7 @@ async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result
             record_spawn_failure(&app, "nell supervisor start", None, Some(&msg), started);
             return Err(msg);
         }
-        Err(_) => {
+        Err(StartWaitTimeout) => {
             record_spawn_failure(
                 &app,
                 "nell supervisor start",
@@ -553,46 +625,250 @@ async fn ensure_bridge_running(app: tauri::AppHandle, persona: String) -> Result
 const ERR_MISSING_PID: &str =
     "bridge.json missing pid — restart Companion to re-spawn bridge with pid field";
 
-#[cfg(unix)]
-#[tauri::command]
-async fn force_restart_bridge(app: tauri::AppHandle, persona: String) -> Result<(), String> {
-    let creds = get_bridge_credentials(persona.clone())?;
-    let pid = creds.pid.ok_or_else(|| ERR_MISSING_PID.to_string())?;
-    // SIGKILL by PID. Best-effort — process may have already exited.
-    // ESRCH (process gone) is fine; other errors surface to the user.
-    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-    if rc != 0 {
-        #[cfg(target_os = "macos")]
-        let errno = unsafe { *libc::__error() };
-        #[cfg(all(unix, not(target_os = "macos")))]
-        let errno = unsafe { *libc::__errno_location() };
-        if errno != libc::ESRCH {
-            return Err(format!("SIGKILL pid={} failed: errno {}", pid, errno));
-        }
-    }
-    // 500ms grace period for OS-level reap.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-    ensure_bridge_running(app, persona).await
+// ── #456: the bridge's stop, watched from the app (Q-A, D6, D10, C17, C35, C48) ──
+//
+// The bridge's HTTP listener closes once a stop begins, so the app follows a stop through files the bridge keeps next to
+// bridge.json (written through brain.health.json_io; formats in tests/fixtures/bridge_watcher_files/), and through
+// `nell supervisor status --json`. A record is believed only when its pid + identity token are the ones bridge.json
+// names (a record left by an earlier process is ignored).
+
+const STOP_PROGRESS_FILE: &str = "bridge_stop_progress.json";
+const HARD_EXIT_REQUEST_FILE: &str = "bridge_hard_exit_request.json";
+/// `nell supervisor status --json` budget (the app's STATUS_TIMEOUT_MS, brainRecovery.ts).
+const STATUS_TIMEOUT_MS: u64 = 5000;
+/// The `--timeout` the app passes to `nell supervisor stop --kill` (the hard-exit offer threshold, owner Q1).
+pub(crate) const KILL_TIMEOUT_S: u64 = 180;
+/// One service-manager call inside the kill helper (brain/bridge/kill.py MANAGER_CAP_S).
+pub(crate) const MANAGER_CAP_S: u64 = 15;
+
+/// The kill helper's stated worst case (brain/bridge/kill.py kill_bound_s): the hard-exit wait (unless skipped) + two
+/// manager calls + the kill poll. Used when `status --json` could not be read.
+pub(crate) fn kill_bound_s(timeout_s: u64, skip_hard_exit_request: bool) -> u64 {
+    (if skip_hard_exit_request { 0 } else { timeout_s }) + 2 * MANAGER_CAP_S + timeout_s
 }
 
-#[cfg(windows)]
-#[tauri::command]
-async fn force_restart_bridge(app: tauri::AppHandle, persona: String) -> Result<(), String> {
-    use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{
-        OpenProcess, TerminateProcess, PROCESS_TERMINATE,
-    };
+/// The stop progress record (one golden fixture: tests/fixtures/bridge_watcher_files/progress.json).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BridgeShutdown {
+    #[serde(default)]
+    pub version: Option<u64>,
+    pub pid: i64,
+    #[serde(default)]
+    pub pid_token: Option<String>,
+    #[serde(default)]
+    pub persona: Option<String>,
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub requested_at: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub tasks: Vec<String>,
+    #[serde(default)]
+    pub count: Option<u64>,
+    #[serde(default)]
+    pub updated_at: Option<String>,
+}
 
-    let creds = get_bridge_credentials(persona.clone())?;
-    let pid = creds.pid.ok_or_else(|| ERR_MISSING_PID.to_string())?;
-    unsafe {
-        let handle = OpenProcess(PROCESS_TERMINATE, false, pid as u32)
-            .map_err(|e| format!("OpenProcess pid={} failed: {}", pid, e))?;
-        let result = TerminateProcess(handle, 1);
-        let _ = CloseHandle(handle);
-        result.map_err(|e| format!("TerminateProcess pid={} failed: {}", pid, e))?;
+/// (pid, identity token) of the bridge bridge.json names; None when it names none.
+fn bridge_identity_at(bridge_json: &std::path::Path) -> Option<(i64, Option<String>)> {
+    let raw = std::fs::read_to_string(bridge_json).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let pid = parsed.get("pid").and_then(|v| v.as_i64()).filter(|p| *p > 0)?;
+    let token = parsed
+        .get("pid_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    Some((pid, token))
+}
+
+/// The progress record of the bridge bridge.json names, or None (no stop recorded, or a record of another process).
+fn read_bridge_shutdown_at(dir: &std::path::Path) -> Result<Option<BridgeShutdown>, String> {
+    let path = dir.join(STOP_PROGRESS_FILE);
+    if !path.exists() {
+        return Ok(None);
     }
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let rec: BridgeShutdown =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", STOP_PROGRESS_FILE, e))?;
+    match bridge_identity_at(&dir.join("bridge.json")) {
+        Some((pid, Some(token))) if rec.pid == pid && rec.pid_token.as_deref() == Some(token.as_str()) => {
+            Ok(Some(rec))
+        }
+        _ => Ok(None),
+    }
+}
+
+#[tauri::command]
+fn read_bridge_shutdown(persona: String) -> Result<Option<BridgeShutdown>, String> {
+    read_bridge_shutdown_at(&persona_dir(&persona)?)
+}
+
+/// The error when bridge.json no longer names the bridge the caller is watching (#456 review S8).
+const ERR_BRIDGE_CHANGED: &str = "bridge_changed: another bridge is running now";
+
+/// Write the hard-exit request for the bridge bridge.json names (pid + token), atomically and owner-only. With
+/// `expected` (the bridge the caller is watching), refuse when bridge.json now names another bridge: a request must
+/// never reach a bridge the user was not asked about (review S8).
+fn write_hard_exit_request_at(
+    dir: &std::path::Path,
+    expected: Option<(i64, Option<String>)>,
+) -> Result<(), String> {
+    let (pid, token) =
+        bridge_identity_at(&dir.join("bridge.json")).ok_or_else(|| ERR_MISSING_PID.to_string())?;
+    if let Some((want_pid, want_token)) = expected {
+        if want_pid != pid || want_token != token {
+            return Err(ERR_BRIDGE_CHANGED.to_string());
+        }
+    }
+    let body = serde_json::json!({
+        "version": 1,
+        "pid": pid,
+        "pid_token": token,
+        "requested_at": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string(),
+    });
+    let text = serde_json::to_string_pretty(&body).map_err(|e| format!("encode request: {}", e))?;
+    let tmp = dir.join(format!("{}.tmp-{}", HARD_EXIT_REQUEST_FILE, std::process::id()));
+    std::fs::write(&tmp, text + "\n").map_err(|e| format!("write {}: {}", tmp.display(), e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, dir.join(HARD_EXIT_REQUEST_FILE))
+        .map_err(|e| format!("replace {}: {}", HARD_EXIT_REQUEST_FILE, e))
+}
+
+#[tauri::command]
+fn request_bridge_hard_exit(
+    persona: String,
+    pid: Option<i64>,
+    pid_token: Option<String>,
+) -> Result<(), String> {
+    write_hard_exit_request_at(&persona_dir(&persona)?, pid.map(|p| (p, pid_token)))
+}
+
+/// `nell supervisor status --persona <p> --json` (files and process checks only, no HTTP). A timeout or a failure is
+/// reported as `{"alive": "unknown"}` (the caller keeps waiting).
+#[tauri::command]
+async fn bridge_status(app: tauri::AppHandle, persona: String) -> Result<serde_json::Value, String> {
+    validate_persona_name(&persona)?;
+    let unknown = serde_json::json!({ "alive": "unknown" });
+    let std_cmd = match nell_command(&app) {
+        Ok(c) => c,
+        Err(_) => return Ok(unknown),
+    };
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.args(["supervisor", "status", "--persona", &persona, "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true); // read-only: safe to end on timeout
+    let output = match tokio::time::timeout(
+        std::time::Duration::from_millis(STATUS_TIMEOUT_MS),
+        cmd.output(),
+    )
+    .await
+    {
+        Ok(Ok(out)) if out.status.success() => out,
+        _ => return Ok(unknown),
+    };
+    match serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+        Ok(v) if v.is_object() => Ok(v),
+        _ => Ok(unknown),
+    }
+}
+
+/// `nell supervisor stop --kill` arguments. With `expect` (the bridge the app is watching: pid + identity token), the
+/// helper kills only that bridge and otherwise refuses with `bridge_changed` (#456 review S8, D16 amended).
+pub(crate) fn stop_kill_args(persona: &str, skip_hard_exit_request: bool, expect: Option<(i64, Option<String>)>) -> Vec<String> {
+    let mut args: Vec<String> = ["supervisor", "stop", "--persona", persona, "--kill", "--timeout"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    args.push(KILL_TIMEOUT_S.to_string());
+    if skip_hard_exit_request {
+        args.push("--skip-hard-exit-request".to_string());
+    }
+    if let Some((pid, token)) = expect {
+        args.push("--expect-pid".to_string());
+        args.push(pid.to_string());
+        if let Some(token) = token {
+            args.push("--expect-token".to_string());
+            args.push(token);
+        }
+    }
+    args
+}
+
+/// The app's forced path (D10): `nell supervisor stop --kill` (identity-checked; the bridge and every process it
+/// started), then the normal start (`ensure_bridge_running`, which routes to an installed service in Python). With
+/// `skip_hard_exit_request` (after a hard exit the bridge ignored) the helper does not ask again. The helper runs
+/// WITHOUT kill_on_drop and with a timeout of its stated bound: on that timeout it is left running (never cut off
+/// mid-kill) and the error is shown.
+#[tauri::command]
+async fn force_restart_bridge(
+    app: tauri::AppHandle,
+    persona: String,
+    skip_hard_exit_request: Option<bool>,
+    start_after: Option<bool>,
+    pid: Option<i64>,
+    pid_token: Option<String>,
+) -> Result<(), String> {
+    validate_persona_name(&persona)?;
+    let skip = skip_hard_exit_request.unwrap_or(false);
+    let status = bridge_status(app.clone(), persona.clone())
+        .await
+        .unwrap_or_else(|_| serde_json::json!({ "alive": "unknown" }));
+    let bound_s = status
+        .get("kill_bound_s")
+        .and_then(|v| v.as_f64())
+        .filter(|b| *b > 0.0)
+        .unwrap_or(kill_bound_s(KILL_TIMEOUT_S, skip) as f64);
+    let budget = std::time::Duration::from_secs_f64(bound_s)
+        + std::time::Duration::from_millis(STATUS_TIMEOUT_MS);
+
+    let started = std::time::Instant::now();
+    let std_cmd = nell_command(&app)?;
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.args(stop_kill_args(&persona, skip, pid.map(|p| (p, pid_token))));
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = cmd.spawn().map_err(|e| {
+        let msg = format!("spawn nell supervisor stop --kill: {}", e);
+        record_spawn_failure(&app, "nell supervisor stop --kill", None, Some(&msg), started);
+        msg
+    })?;
+    let output = match tokio::time::timeout(budget, child.wait_with_output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(format!("nell supervisor stop --kill: {}", e)),
+        Err(_) => {
+            // Left running on purpose: a kill cut off half-way could leave frozen processes behind.
+            record_spawn_failure(
+                &app,
+                "nell supervisor stop --kill",
+                None,
+                Some("force_restart_timeout"),
+                started,
+            );
+            return Err(
+                "force_restart_timeout: the bridge is still being stopped; try again in a moment".to_string(),
+            );
+        }
+    };
+    if !output.status.success() {
+        record_spawn_failure(&app, "nell supervisor stop --kill", Some(&output), None, started);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Err(format!(
+            "supervisor stop --kill failed (exit {}): {}",
+            output.status.code().unwrap_or(-1),
+            if stderr.trim().is_empty() { stdout.trim() } else { stderr.trim() }
+        ));
+    }
+    // #456 review M4: a service install only needs the bridge ended; the app starts it after the install.
+    if !start_after.unwrap_or(true) {
+        return Ok(());
+    }
     ensure_bridge_running(app, persona).await
 }
 
@@ -918,7 +1194,7 @@ const BRAIN_LOGIN_STATUS_TIMEOUT_SECS: u64 = 15;
 const BRAIN_LOGIN_START_TIMEOUT_SECS: u64 = 30;
 
 /// Build the argv for `nell init`. Extracted so argument construction
-/// (especially the always-present `--model`) is covered by a unit test,
+/// (especially `--model`, present only when the user chose one) is covered by a unit test,
 /// mirroring `build_service_install_args`. `--user-name` stays optional;
 /// `run_init` closes stdin so any unfilled prompt EOFs to its default.
 fn build_init_args(args: &InitArgs) -> Vec<String> {
@@ -939,8 +1215,10 @@ fn build_init_args(args: &InitArgs) -> Vec<String> {
     } else {
         v.push("--fresh".to_string());
     }
-    v.push("--model".to_string());
-    v.push(args.model.clone());
+    if let Some(model) = &args.model {
+        v.push("--model".to_string());
+        v.push(model.clone());
+    }
     if args.force {
         v.push("--force".to_string());
     }
@@ -1160,94 +1438,272 @@ async fn install_supervisor_service_impl(
     })
 }
 
-/// Install a symlink at ``~/.local/bin/nell`` pointing at the bundled CLI.
+/// Put a `nell` command on the user's PATH (#408). The command name stays
+/// `install_nell_cli_symlink` for the frontend; the mechanism depends on the install:
 ///
-/// Lets the user run ``nell ...`` from their terminal without having to
-/// type the full ``/Applications/Companion Emergence.app/Contents/...``
-/// path. Mirrors the install-shape of ``install_supervisor_service``:
-/// idempotent, AppTranslocation-guarded, surfaces a structured result the
-/// frontend can format inline.
+/// * macOS and Linux .deb: a symlink at `~/.local/bin/nell` pointing at the bundled CLI
+///   ([`install_symlink_to`], unchanged). A user's own `nell` (file or symlink) is never
+///   overwritten (Linux #409, macOS #413).
+/// * Linux AppImage: a small script at `~/.local/bin/nell` that runs the AppImage in CLI mode
+///   (`--companion-nell-cli`), which hands off to the bundled `nell` before the GUI starts. The
+///   script is refreshed on every app launch in case the AppImage moved.
+/// * Windows: `nell.cmd` in `%LOCALAPPDATA%\CompanionEmergence\bin` calling the bundled
+///   `nell.bat`, and that folder added once to the user PATH (HKCU).
+/// * An AppImage running without FUSE gets no shortcut and an explanation (owner-ruled).
 ///
-/// `~/.local/bin` is the right target because:
-/// 1. It's user-owned — no sudo prompt, no privileged helper.
-/// 2. Anthropic's ``claude`` installer drops binaries there too, so a
-///    user running this app already has the directory and (almost
-///    certainly) has it on PATH.
-/// 3. It matches the launchd flow's "no escalation" posture.
-///
-/// Behaviour at the target:
-/// * Doesn't exist  → write the symlink.
-/// * Existing symlink pointing at our bundled path → no-op success.
-/// * Existing symlink pointing elsewhere → overwrite (covers app moved /
-///   reinstalled at a different location).
-/// * Existing regular file → refuse with `exit_code=73`. We don't clobber
-///   a user-installed ``nell`` (e.g. ``pip install --user``).
-///
-/// macOS-only for now; Linux desktops have similar layout but the path
-/// validation needs different unstable-path checks (no AppTranslocation,
-/// no /Volumes-shaped DMGs) so we'll add Linux when there's a Linux
-/// `.app` shape to validate against.
+/// Which mechanism applies is decided by the pure `nell_shortcut::plan_shortcut`; this command only
+/// gathers the environment and executes the plan.
 #[tauri::command]
-#[cfg(target_os = "macos")]
 async fn install_nell_cli_symlink(app: tauri::AppHandle) -> Result<InitResult, String> {
-    let bundled = match bundled_nell_path(&app)? {
-        Some(p) => p,
-        None => {
-            return Ok(InitResult {
-                success: false,
-                stdout: String::new(),
-                stderr: "Bundled nell CLI not found in this build. Install from a release DMG."
-                    .to_string(),
-                exit_code: 78,
-            })
-        }
-    };
-
-    if let Some(reason) = unstable_macos_app_path_reason(&bundled) {
-        return Ok(InitResult {
-            success: false,
-            stdout: String::new(),
-            stderr: reason,
-            exit_code: 78,
-        });
-    }
-
-    let home = match std::env::var("HOME") {
-        Ok(h) => PathBuf::from(h),
-        Err(_) => {
-            return Ok(InitResult {
-                success: false,
-                stdout: String::new(),
-                stderr: "HOME env var not set; cannot resolve ~/.local/bin".to_string(),
-                exit_code: 78,
-            })
-        }
-    };
-    let target_dir = home.join(".local").join("bin");
-    let target = target_dir.join("nell");
-    install_symlink_to(&bundled, &target_dir, &target)
+    let bundled = bundled_nell_path(&app)?;
+    let plan = nell_shortcut::plan_shortcut(&shortcut_env(bundled));
+    run_plan(plan).await
 }
 
-/// Non-macOS stub. The Linux + Windows builds compile this; macOS uses
-/// the real implementation above. Returns the unsupported result the
-/// frontend already renders inline. The Linux story (~/.local/bin/nell
-/// from the AppImage / .deb) is achievable but layout-specific
-/// validation differs from macOS — defer to a separate landing.
-///
-/// `#[tauri::command]` is on both halves so `generate_handler!` finds
-/// the companion macros (`__cmd__install_nell_cli_symlink`,
-/// `__tauri_command_name_install_nell_cli_symlink`) on every target.
-#[tauri::command]
-#[cfg(not(target_os = "macos"))]
-#[allow(unused_variables)]
-async fn install_nell_cli_symlink(app: tauri::AppHandle) -> Result<InitResult, String> {
-    Ok(InitResult {
+/// Gather the facts `plan_shortcut` needs. `APPDIR` is canonicalised (the form Tauri's resource dir
+/// uses), so a TMPDIR behind a symlink does not look like a foreign layout.
+fn shortcut_env(bundled: Option<PathBuf>) -> nell_shortcut::ShortcutEnv {
+    let os = nell_shortcut::current_os();
+    let lookup = |key: &str| std::env::var_os(key);
+    let macos_reason = if os == nell_shortcut::Os::MacOs {
+        bundled.as_ref().and_then(|b| unstable_macos_app_path_reason(b))
+    } else {
+        None
+    };
+    let mut env = nell_shortcut::ShortcutEnv::from_lookup(os, &lookup, bundled, macos_reason);
+    env.appdir = env.appdir.map(|d| d.canonicalize().unwrap_or(d));
+    env
+}
+
+#[cfg(windows)]
+async fn run_plan(plan: nell_shortcut::ShortcutPlan) -> Result<InitResult, String> {
+    // The registry and window-broadcast calls block; keep them off the async workers.
+    tokio::task::spawn_blocking(move || execute_plan(&plan))
+        .await
+        .map_err(|e| format!("shortcut task failed: {}", e))
+}
+
+#[cfg(not(windows))]
+async fn run_plan(plan: nell_shortcut::ShortcutPlan) -> Result<InitResult, String> {
+    Ok(execute_plan(&plan))
+}
+
+fn init_result_from(o: nell_shortcut::Outcome) -> InitResult {
+    InitResult { success: o.success, stdout: o.stdout, stderr: o.stderr, exit_code: o.exit_code }
+}
+
+fn unsupported_result(message: &str) -> InitResult {
+    InitResult {
         success: false,
         stdout: String::new(),
-        stderr: "nell-CLI symlink install is currently macOS-only".to_string(),
+        stderr: message.to_string(),
         exit_code: 78,
+    }
+}
+
+/// Carry out a plan. Unavailable plans become the exit-78 result the frontend renders inline.
+fn execute_plan(plan: &nell_shortcut::ShortcutPlan) -> InitResult {
+    use nell_shortcut::ShortcutPlan;
+    match plan {
+        ShortcutPlan::Unavailable { reason } => unsupported_result(reason),
+        ShortcutPlan::Symlink { bundled, target_dir, target } => {
+            execute_symlink(bundled, target_dir, target)
+        }
+        ShortcutPlan::AppImageScript { appimage, target_dir, target } => {
+            execute_script(appimage, target_dir, target)
+        }
+        ShortcutPlan::WindowsCmd { bundled, cmd_dir, cmd_path, win_prefixes } => {
+            execute_windows(bundled, cmd_dir, cmd_path, win_prefixes)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn execute_symlink(
+    bundled: &std::path::Path,
+    target_dir: &std::path::Path,
+    target: &std::path::Path,
+) -> InitResult {
+    // Never replace a user's own nell (a file, or a symlink that doesn't point at a bundled
+    // runtime). Linux since #409, macOS since #413.
+    if let Err(outcome) = nell_shortcut::prepare_linux_symlink(target, bundled) {
+        return init_result_from(outcome);
+    }
+    install_symlink_to(bundled, target_dir, target).unwrap_or_else(|e| InitResult {
+        success: false,
+        stdout: String::new(),
+        stderr: e,
+        exit_code: 1,
     })
 }
+
+#[cfg(not(unix))]
+fn execute_symlink(
+    _bundled: &std::path::Path,
+    _target_dir: &std::path::Path,
+    _target: &std::path::Path,
+) -> InitResult {
+    unsupported_result("The nell shortcut is not supported on this platform.")
+}
+
+#[cfg(unix)]
+fn execute_script(
+    appimage: &std::path::Path,
+    target_dir: &std::path::Path,
+    target: &std::path::Path,
+) -> InitResult {
+    let nell_path = match std::env::current_exe() {
+        Ok(exe) => nell_shortcut::derive_cli_nell_path(&exe),
+        Err(e) => return unsupported_result(&format!("cannot locate the running app: {}", e)),
+    };
+    init_result_from(nell_shortcut::install_script_shim(
+        target_dir,
+        target,
+        appimage,
+        appimage.is_file(),
+        &nell_path,
+    ))
+}
+
+#[cfg(not(unix))]
+fn execute_script(
+    _appimage: &std::path::Path,
+    _target_dir: &std::path::Path,
+    _target: &std::path::Path,
+) -> InitResult {
+    unsupported_result("The nell shortcut is not supported on this platform.")
+}
+
+#[cfg(windows)]
+fn execute_windows(
+    bundled: &std::path::Path,
+    cmd_dir: &std::path::Path,
+    cmd_path: &std::path::Path,
+    win_prefixes: &[(String, String)],
+) -> InitResult {
+    init_result_from(nell_shortcut::install_windows_cmd(
+        bundled,
+        cmd_dir,
+        cmd_path,
+        win_prefixes,
+        "Environment",
+    ))
+}
+
+#[cfg(not(windows))]
+fn execute_windows(
+    _bundled: &std::path::Path,
+    _cmd_dir: &std::path::Path,
+    _cmd_path: &std::path::Path,
+    _win_prefixes: &[(String, String)],
+) -> InitResult {
+    unsupported_result("The nell shortcut is not supported on this platform.")
+}
+
+/// On every app launch, refresh a shortcut that was installed earlier: the AppImage may have moved
+/// (Linux) or the install folder may have changed (Windows). Never creates a shortcut, never touches
+/// a file that is not ours, never edits the PATH, and never blocks startup.
+fn refresh_shortcut_on_launch(app: &tauri::AppHandle) {
+    let bundled = match bundled_nell_path(app) {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    let plan = nell_shortcut::plan_shortcut(&shortcut_env(bundled.clone()));
+    refresh_plan(&plan, bundled.as_deref());
+}
+
+/// Record a shortcut-refresh problem where a user or a bug report can find it: the app's launch
+/// log (`$KINDLED_HOME/launch-failures.log`, the same file spawn failures use), plus stderr for
+/// terminal runs. Best-effort: a read-only home must never affect startup. A Windows release build
+/// has no console, so stderr alone would be invisible.
+fn log_shortcut_problem(detail: &str, bundled: Option<&std::path::Path>) {
+    eprintln!("nell shortcut: {}", detail);
+    let home = match nellbrain_home() {
+        Ok(h) => h,
+        Err(_) => return,
+    };
+    let failure = launch_log::LaunchFailure {
+        command: "nell-shortcut-refresh".to_string(),
+        exit_code: None,
+        stdout_tail: String::new(),
+        stderr_tail: detail.to_string(),
+        platform: std::env::consts::OS.to_string(),
+        platform_version: std::env::consts::ARCH.to_string(),
+        bundled_runtime_path: bundled.map(|p| p.to_string_lossy().into_owned()),
+        runtime_path_exists: bundled.map(|p| p.exists()).unwrap_or(false),
+        duration_ms: 0,
+    };
+    let _ = launch_log::append_failure(&home, &failure);
+}
+
+#[cfg(unix)]
+fn refresh_plan(plan: &nell_shortcut::ShortcutPlan, bundled: Option<&std::path::Path>) {
+    if let nell_shortcut::ShortcutPlan::AppImageScript { appimage, target, .. } = plan {
+        // Nothing to refresh (and nothing worth logging) unless OUR shim was installed earlier: a
+        // user's own `nell` at this path must stay silent.
+        if !nell_shortcut::is_our_shim_file(target) {
+            return;
+        }
+        let derived = match std::env::current_exe() {
+            Ok(exe) => nell_shortcut::derive_cli_nell_path(&exe),
+            Err(_) => return,
+        };
+        if !derived.exists() {
+            log_shortcut_problem(
+                &format!(
+                    "expected the bundled nell at {} but it is missing; the shortcut was not refreshed",
+                    derived.display()
+                ),
+                bundled,
+            );
+            return;
+        }
+        // Defence in depth: the CLI mode finds nell by this layout rule, Tauri by its own resolver.
+        if let Some(b) = bundled {
+            let same = match (derived.canonicalize(), b.canonicalize()) {
+                (Ok(d), Ok(t)) => d == t,
+                _ => true, // cannot compare: do not raise a false alarm
+            };
+            if !same {
+                log_shortcut_problem(
+                    &format!(
+                        "layout mismatch: CLI mode would run {} but the app resolves its runtime at {}",
+                        derived.display(),
+                        b.display()
+                    ),
+                    bundled,
+                );
+            }
+        }
+        if let Ok(text) = nell_shortcut::render_appimage_script(appimage) {
+            let outcome = nell_shortcut::refresh_shim_at(target, &text);
+            if !outcome.success {
+                log_shortcut_problem(&format!("refresh failed: {}", outcome.stderr), bundled);
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+fn refresh_plan(plan: &nell_shortcut::ShortcutPlan, _bundled: Option<&std::path::Path>) {
+    if let nell_shortcut::ShortcutPlan::WindowsCmd { bundled, cmd_path, win_prefixes, .. } = plan {
+        if !nell_shortcut::is_our_shim_file(cmd_path) {
+            return; // never installed, or not our file: nothing to refresh
+        }
+        match nell_shortcut::render_windows_cmd(&bundled.to_string_lossy(), win_prefixes) {
+            Ok(text) => {
+                let outcome = nell_shortcut::refresh_cmd_at(cmd_path, &text);
+                if !outcome.success {
+                    log_shortcut_problem(&format!("refresh failed: {}", outcome.stderr), Some(bundled.as_path()));
+                }
+            }
+            Err(e) => log_shortcut_problem(&format!("refresh skipped: {}", e), Some(bundled.as_path())),
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn refresh_plan(_plan: &nell_shortcut::ShortcutPlan, _bundled: Option<&std::path::Path>) {}
 
 /// Pure file-system half of [`install_nell_cli_symlink`]. Extracted so
 /// the FS branches can be unit-tested against tempdirs without spinning
@@ -1257,8 +1713,8 @@ async fn install_nell_cli_symlink(app: tauri::AppHandle) -> Result<InitResult, S
 /// On `success=true`, `stdout` holds the user-facing summary; on
 /// `success=false`, `stderr` holds the error text the frontend renders.
 ///
-/// Unix-only — uses [`std::os::unix::fs::symlink`]. The Windows build
-/// stops at the [`install_nell_cli_symlink`] non-macos stub; this
+/// Unix-only — uses [`std::os::unix::fs::symlink`]. Windows uses a
+/// `nell.cmd` shortcut instead (see [`install_nell_cli_symlink`]); this
 /// helper isn't compiled there.
 #[cfg(unix)]
 fn install_symlink_to(
@@ -1363,12 +1819,7 @@ fn path_hint(target_dir: &std::path::Path) -> String {
             std::env::split_paths(&p).any(|entry| entry == target_dir)
         })
         .unwrap_or(false);
-    if on_path {
-        "Open a new Terminal window and run `nell --version`.".to_string()
-    } else {
-        "If `nell` isn't found in Terminal, add `export PATH=\"$HOME/.local/bin:$PATH\"` \
-         to your shell rc (~/.zshrc) and reload.".to_string()
-    }
+    nell_shortcut::path_hint_text(nell_shortcut::current_os(), on_path)
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1864,6 +2315,10 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(BrainLoginState::default())
+        .setup(|app| {
+            refresh_shortcut_on_launch(app.handle());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_bridge_credentials,
             read_app_config,
@@ -1871,6 +2326,9 @@ pub fn run() {
             list_personas,
             ensure_bridge_running,
             force_restart_bridge,
+            read_bridge_shutdown,
+            request_bridge_hard_exit,
+            bridge_status,
             run_init,
             run_migrate,
             preflight_existing_ce,
@@ -1992,16 +2450,32 @@ mod tests {
             voice_template: "default".into(),
             migrate_from: None,
             force: false,
-            model: "sonnet".into(),
+            model: Some("opus".into()),
         };
         let argv = build_init_args(&args);
         assert_eq!(argv[0], "init");
         assert!(argv.windows(2).any(|w| w == ["--persona", "nell"]));
-        assert!(argv.windows(2).any(|w| w == ["--model", "sonnet"]));
+        assert_eq!(argv.iter().filter(|a| a.as_str() == "--model").count(), 1);
+        assert!(argv.windows(2).any(|w| w == ["--model", "opus"]));
         assert!(argv.windows(2).any(|w| w == ["--voice-template", "default"]));
         assert!(argv.windows(2).any(|w| w == ["--user-pronouns", "they/them"]));
         assert!(argv.iter().any(|a| a == "--fresh"));
         assert!(!argv.iter().any(|a| a == "--force"));
+    }
+
+    #[test]
+    fn build_init_args_has_no_model_flag_when_none_was_chosen() {
+        let args = InitArgs {
+            persona: "nell".into(),
+            user_name: None,
+            user_pronouns: None,
+            voice_template: "default".into(),
+            migrate_from: None,
+            force: false,
+            model: None,
+        };
+        let argv = build_init_args(&args);
+        assert!(!argv.iter().any(|a| a == "--model"));
     }
 
     #[test]
@@ -2013,7 +2487,7 @@ mod tests {
             voice_template: "default".into(),
             migrate_from: Some("/tmp/og".into()),
             force: true,
-            model: "opus".into(),
+            model: None,
         };
         let argv = build_init_args(&args);
         assert!(argv.windows(2).any(|w| w == ["--migrate-from", "/tmp/og"]));
@@ -2063,9 +2537,8 @@ mod tests {
 
     // ── install_symlink_to — Phase 1.A ────────────────────────────────────
     // Unix-only: install_symlink_to is itself #[cfg(unix)] because it
-    // uses std::os::unix::fs::symlink. Windows builds compile only the
-    // non-macos stub of install_nell_cli_symlink and don't have these
-    // helpers at all.
+    // uses std::os::unix::fs::symlink. Windows builds use the nell.cmd
+    // shortcut instead and don't have these helpers at all.
 
     #[cfg(unix)]
     #[test]
@@ -2147,6 +2620,30 @@ mod tests {
         // Regular file untouched.
         let body = std::fs::read_to_string(&target).unwrap();
         assert!(body.starts_with("#!/usr/bin/env python"));
+    }
+
+    // #413: the shortcut step must not replace a user's own `nell` symlink (for example
+    // one into a source checkout) on any Unix, macOS included. Exit 73, link untouched.
+    #[cfg(unix)]
+    #[test]
+    fn execute_symlink_refuses_to_replace_a_foreign_symlink() {
+        let dir = tempdir().unwrap();
+        let bundled = dir.path().join("app/python-runtime/bin/nell");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, "x").unwrap();
+        let theirs = dir.path().join("src/companion-emergence/.venv/bin/nell");
+        std::fs::create_dir_all(theirs.parent().unwrap()).unwrap();
+        std::fs::write(&theirs, "x").unwrap();
+
+        let target_dir = dir.path().join("home/.local/bin");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let target = target_dir.join("nell");
+        std::os::unix::fs::symlink(&theirs, &target).unwrap();
+
+        let r = execute_symlink(&bundled, &target_dir, &target);
+        assert!(!r.success, "expected refusal: {:?}", r);
+        assert_eq!(r.exit_code, 73);
+        assert_eq!(std::fs::read_link(&target).unwrap(), theirs);
     }
 
     #[cfg(unix)]
@@ -2389,36 +2886,37 @@ mod tests {
     fn list_personas_at_reports_memories_db_and_recency_sort() {
         let dir = tempdir().unwrap();
         let personas = dir.path().join("personas");
-        // phoebe: has memories.db + a recent last_opened_at
-        fs::create_dir_all(personas.join("phoebe")).unwrap();
-        write(&personas.join("phoebe").join("memories.db"), "");
+        // canary: has memories.db + an older last_opened_at (alphabetically first, so a sort by name would put it
+        // first and fail the order below: the recency check bites)
+        fs::create_dir_all(personas.join("canary")).unwrap();
+        write(&personas.join("canary").join("memories.db"), "");
         write(
-            &personas.join("phoebe").join("persona_config.json"),
-            r#"{"last_opened_at": "2026-05-23T09:00:00Z"}"#,
+            &personas.join("canary").join("persona_config.json"),
+            r#"{"last_opened_at": "2026-05-22T09:00:00Z"}"#,
         );
-        // nell: has memories.db + an older last_opened_at
+        // nell: has memories.db + a recent last_opened_at
         fs::create_dir_all(personas.join("nell")).unwrap();
         write(&personas.join("nell").join("memories.db"), "");
         write(
             &personas.join("nell").join("persona_config.json"),
-            r#"{"last_opened_at": "2026-05-22T09:00:00Z"}"#,
+            r#"{"last_opened_at": "2026-05-23T09:00:00Z"}"#,
         );
         // broken: no memories.db, no config
         fs::create_dir_all(personas.join("broken")).unwrap();
 
         let summaries = list_personas_at(&personas).unwrap();
         let names: Vec<String> = summaries.iter().map(|s| s.name.clone()).collect();
-        // phoebe (most recent) → nell (older) → broken (no timestamp, name asc last)
+        // nell (most recent) → canary (older) → broken (no timestamp, name asc last)
         assert_eq!(
             names,
-            vec!["phoebe".to_string(), "nell".to_string(), "broken".to_string()]
+            vec!["nell".to_string(), "canary".to_string(), "broken".to_string()]
         );
         let broken = summaries.iter().find(|s| s.name == "broken").unwrap();
         assert!(!broken.has_memories_db);
         assert!(broken.last_opened_at.is_none());
-        let phoebe = summaries.iter().find(|s| s.name == "phoebe").unwrap();
-        assert!(phoebe.has_memories_db);
-        assert_eq!(phoebe.last_opened_at.as_deref(), Some("2026-05-23T09:00:00Z"));
+        let canary = summaries.iter().find(|s| s.name == "canary").unwrap();
+        assert!(canary.has_memories_db);
+        assert_eq!(canary.last_opened_at.as_deref(), Some("2026-05-22T09:00:00Z"));
     }
 
     #[test]
@@ -2568,5 +3066,334 @@ mod kindled_home_tests {
                 assert_eq!(home, std::path::PathBuf::from("/tmp/nell-test"));
             },
         );
+    }
+
+    // ── nell shortcut command wiring (#408) ──────────────────────────────
+
+    /// C29: an AppImage running without FUSE gets no shortcut and the exact explanation, and
+    /// nothing is written under HOME.
+    #[cfg(unix)]
+    #[test]
+    fn no_fuse_appimage_gets_the_explanation_and_nothing_is_written() {
+        let home = tempfile::tempdir().unwrap();
+        let env = nell_shortcut::ShortcutEnv {
+            os: nell_shortcut::Os::Linux,
+            bundled: Some(PathBuf::from(
+                "/tmp/appimage_extracted_0123abcd/usr/lib/Companion Emergence/python-runtime/bin/nell",
+            )),
+            home: Some(home.path().to_path_buf()),
+            local_app_data: None,
+            appimage: Some(PathBuf::from("/home/u/CE.AppImage")),
+            appdir: Some(PathBuf::from("/tmp/appimage_extracted_0123abcd")),
+            macos_unstable_reason: None,
+            win_prefixes: vec![],
+        };
+        let result = execute_plan(&nell_shortcut::plan_shortcut(&env));
+        assert!(!result.success);
+        assert_eq!(result.exit_code, 78);
+        assert_eq!(result.stderr, nell_shortcut::NO_FUSE_MESSAGE);
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+    }
+
+    /// Unavailable plans keep the exit-78 shape the frontend renders inline.
+    #[test]
+    fn unavailable_plan_is_an_exit_78_result() {
+        let r = execute_plan(&nell_shortcut::ShortcutPlan::Unavailable { reason: "because".to_string() });
+        assert!(!r.success);
+        assert_eq!(r.exit_code, 78);
+        assert_eq!(r.stderr, "because");
+        assert!(r.stdout.is_empty());
+    }
+
+    /// Linux deb path through the real command code: a user's own `nell` is never overwritten, a
+    /// fresh target gets the symlink. macOS runs the same check since #413
+    /// (`execute_symlink_refuses_to_replace_a_foreign_symlink`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_symlink_refuses_a_users_own_nell_and_links_when_free() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundled = tmp.path().join("usr/lib/Companion Emergence/python-runtime/bin/nell");
+        std::fs::create_dir_all(bundled.parent().unwrap()).unwrap();
+        std::fs::write(&bundled, "#!/bin/sh\nexit 0\n").unwrap();
+        let target_dir = tmp.path().join("home/.local/bin");
+        let target = target_dir.join("nell");
+
+        let ok = execute_symlink(&bundled, &target_dir, &target);
+        assert!(ok.success, "{:?}", ok.stderr);
+        assert_eq!(std::fs::read_link(&target).unwrap(), bundled);
+
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&target, "my own nell").unwrap();
+        let refused = execute_symlink(&bundled, &target_dir, &target);
+        assert!(!refused.success);
+        assert_eq!(refused.exit_code, 73);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "my own nell");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// #456 — the stop watched from the app: golden fixtures (C48), the record checks (C43 a), the forced path (C35)
+// ────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod bridge_stop_tests {
+    use super::*;
+
+    fn fixture(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join("fixtures")
+            .join("bridge_watcher_files")
+            .join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {}", path.display(), e))
+    }
+
+    const TOKEN: &str = "linux:0b9c2f4e-1111-2222-3333-444455556666:4242:123456";
+
+    fn bridge_json(dir: &std::path::Path, token: &str) {
+        std::fs::write(
+            dir.join("bridge.json"),
+            format!(r#"{{"port": 5000, "auth_token": "t", "pid": 4242, "pid_token": "{}"}}"#, token),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn progress_fixture_parses() {
+        let rec: BridgeShutdown = serde_json::from_str(&fixture("progress.json")).unwrap();
+        assert_eq!(rec.pid, 4242);
+        assert_eq!(rec.pid_token.as_deref(), Some(TOKEN));
+        assert_eq!(rec.tasks, vec!["background job: compaction", "chat reply"]);
+        assert_eq!(rec.count, Some(2));
+        assert_eq!(rec.reason.as_deref(), Some("user_stop"));
+        assert_eq!(rec.phase.as_deref(), Some("stopping"));
+    }
+
+    #[test]
+    fn stop_intent_and_request_fixtures_parse() {
+        for name in ["stop_intent_pending.json", "stop_intent_committed.json", "hard_exit_request.json"] {
+            let v: serde_json::Value = serde_json::from_str(&fixture(name)).unwrap();
+            assert_eq!(v.get("pid").and_then(|p| p.as_i64()), Some(4242), "{}", name);
+            assert_eq!(v.get("pid_token").and_then(|p| p.as_str()), Some(TOKEN), "{}", name);
+        }
+        let committed: serde_json::Value = serde_json::from_str(&fixture("stop_intent_committed.json")).unwrap();
+        assert_eq!(committed.get("state").and_then(|s| s.as_str()), Some("committed"));
+    }
+
+    #[test]
+    fn status_fixture_carries_the_kill_bound_the_formula_gives() {
+        let v: serde_json::Value = serde_json::from_str(&fixture("status.json")).unwrap();
+        let bound = v.get("kill_bound_s").and_then(|b| b.as_f64()).unwrap();
+        assert_eq!(bound as u64, kill_bound_s(KILL_TIMEOUT_S, false));
+        assert_eq!(kill_bound_s(KILL_TIMEOUT_S, true), 2 * MANAGER_CAP_S + KILL_TIMEOUT_S);
+        assert_eq!(v.get("alive").and_then(|a| a.as_str()), Some("alive"));
+        assert!(v.get("stop_intent").and_then(|i| i.get("state")).is_some());
+    }
+
+    #[test]
+    fn a_progress_record_is_read_only_for_the_bridge_bridge_json_names() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(dir.path().join(STOP_PROGRESS_FILE), fixture("progress.json")).unwrap();
+        bridge_json(dir.path(), TOKEN);
+        let rec = read_bridge_shutdown_at(dir.path()).unwrap();
+        assert!(rec.is_some());
+        bridge_json(dir.path(), "linux:other:4242:1");
+        assert!(read_bridge_shutdown_at(dir.path()).unwrap().is_none());
+        std::fs::write(dir.path().join("bridge.json"), r#"{"port": 5000, "pid": 4242}"#).unwrap();
+        assert!(read_bridge_shutdown_at(dir.path()).unwrap().is_none()); // a pre-PR bridge has no record
+    }
+
+    #[test]
+    fn hard_exit_request_names_the_current_bridge() {
+        let dir = tempfile::TempDir::new().unwrap();
+        bridge_json(dir.path(), TOKEN);
+        write_hard_exit_request_at(dir.path(), None).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join(HARD_EXIT_REQUEST_FILE)).unwrap()).unwrap();
+        let fx: serde_json::Value = serde_json::from_str(&fixture("hard_exit_request.json")).unwrap();
+        let keys = |x: &serde_json::Value| {
+            let mut k: Vec<String> = x.as_object().unwrap().keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&v), keys(&fx));
+        assert_eq!(v.get("pid").and_then(|p| p.as_i64()), Some(4242));
+        assert_eq!(v.get("pid_token").and_then(|p| p.as_str()), Some(TOKEN));
+        let empty = tempfile::TempDir::new().unwrap();
+        assert_eq!(write_hard_exit_request_at(empty.path(), None).unwrap_err(), ERR_MISSING_PID);
+    }
+
+    #[test]
+    fn hard_exit_request_refuses_when_another_bridge_is_named_now() {
+        // #456 review S8: the app watched bridge 4242 + TOKEN; bridge.json now names another bridge.
+        let dir = tempfile::TempDir::new().unwrap();
+        bridge_json(dir.path(), "linux:0b9c2f4e-1111-2222-3333-444455556666:4242:999999");
+        let err = write_hard_exit_request_at(dir.path(), Some((4242, Some(TOKEN.to_string())))).unwrap_err();
+        assert_eq!(err, ERR_BRIDGE_CHANGED);
+        assert!(!dir.path().join(HARD_EXIT_REQUEST_FILE).exists());
+        bridge_json(dir.path(), TOKEN);
+        write_hard_exit_request_at(dir.path(), Some((4242, Some(TOKEN.to_string())))).unwrap();
+        assert!(dir.path().join(HARD_EXIT_REQUEST_FILE).exists());
+    }
+
+    #[test]
+    fn stop_kill_args_pass_the_watched_bridge() {
+        // #456 review S8: the helper is told which bridge it may kill.
+        let with_pin = stop_kill_args("nell", true, Some((4242, Some(TOKEN.to_string()))));
+        assert_eq!(
+            with_pin,
+            vec![
+                "supervisor", "stop", "--persona", "nell", "--kill", "--timeout", "180",
+                "--skip-hard-exit-request", "--expect-pid", "4242", "--expect-token", TOKEN,
+            ]
+        );
+        let no_pin = stop_kill_args("nell", false, None);
+        assert_eq!(no_pin, vec!["supervisor", "stop", "--persona", "nell", "--kill", "--timeout", "180"]);
+        assert!(!no_pin.iter().any(|a| a.starts_with("--expect")));
+    }
+
+    #[test]
+    fn force_restart_runs_the_kill_helper_and_never_kills_by_pid_itself() {
+        // C35: the forced path is `nell supervisor stop --kill`; no direct signal or TerminateProcess anywhere here.
+        let src = include_str!("lib.rs");
+        let start = src.find("async fn force_restart_bridge(").unwrap();
+        let body = &src[start..start + src[start..].find("\n}\n").unwrap()];
+        assert!(body.contains("stop_kill_args("));
+        assert!(stop_kill_args("p", false, None).contains(&"--kill".to_string()));
+        assert!(!body.contains("kill_on_drop"));
+        let direct_kill = concat!("libc::", "kill(");
+        let terminate = concat!("Terminate", "Process(");
+        assert!(!src.contains(direct_kill));
+        assert!(!src.contains(terminate));
+    }
+
+    // ── wait_for_start (Engine 6, HR5 part 4): millisecond budgets, every wait bounded by an outer 5 s timeout ──
+
+    const T_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+    const T_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+    /// A status reader that answers the scripted readings in order and then repeats the last one.
+    fn scripted(
+        readings: Vec<Option<bool>>,
+    ) -> impl FnMut() -> std::future::Ready<Option<bool>> {
+        let mut i = 0;
+        move || {
+            let r = readings
+                .get(i)
+                .copied()
+                .unwrap_or_else(|| readings.last().copied().flatten());
+            i += 1;
+            std::future::ready(r)
+        }
+    }
+
+    /// Runs `wait_for_start` with `run`; the outer timeout turns a hang into a failed test.
+    async fn waited<T>(
+        run: impl std::future::Future<Output = T>,
+        readings: Vec<Option<bool>>,
+    ) -> (Result<T, StartWaitTimeout>, std::time::Duration) {
+        let began = std::time::Instant::now();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_start(T_BUDGET, T_POLL, run, scripted(readings)),
+        )
+        .await
+        .expect("wait_for_start never returned (bounded fallback)");
+        (result, began.elapsed())
+    }
+
+    async fn finishes_after(ms: u64) -> u8 {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        7
+    }
+
+    #[test]
+    fn engine_progress_shown_reads_the_field() {
+        assert_eq!(engine_progress_shown(&serde_json::json!({"engine_progress": {"phase": "rebuilding"}})), Some(true));
+        assert_eq!(engine_progress_shown(&serde_json::json!({"engine_progress": null})), Some(false));
+        assert_eq!(engine_progress_shown(&serde_json::json!({"alive": "unknown"})), None);
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_returns_the_commands_result() {
+        let (r, _) = waited(finishes_after(0), vec![Some(false)]).await;
+        assert_eq!(r, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_gives_up_at_the_budget_with_no_engine_progress() {
+        let (r, took) = waited(std::future::pending::<u8>(), vec![Some(false)]).await;
+        assert_eq!(r, Err(StartWaitTimeout));
+        assert!(took >= T_BUDGET);
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_keeps_the_command_running_across_steps() {
+        // a long budget, so only a restarted or dropped command could fail this
+        let began = std::time::Instant::now();
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_start(
+                std::time::Duration::from_secs(2),
+                T_POLL,
+                finishes_after(120),
+                scripted(vec![Some(false)]),
+            ),
+        )
+        .await
+        .expect("wait_for_start never returned (bounded fallback)");
+        assert_eq!(r, Ok(7));
+        assert!(began.elapsed() >= std::time::Duration::from_millis(120));
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_does_not_give_up_while_engine_progress_is_shown() {
+        // the command outlasts the 50 ms budget several times over
+        let (r, _) = waited(finishes_after(300), vec![Some(true)]).await;
+        assert_eq!(r, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_gives_up_after_the_pause_ends() {
+        // five paused steps (>= 50 ms not counted), then the record is gone: the budget runs from there
+        let mut readings = vec![Some(true); 5];
+        readings.push(Some(false));
+        let (r, took) = waited(std::future::pending::<u8>(), readings).await;
+        assert_eq!(r, Err(StartWaitTimeout));
+        assert!(took >= T_BUDGET * 2);
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_keeps_a_shown_reading_when_a_status_read_times_out() {
+        let (r, _) = waited(finishes_after(300), vec![Some(true), None]).await;
+        assert_eq!(r, Ok(7));
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_keeps_an_absent_reading_when_a_status_read_times_out() {
+        let (r, took) = waited(std::future::pending::<u8>(), vec![Some(false), None]).await;
+        assert_eq!(r, Err(StartWaitTimeout));
+        assert!(took >= T_BUDGET);
+        let (r, _) = waited(std::future::pending::<u8>(), vec![None]).await;
+        assert_eq!(r, Err(StartWaitTimeout));
+    }
+
+    #[tokio::test]
+    async fn wait_for_start_counts_a_slow_status_read_against_the_budget() {
+        let began = std::time::Instant::now();
+        let slow = || async {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            Some(false)
+        };
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            wait_for_start(T_BUDGET, T_POLL, std::future::pending::<u8>(), slow),
+        )
+        .await
+        .expect("wait_for_start never returned (bounded fallback)");
+        assert_eq!(r, Err(StartWaitTimeout));
+        assert!(began.elapsed() >= T_BUDGET);
     }
 }

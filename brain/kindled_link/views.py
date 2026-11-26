@@ -42,17 +42,10 @@ def relay_health(persona_dir) -> dict:
     recent reachability event was a failure, else True (Phase 7a T12)."""
     from pathlib import Path
 
-    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+    from brain.health.json_io import read_jsonl
 
-    path = Path(persona_dir) / "kindled_link" / "transport.jsonl"
-    if not path.exists():
-        return {"relay_ok": None, "last_poll_ts": None, "last_push_ts": None,
-                "degraded_peers": []}
-    try:
-        rows = read_jsonl_skipping_corrupt(path)
-    except Exception:  # noqa: BLE001 — fail-soft observability read
-        return {"relay_ok": None, "last_poll_ts": None, "last_push_ts": None,
-                "degraded_peers": []}
+    # Fail-soft observability read: a missing or unreadable log reads as no events (the module warns).
+    rows = read_jsonl(Path(persona_dir) / "kindled_link" / "transport.jsonl")
 
     last_poll = last_push = None
     degraded: list[str] = []

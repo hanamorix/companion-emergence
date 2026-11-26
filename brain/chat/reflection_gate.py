@@ -5,46 +5,77 @@ Fails open (reflect now) on any state error, logged at WARNING so a persistent
 failure (which would silently disable the debounce) is visible."""
 from __future__ import annotations
 
-import json
 import logging
-import os
 from datetime import UTC, datetime
 from pathlib import Path
+
+from brain.health.json_io import Recovery, read_json, write_json
+from brain.utils.log_throttle import count_throttled, warn_throttled
 
 log = logging.getLogger(__name__)
 
 _SALIENCE_THRESHOLD = 0.30
 _MIN_SECONDS_BETWEEN = 90.0  # debounce window (tunable); ~replaces the old 4-turn window
+# #368: suppressing is routine (most short turns), so it logs at INFO at most
+# hourly per reason and kind, with a running count, and at DEBUG in between.
+_SUPPRESS_LOG_INTERVAL_S = 3600.0
 
 
 def _load(persona_dir: Path) -> dict:
-    p = persona_dir / "reflection_state.json"
-    if not p.exists():
-        return {}
-    return json.loads(p.read_text(encoding="utf-8"))  # may raise → caller fails open
+    # RAISE: a corrupt or unreadable file raises, and the caller fails open; a missing one is {}.
+    return read_json(persona_dir / "reflection_state.json", default=dict, recover=Recovery.RAISE)
 
 
 def _atomic_write(persona_dir: Path, state: dict) -> None:
-    persona_dir.mkdir(parents=True, exist_ok=True)
-    tmp = persona_dir / "reflection_state.json.tmp"
-    tmp.write_text(json.dumps(state), encoding="utf-8")
-    os.replace(tmp, persona_dir / "reflection_state.json")  # atomic on POSIX/Windows
+    write_json(persona_dir / "reflection_state.json", state, indent=None, fsync=False)
+
+
+def _record_suppress(reason: str, kind: str, msg: str, *args: object) -> None:
+    """Count and log a suppressed turn (#368). Never raises: the record must not
+    change the decision, and a broken record must not break the chat turn that
+    called the gate. Its failure is warned (throttled), not hidden."""
+    try:
+        count_throttled(
+            log, f"reflection_gate:{reason}:{kind}", logging.INFO, msg, *args,
+            interval_s=_SUPPRESS_LOG_INTERVAL_S,
+        )
+    except Exception:  # noqa: BLE001
+        try:
+            warn_throttled(log, f"reflection_gate:record:{reason}", "reflection_gate: suppress record failed")
+        except Exception:  # noqa: BLE001, S110
+            # #368: last resort. If even the warning fails, logging itself is
+            # broken and there is nowhere left to report; dropping the record
+            # beats failing the chat turn or changing the gate's decision.
+            # Guarded by test_the_suppress_record_cannot_raise_even_when_its_warning_fails.
+            pass
 
 
 def should_reflect(signal, persona_dir: Path, *, kind: str, now: datetime | None = None) -> bool:
     if signal.score < _SALIENCE_THRESHOLD:
+        _record_suppress(
+            "low_salience", kind, "reflection_gate: suppressed kind=%s, low salience %.2f < %.2f",
+            kind, signal.score, _SALIENCE_THRESHOLD,
+        )
         return False
     now = now or datetime.now(UTC)
+    elapsed = None
     try:
         state = _load(persona_dir)
         last_iso = state.get(kind, {}).get("last_reflection_ts")
         if last_iso is not None:
-            last = datetime.fromisoformat(last_iso)
-            if (now - last).total_seconds() < _MIN_SECONDS_BETWEEN:
-                return False
-        state.setdefault(kind, {})["last_reflection_ts"] = now.isoformat()
-        _atomic_write(persona_dir, state)
-        return True
+            elapsed = (now - datetime.fromisoformat(last_iso)).total_seconds()
+        if elapsed is None or elapsed >= _MIN_SECONDS_BETWEEN:
+            state.setdefault(kind, {})["last_reflection_ts"] = now.isoformat()
+            _atomic_write(persona_dir, state)
+            return True
     except Exception:  # noqa: BLE001 — fail open: a state bug must not silence her reflection
         log.warning("reflection_gate state error; reflecting (fail-open)", exc_info=True)
         return True
+    # #368: the suppress record stays outside the fail-open try. Inside it, a
+    # raising record was caught as a "state error" and a debounced turn
+    # reflected anyway. Guarded by test_a_raising_suppress_record_cannot_flip_the_decision.
+    _record_suppress(
+        "too_soon", kind, "reflection_gate: suppressed kind=%s, too soon %.0fs < %.0fs",
+        kind, elapsed, _MIN_SECONDS_BETWEEN,
+    )
+    return False

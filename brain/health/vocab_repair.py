@@ -22,11 +22,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from brain import prompt_strings
+from brain.emotion.vocabulary import canonical_name
+from brain.health.json_io import Recovery, read_json, write_json
+from brain.health.parse_failures import record_parse_failure
+from brain.memory.store import MemoryStore
 from brain.utils.llm_output import extract_json_object
 
 if TYPE_CHECKING:
     from brain.bridge.provider import LLMProvider
-    from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -63,21 +66,14 @@ def _state_path(persona_dir: Path) -> Path:
 
 
 def _load_state(persona_dir: Path) -> dict | None:
-    p = _state_path(persona_dir)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("vocab_repair: corrupt state file: %s", exc)
-        return None
+    # CONTENT: an unreadable file raises (as it always did); a missing or corrupt one is "no state".
+    return read_json(
+        _state_path(persona_dir), default=lambda: None, recover=Recovery.CONTENT, expect=dict
+    )
 
 
 def _save_state(persona_dir: Path, state: dict) -> None:
-    p = _state_path(persona_dir)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2), encoding="utf-8")
-    tmp.replace(p)
+    write_json(_state_path(persona_dir), state, indent=2, fsync=False)
 
 
 # ---------------------------------------------------------------------------
@@ -94,13 +90,13 @@ def should_run_vocab_repair(persona_dir: Path) -> bool:
     supervisor only asks at startup, so the retry cadence is once per bridge
     start, bounded by _DESCRIBE_BATCH per run.
     """
-    vocab_path = persona_dir / "emotion_vocabulary.json"
-    if not vocab_path.exists():
-        return False
-
-    try:
-        data = json.loads(vocab_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, ValueError):
+    data = read_json(
+        persona_dir / "emotion_vocabulary.json",
+        default=lambda: None,
+        recover=Recovery.CONTENT,
+        expect=dict,
+    )
+    if data is None:  # missing or corrupt
         return False
 
     from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
@@ -134,13 +130,8 @@ def run_vocab_repair(
     prior_described = int(existing.get("described", 0)) if prior_complete else 0
 
     vocab_path = persona_dir / "emotion_vocabulary.json"
-    if not vocab_path.exists():
-        return _write_and_return(persona_dir, repaired=0, described=0)
-
-    try:
-        data = json.loads(vocab_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, ValueError) as exc:
-        logger.warning("vocab_repair: cannot read vocab: %s — skipping", exc)
+    data = read_json(vocab_path, default=lambda: None, recover=Recovery.CONTENT, expect=dict)
+    if data is None:  # missing, or corrupt (the module logged it): skip, as before
         return _write_and_return(persona_dir, repaired=0, described=0)
 
     # ------------------------------------------------------------------
@@ -206,6 +197,10 @@ def run_vocab_repair(
                 provider=provider,
             )
         except Exception as exc:  # noqa: BLE001
+            from brain.bridge.cli_throttle import ThrottleDeferred
+
+            if isinstance(exc, ThrottleDeferred):
+                raise
             logger.warning(
                 "vocab_repair: Step 2 description derivation failed (kept placeholders): %s", exc
             )
@@ -279,9 +274,8 @@ def _merge_variant_entries(data: dict) -> list[tuple[str, str]]:
 
 
 def _atomic_write_vocab(vocab_path: Path, data: dict) -> None:
-    """Atomic JSON write with .bak rotation via save_with_backup."""
-    from brain.health.attempt_heal import save_with_backup
-    save_with_backup(vocab_path, data)
+    """Atomic JSON write with .bak rotation via json_io.write_json."""
+    write_json(vocab_path, data, backups=3)
 
 
 def _excerpts_for_name(name: str, store: MemoryStore) -> list[str]:
@@ -290,8 +284,10 @@ def _excerpts_for_name(name: str, store: MemoryStore) -> list[str]:
         # F3: cap the search so a high-frequency name doesn't pull all rows.
         candidates = store.search_text(name, limit=10)
         excerpts = []
+        wanted = canonical_name(name)
         for mem in candidates:
-            if name in (mem.emotions or {}):
+            # Names only: a stored emotion whose value is not finite still counts as evidence for its name.
+            if wanted in {canonical_name(n) for n in MemoryStore.stored_emotion_names(mem)}:
                 text = mem.content[:_EXCERPT_CHAR_LIMIT]
                 excerpts.append(text)
                 if len(excerpts) >= _MAX_EXCERPTS_PER_NAME:
@@ -365,7 +361,13 @@ def _describe_stubs(
                 except TypeError:
                     raw = provider.generate(user_prompt, system=_DESCRIBE_SYSTEM)
                 # #173: Haiku may fence its reply; use the shared tolerant extractor.
-                mapping: dict = json.loads(extract_json_object(raw))
+                try:
+                    mapping: dict = json.loads(extract_json_object(raw))
+                except ValueError as exc:
+                    record_parse_failure(persona_dir, site="vocab_repair", raw=raw, error=str(exc))
+                    raise
+            except _cli_throttle.ThrottleDeferred:
+                raise  # #456/#473: "not now": nothing more is written this run (no state rewrite either)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
                     "vocab_repair: provider call or parse failed for batch %r: %s — "

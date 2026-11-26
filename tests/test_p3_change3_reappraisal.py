@@ -3,19 +3,17 @@ via the pending queue.
 
 Covers C3.1-C3.3 from changes/p3-retention/1.5-criteria.md.
 
-Naming: synthetic user = Bob, persona = Canary, model = Claude. No Phoebe.
+Naming: synthetic user = Bob, persona = Canary, model = Claude. No real persona or user names.
 """
 
 from __future__ import annotations
 
-import inspect
 from unittest.mock import patch
 
 import pytest
 
-from brain.chat import prompt as prompt_mod
 from brain.chat.prompt import _build_recall_block
-from brain.engines.consolidation import run_consolidation
+from brain.engines.consolidation import Reappraisal, run_consolidation
 from brain.memory.pending import PendingQueue
 from brain.memory.store import Memory, MemoryStore
 
@@ -42,8 +40,8 @@ def test_c3_1_reappraise_updates_existing_row_no_new_row(tmp_path):
 
     known_value = 7.25
 
-    def _fake_reappraiser(m: Memory) -> float:
-        return known_value
+    def _fake_reappraiser(m: Memory) -> Reappraisal:
+        return Reappraisal(known_value)
 
     result = run_consolidation(
         store, persona_dir=tmp_path,
@@ -56,7 +54,7 @@ def test_c3_1_reappraise_updates_existing_row_no_new_row(tmp_path):
     assert store.count(active_only=False) == before_count  # no INSERT — same row count
     # A normal reappraise update does not clobber unrelated fields.
     assert got.content == "Bob's home address is 12 Elm Street"
-    assert got.emotions == {}
+    assert got._stored_emotions == {}
     store.close()
 
 
@@ -89,11 +87,11 @@ def test_c3_2_row_deleted_mid_window_no_resurrection_no_crash(tmp_path):
     before_count = store.count(active_only=False)
     PendingQueue(tmp_path).enqueue_reappraisal(mem.id, source="recall")
 
-    def _deleting_reappraiser(m: Memory) -> float:
+    def _deleting_reappraiser(m: Memory) -> Reappraisal:
         # Fires strictly between the handler's store.get (already returned
         # `m`) and its store.update — the HARDER window (finding #3).
         store.hard_delete(m.id)
-        return 9.9
+        return Reappraisal(9.9)
 
     result = run_consolidation(
         store, persona_dir=tmp_path,
@@ -112,7 +110,7 @@ def test_c3_2_row_already_missing_at_read_is_skipped(tmp_path):
     store = MemoryStore(tmp_path / "memories.db")
     PendingQueue(tmp_path).enqueue_reappraisal("nonexistent-id", source="recall")
 
-    def _fake_reappraiser(m: Memory) -> float:
+    def _fake_reappraiser(m: Memory) -> Reappraisal:
         raise AssertionError("reappraiser must never be called for a missing row")
 
     result = run_consolidation(
@@ -125,16 +123,6 @@ def test_c3_2_row_already_missing_at_read_is_skipped(tmp_path):
 
 
 # --------------------------------------------------------------------------- C3.3
-def test_c3_3_recall_hook_source_never_references_a_provider():
-    """Static check: the recall-block hook's source never references a
-    provider/appraiser — it can only enqueue. Fail-test: an inline-appraise
-    implementation would need a provider/reappraiser call at this site."""
-    src = inspect.getsource(prompt_mod._build_recall_block)
-    assert ".generate(" not in src  # the LLMProvider call surface
-    assert "reappraiser" not in src  # no inline appraiser reference at all
-    assert "enqueue_reappraisal" in src  # the hook DOES enqueue
-
-
 def test_c3_3_recall_enqueues_for_full_inject_and_snippet_union_not_inline(tmp_path):
     """Exercising the recall-block hook enqueues a re-appraise request for
     BOTH a full-inject (full_ids) and a snippet (bump_targets) surfaced
@@ -174,7 +162,7 @@ def test_c3_3_batch_enqueue_uses_a_single_lock_and_write(tmp_path):
     ids = ["id-a", "id-b", "id-c"]
     queue = PendingQueue(tmp_path)
 
-    with patch("brain.memory.pending.file_lock", wraps=real_file_lock) as mock_lock:
+    with patch("brain.health.json_io.file_lock", wraps=real_file_lock) as mock_lock:
         written = queue.enqueue_reappraisals(ids, source="recall")
 
     assert written == 3

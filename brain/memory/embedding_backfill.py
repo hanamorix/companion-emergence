@@ -44,12 +44,13 @@ RUNTIME-DERIVED BATCH SIZE (replaces the old hardcoded `DEFAULT_BATCH_SIZE =
 25`): the number of real embed computations one tick performs self-derives
 from a measured WARM per-embed time on the actual host vs a time budget
 (`floor(batch_budget_seconds / per_embed_seconds)`) — see `_get_batch_size`
-below, which mirrors ``brain/memory/reranker.py``'s auto-scaling rerank
-width. Measured ONCE per process (per model_id) and cached for the process
-lifetime — no periodic recompute (approved F1 spec §3/S10): unlike rerank
-width, hardware doesn't meaningfully drift mid-process here, and this tick
-runs unattended on the supervisor thread where a recompute would just be
-extra embed-provider calls for no real gain.
+below. Measured ONCE per process (per model_id) and cached for the
+process lifetime — no periodic recompute (approved F1 spec §3/S10):
+hardware doesn't meaningfully drift mid-process here, and this tick runs
+unattended on the supervisor thread where a recompute would just be extra
+embed-provider calls for no real gain. (The reranker's hourly width
+measurement this once mirrored was replaced by the name-recall fix's
+per-message width, which fits each message from a running cost model.)
 
 IDLE-GATED: this module's own ``run_embedding_backfill_tick`` does NOT gate
 itself — the supervisor call site (``brain/bridge/supervisor.py``) wraps the
@@ -84,18 +85,14 @@ cursor resets automatically on a model swap (its persisted `model_id` no
 longer matches the current provider's), so a new model reopens the whole
 backlog rather than silently under-covering it.
 
-The cursor is a COMPOSITE ``(created_at, id)`` keyset position, not a bare
-timestamp — see ``MemoryStore.list_active_since``/``list_unembedded_since``.
-A bare-timestamp cursor made any row sharing its exact ``created_at`` with
-the pinned row permanently unreachable (bulk migrator imports routinely
-produce duplicate/second-granularity timestamps —
-``brain/migrator/emergence_kit.py`` via ``brain/migrator/transform.py``'s
-``_coerce_utc``); pairing the timestamp with the row's own ``id`` gives
-every row a distinct position in the scan order. A cursor file written
-before this pairing existed is timestamp-only and is treated as unparseable
-— see ``_load_cursor`` — which resets to the top of history rather than
-guessing; safe and cheap, since a rescan only re-confirms rows already
-embedded (they no longer satisfy `embedding IS NULL`).
+The cursor is the SQLite ``rowid`` of the last row processed (``{"rowid": n}`` in the persisted file): the backlog is walked in
+insertion order (``MemoryStore.list_unembedded_since``), not by ``created_at`` (sfa S31(b)), because a row's ``created_at`` can
+move (the temp gate's write-back resets it when a memory is remembered) and a cursor keyed on it would skip or revisit such a
+row. Every row has its own distinct rowid, so rows that share a ``created_at`` (bulk migrator imports routinely produce
+duplicate or second-granularity timestamps) are all reachable. A cursor file written before this form existed (the
+``{"created_at", "id"}`` dict or a bare timestamp) reads as unusable (see ``_load_cursor``), which resets to the top of history
+rather than guessing; safe and cheap, since a rescan only re-confirms rows already embedded (they no longer satisfy
+`embedding IS NULL`).
 
 CURSOR-FREEZE FIX (folded into increment 3): a row that fails to embed is
 logged and the cursor is allowed to advance PAST it (skip-and-log), instead
@@ -120,7 +117,6 @@ cursor-reset behavior is what the termination check keys off of.
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import threading
@@ -128,7 +124,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from brain import tunables
+from brain import dev_constants, tunables
+from brain.health.json_io import read_json, write_json
 from brain.memory.store import MemoryStore
 from brain.paths import cadence_state_path
 
@@ -142,29 +139,28 @@ logger = logging.getLogger(__name__)
 # the two thresholds can diverge independently later).
 MIN_CHARS_TO_EMBED = 20
 
-# Bounds how many candidate rows are even *examined* (read from `memories`)
-# in one tick — cheap (an indexed WHERE-clause row), independent of
-# `batch_size` which bounds actual embed *compute* (the expensive part).
-# Keeps a corpus with a long run of skip-worthy short/failing rows from
-# spinning CPU scanning without also embedding anything.
-DEFAULT_SCAN_CAP = 500
-
 _CURSOR_FILE = "embedding_backfill_cursor.json"
+_SQLITE_MAX_ROWID = 2**63 - 1  # the largest integer SQLite binds; a cursor beyond it would make every tick raise
 
 # ---------------------------------------------------------------------------
 # Runtime-derived batch size (F1 #259 increment 3) — see module docstring.
 # ---------------------------------------------------------------------------
 
-# I7: the tick's own time budget and the assumed supervisor tick cadence are
-# ops tunables, not inline literals — registered like the existing
-# `throttle.*` keys (see brain/bridge/cli_throttle.py). `batch_budget_seconds`
-# leaves ~half of `tick_interval_seconds` as headroom so a slow entry (or a
-# tick that ran a little long already) still fits inside one supervisor tick.
+# I7: the tick's own time budget and the supervisor's tick are ops tunables,
+# not inline literals — registered like the existing `throttle.*` keys (see
+# brain/bridge/cli_throttle.py). `tick_interval_seconds` is the supervisor's
+# tick: `run_folded` waits that long between passes (read once per run), and
+# `_derive_batch_size` warns when the batch budget is not shorter than it.
+# `batch_budget_seconds` should leave ~half of it as headroom so a slow entry
+# (or a tick that ran a little long already) still fits inside one supervisor
+# tick.
 _BATCH_BUDGET_SECONDS_DEFAULT = tunables.register(
-    "embedding_backfill.batch_budget_seconds", 30.0
+    "embedding_backfill.batch_budget_seconds", 30.0,
+    description="Seconds one background pass may spend preparing older memories for search.",
 )
 _TICK_INTERVAL_SECONDS_DEFAULT = tunables.register(
-    "embedding_backfill.tick_interval_seconds", 60.0
+    "embedding_backfill.tick_interval_seconds", 60.0,
+    description="How often, in seconds, the app's background passes run. Takes effect when the app starts.",
 )
 
 
@@ -174,9 +170,19 @@ def _batch_budget_seconds() -> float:
     )
 
 
-def _tick_interval_seconds() -> float:
-    return tunables.get_tunable(
-        "embedding_backfill.tick_interval_seconds", _TICK_INTERVAL_SECONDS_DEFAULT
+def tick_interval_seconds() -> float:
+    """The supervisor's tick in seconds.
+
+    A setting that is not a finite number above 0, or is above ``threading.TIMEOUT_MAX`` (the longest wait the platform
+    allows: ``Event.wait`` raises ``OverflowError`` past it), reads as the registered default.
+    """
+    return tunables.positive_or_default(
+        "embedding_backfill.tick_interval_seconds",
+        tunables.get_tunable(
+            "embedding_backfill.tick_interval_seconds", _TICK_INTERVAL_SECONDS_DEFAULT
+        ),
+        _TICK_INTERVAL_SECONDS_DEFAULT,
+        largest=threading.TIMEOUT_MAX,
     )
 
 
@@ -253,12 +259,12 @@ def _derive_batch_size(per_embed_seconds: float, scan_cap: int) -> int:
     already kept reasonable (>= 1) by the existing low clamp below.
 
     Logs once (per process) if the configured budget leaves no headroom
-    inside the assumed tick interval — a configuration smell, not a fatal
+    inside the supervisor tick — a configuration smell, not a fatal
     error, so this never raises.
     """
     global _warned_no_headroom
     budget = _batch_budget_seconds()
-    tick = _tick_interval_seconds()
+    tick = tick_interval_seconds()
     if budget >= tick and not _warned_no_headroom:
         _warned_no_headroom = True
         logger.warning(
@@ -280,9 +286,10 @@ def _get_batch_size(provider, scan_cap: int) -> int:  # noqa: ANN001
     must not serialize concurrent callers behind it) and caches with
     first-writer-wins (`setdefault`) so a measurement race between two
     threads on the very first call never lets a later, possibly-noisier
-    measurement overwrite an already-cached figure. Mirrors
-    reranker.py's `_warm_per_doc_latency`, minus its periodic-recompute
-    machinery — see module docstring for why this measures only once.
+    measurement overwrite an already-cached figure. Measured once per
+    process with no periodic recompute (see module docstring for why). It
+    once mirrored reranker.py's hourly `_warm_per_doc_latency`, which the
+    name-recall fix's per-message width (R1) removed.
 
     `scan_cap` is folded into the cached figure via `_derive_batch_size`'s
     upper clamp: in production `run_embedding_backfill_tick` is always
@@ -325,28 +332,26 @@ class BackfillTickResult:
     batch_size: int  # the derived (or caller-overridden) batch size used
 
 
-def _load_cursor(persona_dir, current_model_id: str) -> tuple[str, str] | None:  # noqa: ANN001
+def _load_cursor(persona_dir, current_model_id: str) -> int | None:  # noqa: ANN001
     """Best-effort cursor read. Missing/corrupt/model-mismatched/old-format
     -> None (start of history) — fail toward re-scanning, never toward
     silently skipping a row. See module docstring: the cursor is an
     optimization, not the correctness mechanism.
 
-    The persisted cursor is the COMPOSITE ``{"created_at": ..., "id": ...}``
-    form (see ``MemoryStore.list_unembedded_since``). A cursor file written
-    by a pre-keyset build of this module is timestamp-only (a bare string)
-    — that old format is deliberately NOT half-interpreted (e.g. paired with
-    an empty/sentinel id, which would silently reintroduce the same-timestamp
-    blind spot this format exists to close); it is treated exactly like any
-    other unparseable cursor and reset to ``None``, which just rescans from
-    the top. Safe and cheap: a rescan only re-confirms rows already embedded
-    under the current model (they no longer satisfy the backlog predicate).
+    The persisted cursor is ``{"rowid": n}`` (see
+    ``MemoryStore.list_unembedded_since``): an ``int`` (not a bool) in
+    ``0 .. _SQLITE_MAX_ROWID``. Anything else is unusable and reads as None,
+    which just rescans from the top: a cursor file written by an earlier
+    build (the ``{"created_at", "id"}`` dict, or a bare timestamp string; deliberately
+    NOT half-interpreted) or a damaged file. An integer SQLite
+    cannot bind would make every tick raise before the file is rewritten, so
+    it is refused here rather than trusted. A rescan only re-confirms rows
+    already embedded under the current model (they no longer satisfy the
+    backlog predicate).
     """
     path = cadence_state_path(persona_dir, _CURSOR_FILE)
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(raw, dict):
+    raw = read_json(path, default=lambda: None, expect=dict)  # missing/corrupt/unreadable: rescan from the top
+    if raw is None:
         return None
     if raw.get("model_id") != current_model_id:
         # A model swap (or first run under this model) invalidates any prior
@@ -363,38 +368,27 @@ def _load_cursor(persona_dir, current_model_id: str) -> tuple[str, str] | None: 
         return None
     cursor = raw.get("cursor")
     if not isinstance(cursor, dict):
-        # Includes the pre-keyset bare-string format, and None/missing.
+        # Includes the earlier bare-string format, and None/missing.
         return None
-    created_at = cursor.get("created_at")
-    row_id = cursor.get("id")
-    if not isinstance(created_at, str) or not created_at:
+    rowid = cursor.get("rowid")
+    if type(rowid) is not int or not 0 <= rowid <= _SQLITE_MAX_ROWID:
         return None
-    if not isinstance(row_id, str) or not row_id:
-        return None
-    return (created_at, row_id)
+    return rowid
 
 
 def _save_cursor(
     persona_dir,  # noqa: ANN001
     current_model_id: str,
-    cursor: tuple[str, str] | None,
+    cursor: int | None,
 ) -> None:
     """Best-effort cursor write (temp file + rename). Failure is swallowed —
     mirrors persisted_cadence.save_cadence's posture: a failed save only
     means the NEXT tick re-scans a bit more than necessary, never that a
     row goes unembedded."""
     path = cadence_state_path(persona_dir, _CURSOR_FILE)
-    cursor_payload = (
-        {"created_at": cursor[0], "id": cursor[1]} if cursor is not None else None
-    )
+    cursor_payload = {"rowid": cursor} if cursor is not None else None
     payload = {"model_id": current_model_id, "cursor": cursor_payload}
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(payload), encoding="utf-8")
-        tmp.replace(path)
-    except OSError:
-        logger.warning("embedding_backfill: could not persist cursor (best-effort)", exc_info=True)
+    write_json(path, payload, indent=None, fsync=False, on_error="log")  # best-effort: a rescan is the cost
 
 
 def has_embedding_backfill_work(store: MemoryStore) -> bool:
@@ -402,10 +396,13 @@ def has_embedding_backfill_work(store: MemoryStore) -> bool:
     (ram-spike-fix INC-9, S53/S66): True iff the backlog (exactly
     ``MemoryStore.list_unembedded_since``'s definition, from the start of
     history, under the current embedding model) holds at least one row.
-    Reads one row at most; writes nothing."""
+    Reads one row at most; writes nothing. Builds no provider: the model id
+    comes from `resolve_embedding_model_id()`, because constructing a
+    `FastEmbedProvider` downloads the whole model when it is not cached, and
+    this probe runs on every idle pass."""
     from brain.memory import embeddings as embeddings_mod
 
-    model_id = embeddings_mod.build_embedding_provider().model_id()
+    model_id = embeddings_mod.resolve_embedding_model_id()
     return bool(
         store.list_unembedded_since(
             None, limit=1, current_model_id=model_id, min_chars=MIN_CHARS_TO_EMBED
@@ -418,7 +415,7 @@ def run_embedding_backfill_tick(
     store: MemoryStore,
     *,
     batch_size: int | None = None,
-    scan_cap: int = DEFAULT_SCAN_CAP,
+    scan_cap: int | None = None,
 ) -> BackfillTickResult:
     """Embed up to `batch_size` un-embedded active memories, off the hot path.
 
@@ -431,7 +428,8 @@ def run_embedding_backfill_tick(
     `_get_batch_size` (measured once per process per model_id — see module
     docstring); pass an explicit value to override (tests do this for
     deterministic bounds). `scan_cap` separately bounds how many rows are
-    even read from `memories` this call.
+    even read from `memories` this call; when omitted it is
+    `dev_constants.DEFAULT_SCAN_CAP`.
 
     Backlog is exactly `MemoryStore.list_unembedded_since`'s definition:
     active, long-enough rows with `embedding IS NULL` OR
@@ -445,6 +443,8 @@ def run_embedding_backfill_tick(
     """
     from brain.memory import embeddings as embeddings_mod
 
+    if scan_cap is None:
+        scan_cap = dev_constants.DEFAULT_SCAN_CAP
     provider = embeddings_mod.build_embedding_provider()
     model_id = provider.model_id()
     effective_batch_size = (
@@ -463,9 +463,10 @@ def run_embedding_backfill_tick(
     resolved_up_to = cursor
     hit_batch_limit = False
 
-    for memory in candidates:
+    for backlog_row in candidates:
         scanned += 1
-        row_cursor = (memory.created_at.isoformat(), memory.id)
+        memory = backlog_row.memory
+        row_cursor = backlog_row.rowid
 
         if len(memory.content) < MIN_CHARS_TO_EMBED:
             # Defensive/redundant as of F1 #259 increment-3 red-team fix
@@ -510,8 +511,8 @@ def run_embedding_backfill_tick(
     # scan). Unlike the old content-hash cache, `embedding IS NULL` is not
     # append-only per id: a row can go null a SECOND time (a later content
     # edit whose synchronous re-embed fails — see
-    # MemoryStore._reembed_or_clear) at a `created_at` position the cursor
-    # may already have passed. A persisted forward cursor is only a safe
+    # MemoryStore._reembed_or_clear) at a rowid the cursor may already have
+    # passed. A persisted forward cursor is only a safe
     # scan-cost optimization while there is more of the CURRENTLY FETCHED
     # window left to examine (the `hit_batch_limit` case) or the backlog is
     # LARGER than one scan window; once the window is both fully processed
@@ -538,7 +539,8 @@ def run_embedding_backfill_tick(
     # `hit_batch_limit`), the cursor may simply never reset for a long time.
     # A row that goes NULL a SECOND time BEHIND the persisted cursor position
     # (a failed synchronous re-embed from `fade`/`update(content=...)`/
-    # `unfade` — see `MemoryStore._reembed_or_clear`) is invisible to
+    # `unfade`/the temp gate's write-back, see `MemoryStore._reembed_or_clear`)
+    # is invisible to
     # `list_unembedded_since` until either the backlog finally drains below
     # one scan window (letting a tick exhaust it and reset the cursor) or a
     # `MODEL_EMBEDDING` swap forces a full rescan (`_load_cursor` resets on
@@ -593,7 +595,7 @@ def run_embedding_backfill_to_completion(
     store: MemoryStore,
     *,
     batch_size: int | None = None,
-    scan_cap: int = DEFAULT_SCAN_CAP,
+    scan_cap: int | None = None,
     progress_cb: ProgressCallback | None = None,
 ) -> BackfillDrainResult:
     """Drain the embedding backlog to completion in ONE call, for the
@@ -643,7 +645,7 @@ def run_embedding_backfill_to_completion(
     — also stop.
 
     Both stop conditions are reached in a BOUNDED number of ticks: the
-    keyset cursor only ever moves forward (or resets to re-scan a
+    rowid cursor only ever moves forward (or resets to re-scan a
     provably-exhausted-of-successes remainder), so the total rows examined
     across the whole drain is bounded by a small constant multiple of the
     backlog size, never unbounded.
@@ -676,6 +678,8 @@ def run_embedding_backfill_to_completion(
     """
     from brain.memory import embeddings as embeddings_mod
 
+    if scan_cap is None:
+        scan_cap = dev_constants.DEFAULT_SCAN_CAP
     total_embedded = 0
     total_failed_attempts = 0
     total_scanned = 0
@@ -702,9 +706,9 @@ def run_embedding_backfill_to_completion(
             stopped_reason = "stalled_no_progress"
             break
 
-    provider = embeddings_mod.build_embedding_provider()
     final_failed = store.count_unembedded(
-        current_model_id=provider.model_id(), min_chars=MIN_CHARS_TO_EMBED
+        current_model_id=embeddings_mod.resolve_embedding_model_id(),
+        min_chars=MIN_CHARS_TO_EMBED,
     )
 
     return BackfillDrainResult(
@@ -740,9 +744,9 @@ def delete_legacy_embeddings_db(persona_dir, store: MemoryStore) -> bool:  # noq
     one-go CLI drain (`run_embedding_backfill_to_completion`) already use
     (see `MemoryStore.count_unembedded`), so "safe to delete" means exactly
     "the backfill considers itself caught up". The current model id comes
-    from `build_embedding_provider()` (looked up through the module, same
-    dynamic-lookup convention as `MemoryStore.embed_row` and the CLI
-    backfill command), which is pinned to `model_tier.TIER_EMBEDDING` — so a
+    from `resolve_embedding_model_id()` (looked up through the module; it
+    builds no provider), which is `model_tier.TIER_EMBEDDING`'s model string,
+    the id `build_embedding_provider()`'s provider reports — so a
     `MODEL_EMBEDDING` swap correctly reopens the gate (old-model rows count
     as backlog) rather than deleting the file out from under an in-progress
     re-embed.
@@ -772,9 +776,9 @@ def delete_legacy_embeddings_db(persona_dir, store: MemoryStore) -> bool:  # noq
     if not db_path.exists():
         return False
 
-    provider = embeddings_mod.build_embedding_provider()
+    current_model_id = embeddings_mod.resolve_embedding_model_id()
     backlog = store.count_unembedded(
-        current_model_id=provider.model_id(), min_chars=MIN_CHARS_TO_EMBED
+        current_model_id=current_model_id, min_chars=MIN_CHARS_TO_EMBED
     )
     if backlog > 0:
         logger.info(
@@ -782,7 +786,7 @@ def delete_legacy_embeddings_db(persona_dir, store: MemoryStore) -> bool:  # noq
             "un-embedded under the current model (%s)",
             persona_dir.name,
             backlog,
-            provider.model_id(),
+            current_model_id,
         )
         return False
 
@@ -805,7 +809,7 @@ def delete_legacy_embeddings_db(persona_dir, store: MemoryStore) -> bool:  # noq
             "deleted legacy embeddings.db for %s (all active rows embedded "
             "under current model %s)",
             persona_dir.name,
-            provider.model_id(),
+            current_model_id,
         )
 
     return deleted_main

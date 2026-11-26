@@ -18,8 +18,22 @@ from typing import Any, Literal
 
 ChatRole = Literal["system", "user", "assistant", "tool"]
 
+# The four kinds of image the byte sniff in brain.images can recognise. Not the `files.image_types` setting, which says
+# which images the read_file tool opens and can only narrow this set.
 _ALLOWED_MEDIA_TYPES = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _short_repr(obj: object, limit: int = 200) -> str:
+    """`repr(obj)` cut to ``limit`` characters, for an error message that must stay short and must not itself raise.
+
+    A model-controlled value can be huge (a 200,000-character string) or nested past the recursion limit, where
+    `repr` raises RecursionError inside the very `except` clause that is building the message.
+    """
+    try:
+        return repr(obj)[:limit]
+    except RecursionError:
+        return f"<{type(obj).__name__}>"
 
 
 @dataclass(frozen=True)
@@ -196,7 +210,7 @@ class ToolCall:
         Raises
         ------
         ValueError
-            If the dict is missing required keys or arguments is not parseable.
+            If the dict is missing required keys, ``id`` or ``name`` is not a string, or arguments is not parseable.
         """
         try:
             call_id: str = d["id"]
@@ -205,17 +219,28 @@ class ToolCall:
             raw_args = func["arguments"]
         except (KeyError, TypeError) as exc:
             raise ValueError(
-                f"ToolCall.from_provider_dict: missing required fields in {d!r}"
+                f"ToolCall.from_provider_dict: missing required fields in {_short_repr(d)}"
             ) from exc
+
+        # Rejected where it is read: a non-string id breaks the pairing of a result with its call and a
+        # non-string name cannot match any tool, and both would otherwise fail later and less clearly (#474).
+        if not isinstance(call_id, str):
+            raise ValueError(
+                f"ToolCall.from_provider_dict: id must be a string, got {type(call_id).__name__}"
+            )
+        if not isinstance(name, str):
+            raise ValueError(
+                f"ToolCall.from_provider_dict: name must be a string, got {type(name).__name__}"
+            )
 
         if isinstance(raw_args, dict):
             arguments = raw_args
         elif isinstance(raw_args, str):
             try:
                 arguments = json.loads(raw_args)
-            except json.JSONDecodeError as exc:
+            except (ValueError, RecursionError) as exc:  # JSONDecodeError is a ValueError; so is a 5000-digit run
                 raise ValueError(
-                    f"ToolCall.from_provider_dict: cannot parse arguments JSON: {raw_args!r}"
+                    f"ToolCall.from_provider_dict: cannot parse arguments JSON: {_short_repr(raw_args)}"
                 ) from exc
             if not isinstance(arguments, dict):
                 raise ValueError(

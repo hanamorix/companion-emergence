@@ -39,6 +39,7 @@ concern, already exercised offline elsewhere.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -69,24 +70,43 @@ _TIMEOUT_S = 300
 # network to get a real judge", never a false skip of a run that could have
 # gone offline. A machine (this dev box, or the dedicated workflow after its
 # warm step) that already has the model cached still runs these tests.
+#
+# #405 / #363 follow-up (2026-10-16): "skip unless cached" ran this module in
+# the default suite on any dev box with the model cached, where C2's margin is
+# 3-8% of what it measures and fails about 1 run in 4 -- and it let the
+# dedicated workflow pass with zero tests run if its warm step ever left the
+# cache empty. So the module is now opt-in: it runs only with
+# KINDLED_RUN_JUDGE_RSS=1 (set by judge-release-rss.yml, or by hand), and once
+# opted in a missing model is a failure, not a skip. The bound is unchanged.
 _JUDGE_MODEL_ID = model_for_tier(TIER_RELEVANCE_JUDGE)
-if not _hf_cached(_JUDGE_MODEL_ID, get_cache_dir()):
+if os.environ.get("KINDLED_RUN_JUDGE_RSS") != "1":
     pytest.skip(
-        f"{_JUDGE_MODEL_ID!r} not in the local HF cache ({get_cache_dir()}) -- "
-        "skipping without a network request; this module needs the model "
-        "pre-warmed (see .github/workflows/judge-release-rss.yml)",
+        "judge release-RSS tests are opt-in: set KINDLED_RUN_JUDGE_RSS=1 "
+        "(run by .github/workflows/judge-release-rss.yml; see #405)",
         allow_module_level=True,
+    )
+if not _hf_cached(_JUDGE_MODEL_ID, get_cache_dir()):
+    pytest.fail(
+        f"{_JUDGE_MODEL_ID!r} not in the local HF cache ({get_cache_dir()}) -- "
+        "KINDLED_RUN_JUDGE_RSS=1 is set but this module needs the model "
+        "pre-warmed (see .github/workflows/judge-release-rss.yml)",
+        pytrace=False,
     )
 
 
-def _run_subprocess_script(script: str) -> dict:
+def _run_subprocess_script(script: str, scratch_dir: Path) -> dict:
     """Run `script` in a fresh `python -P` subprocess (mirrors test_search_
     via_bridge.py's `-P` convention — no cwd-shadowing of `brain`), parse the
     LAST stdout line as the JSON result dict this file's scripts always print,
-    and fail loudly (with full stdout/stderr) on any non-zero exit."""
+    and fail loudly (with full stdout/stderr) on any non-zero exit.
+
+    `scratch_dir` (the test's `tmp_path`) reaches the script as the env var
+    ``RSS_TEST_SCRATCH_DIR``; the script keeps its persona / empty-cache dirs
+    under it, so pytest removes them (the scripts used to `mkdtemp` and leak)."""
     proc = subprocess.run(
         [sys.executable, "-P", "-c", script],
         cwd=str(_REPO_ROOT),
+        env={**os.environ, "RSS_TEST_SCRATCH_DIR": str(scratch_dir)},
         capture_output=True,
         text=True,
         timeout=_TIMEOUT_S,
@@ -209,7 +229,21 @@ _RSS_TRACE_PRELUDE = textwrap.dedent(
 _C2_RETAINED_FRACTION_BOUND = 0.25
 
 
-def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
+def _report(arm: str, rss_before: int, peak: int, rss_after: int) -> None:
+    """Print the retained fraction for every run (#405 review): the workflow runs
+    with -s, so its log accumulates the per-platform evidence the 25% bound is
+    judged against, whether the run passes or fails."""
+    load_delta = peak - rss_before
+    retained = rss_after - rss_before
+    frac = retained / load_delta if load_delta else float("nan")
+    print(
+        f"\n[judge-rss] arm={arm} platform={sys.platform} load_delta={load_delta / 1e6:.1f}MB "
+        f"retained={retained / 1e6:.1f}MB retained_fraction={frac:.1%} "
+        f"bound={_C2_RETAINED_FRACTION_BOUND:.0%}"
+    )
+
+
+def test_c2a_calibration_tick_finish_releases_judge_rss(tmp_path: Path) -> None:
     """C2 (calibration finish arm): a real `_run_calibration_tick` call that
     builds the real torch judge (one unlabeled calibration_log row, a clearly
     non-ambiguous pair so no Haiku call is needed — a `FakeProvider` is
@@ -226,7 +260,6 @@ def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
     """
     script = _RSS_TRACE_PRELUDE + textwrap.dedent(
         """
-        import tempfile
         from pathlib import Path
 
         from brain.bridge.provider import FakeProvider
@@ -254,7 +287,7 @@ def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
 
         reranker_mod.build_reranker_provider = _no_reranker
 
-        persona_dir = Path(tempfile.mkdtemp())
+        persona_dir = Path(os.environ["RSS_TEST_SCRATCH_DIR"])
         store = MemoryStore(persona_dir / "memories.db")
         # Same genuine pair as test_relevance_judge_real_model.py's
         # _GENUINE_PAIRS[0] (measured there, and independently confirmed
@@ -278,7 +311,7 @@ def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
         _poll_thread.start()
         _run_calibration_tick(persona_dir, provider=FakeProvider())
         _stop.set()
-        _poll_thread.join(timeout=5)
+        _poll_thread.join()
         rss_after = _settled_rss()
         peak = max(_trace) if _trace else rss_after
 
@@ -290,11 +323,11 @@ def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
         }))
         """
     )
-    result = _run_subprocess_script(script)
+    result = _run_subprocess_script(script, tmp_path)
     rss_before, peak, rss_after = result["rss_before"], result["peak"], result["rss_after"]
     load_delta = peak - rss_before
     bound = rss_before + _C2_RETAINED_FRACTION_BOUND * load_delta
-    print(f"\nload_delta={load_delta / 1e6:.1f}MB rss_after-rss_before={(rss_after - rss_before) / 1e6:.1f}MB")
+    _report('c2a_calibration_tick_finish', rss_before, peak, rss_after)
     assert load_delta > 200_000_000, (
         f"the judge doesn't look like it actually loaded (load_delta={load_delta / 1e6:.1f}MB) "
         "-- this test would pass vacuously if label_calibration_sample never built the real judge"
@@ -306,7 +339,7 @@ def test_c2a_calibration_tick_finish_releases_judge_rss() -> None:
     )
 
 
-def test_c2c_calibration_tick_pause_releases_judge_rss() -> None:
+def test_c2c_calibration_tick_pause_releases_judge_rss(tmp_path: Path) -> None:
     """C2 (calibration PAUSE arm, ram-spike-fix INC-10): two unlabeled
     calibration_log rows, a `should_pause` that fires True right after the
     FIRST row is labeled (before the second) — `_run_calibration_tick`
@@ -321,7 +354,6 @@ def test_c2c_calibration_tick_pause_releases_judge_rss() -> None:
     """
     script = _RSS_TRACE_PRELUDE + textwrap.dedent(
         """
-        import tempfile
         from pathlib import Path
 
         from brain.bridge.provider import FakeProvider
@@ -335,7 +367,7 @@ def test_c2c_calibration_tick_pause_releases_judge_rss() -> None:
 
         reranker_mod.build_reranker_provider = _no_reranker
 
-        persona_dir = Path(tempfile.mkdtemp())
+        persona_dir = Path(os.environ["RSS_TEST_SCRATCH_DIR"])
         store = MemoryStore(persona_dir / "memories.db")
         pairs = [
             ("deep breathing helps when you are feeling anxious", "how do I calm down when everything feels like too much"),
@@ -359,7 +391,7 @@ def test_c2c_calibration_tick_pause_releases_judge_rss() -> None:
         _poll_thread.start()
         ran = _run_calibration_tick(persona_dir, provider=FakeProvider(), should_pause=_should_pause)
         _stop.set()
-        _poll_thread.join(timeout=5)
+        _poll_thread.join()
         rss_after = _settled_rss()
         peak = max(_trace) if _trace else rss_after
 
@@ -378,10 +410,11 @@ def test_c2c_calibration_tick_pause_releases_judge_rss() -> None:
         }))
         """
     )
-    result = _run_subprocess_script(script)
+    result = _run_subprocess_script(script, tmp_path)
     rss_before, peak, rss_after = result["rss_before"], result["peak"], result["rss_after"]
     load_delta = peak - rss_before
     bound = rss_before + _C2_RETAINED_FRACTION_BOUND * load_delta
+    _report('c2c_calibration_tick_pause', rss_before, peak, rss_after)
     assert result["ran"] is None, "a mid-tick pause must report None (paused), not True/False"
     assert result["unlabeled_remaining"] == 1, (
         "exactly one row must stay unlabeled -- proves the pause stopped between "
@@ -398,7 +431,7 @@ def test_c2c_calibration_tick_pause_releases_judge_rss() -> None:
     )
 
 
-def test_c2b_weight_retrain_finish_releases_judge_rss() -> None:
+def test_c2b_weight_retrain_finish_releases_judge_rss(tmp_path: Path) -> None:
     """C2 (self-tune finish arm, scoped per this file's module docstring): a
     real champion build (`build_judge_provider()`) + a real, tiny LoRA
     weight-retrain (`judge_lora.build_lora_retrain_fn`, 1 epoch, 6 real
@@ -447,7 +480,7 @@ def test_c2b_weight_retrain_finish_releases_judge_rss() -> None:
         rj.release_judge()
 
         _stop.set()
-        _poll_thread.join(timeout=5)
+        _poll_thread.join()
         rss_after = _settled_rss()
         peak = max(_trace) if _trace else rss_after
 
@@ -460,11 +493,11 @@ def test_c2b_weight_retrain_finish_releases_judge_rss() -> None:
         }))
         """
     )
-    result = _run_subprocess_script(script)
+    result = _run_subprocess_script(script, tmp_path)
     rss_before, peak, rss_after = result["rss_before"], result["peak"], result["rss_after"]
     load_delta = peak - rss_before
     bound = rss_before + _C2_RETAINED_FRACTION_BOUND * load_delta
-    print(f"\nload_delta={load_delta / 1e6:.1f}MB rss_after-rss_before={(rss_after - rss_before) / 1e6:.1f}MB")
+    _report('c2b_weight_retrain_finish', rss_before, peak, rss_after)
     assert load_delta > 200_000_000, (
         f"the champion+challenger don't look like they actually loaded (load_delta={load_delta / 1e6:.1f}MB)"
     )
@@ -481,7 +514,7 @@ def test_c2b_weight_retrain_finish_releases_judge_rss() -> None:
     )
 
 
-def test_c3a_cached_judge_load_makes_zero_network_requests() -> None:
+def test_c3a_cached_judge_load_makes_zero_network_requests(tmp_path: Path) -> None:
     """C3(a): with the configured judge id present in the local HF cache
     (this machine's real cache dir, per the module's own `get_cache_dir()`),
     building the judge via the production factory
@@ -496,11 +529,44 @@ def test_c3a_cached_judge_load_makes_zero_network_requests() -> None:
     Fail-first (pre-INC-5): `CrossEncoder(model_id, cache_folder=...)` with
     no offline kwargs at all issues real HEAD/GET requests to the Hub (O15)
     -> connect_calls > 0.
+
+    The measured window includes the library's own once-a-day request. huggingface_hub
+    1.30.0 builds an "is an AI agent calling me" user-agent for every request, which
+    reads a registry file in the HF home (`$HF_HOME/.agent_harnesses.json`, younger
+    than 24 h) and otherwise does `GET {endpoint}/api/agent-harnesses` -- before the
+    offline short-circuit, so a `local_files_only` load made that one GET (#554).
+    The app switches the library's telemetry off for the whole process (`brain/
+    __init__.py` sets `HF_HUB_DISABLE_TELEMETRY`), so the load must not make it. The
+    HF home is not in the CI model cache, so whether the registry file existed depended
+    on whether an earlier test had loaded a judge (random order exposed it, #540); the
+    script therefore points the constant at a fresh, ABSENT file under the test's
+    scratch directory, which is the state of the first load of a day, and nothing is
+    written there for the library to find. The library's own opt-outs are removed from
+    the environment first (a runner that exports one would pass without the fix), `brain`
+    is imported before the library as every entry point does, and the telemetry flag is
+    checked on before and after the load.
     """
     script = textwrap.dedent(
         """
         import json
+        import os
         import socket
+
+        # See the test docstring: the library's opt-outs must not be what keeps the request away.
+        for _name in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "HF_HUB_DISABLE_TELEMETRY", "DISABLE_TELEMETRY", "DO_NOT_TRACK"):
+            os.environ.pop(_name, None)
+
+        # The package import is what turns the library's telemetry off; it comes before the library, as in every entry point.
+        import brain  # noqa: F401
+
+        # Reading the constant first fails loudly (AttributeError) if the library renames it.
+        import huggingface_hub.constants as hf_constants
+
+        assert hf_constants.AGENT_HARNESSES_PATH
+        assert hf_constants.HF_HUB_OFFLINE is False
+        assert hf_constants.HF_HUB_DISABLE_TELEMETRY is True
+        hf_constants.AGENT_HARNESSES_PATH = os.path.join(os.environ["RSS_TEST_SCRATCH_DIR"], "agent-harnesses.json")
+        assert not os.path.exists(hf_constants.AGENT_HARNESSES_PATH)
 
         _connect_calls = [0]
         _orig_connect = socket.socket.connect
@@ -520,6 +586,7 @@ def test_c3a_cached_judge_load_makes_zero_network_requests() -> None:
         import huggingface_hub.utils._http as hf_http
 
         _hf_session_calls = [0]
+        _hf_session_requests = []
         _orig_get_session = hf_http.get_session
 
         def _counting_get_session():
@@ -529,6 +596,7 @@ def test_c3a_cached_judge_load_makes_zero_network_requests() -> None:
 
                 def _counting_request(*a, **kw):
                     _hf_session_calls[0] += 1
+                    _hf_session_requests.append([repr(x) for x in a[:2]] + [f"{k}={v!r}" for k, v in kw.items() if k in ("method", "url")])
                     return _orig_request(*a, **kw)
 
                 session.request = _counting_request
@@ -545,8 +613,10 @@ def test_c3a_cached_judge_load_makes_zero_network_requests() -> None:
         print(json.dumps({
             "connect_calls": _connect_calls[0],
             "hf_session_calls": _hf_session_calls[0],
+            "hf_session_requests": _hf_session_requests,
             "model_id": provider.model_id(),
             "score_is_float": isinstance(score, float),
+            "telemetry_flag_after": hf_constants.HF_HUB_DISABLE_TELEMETRY,
             # S81 (owner ruling, "CPU everywhere (Recommended)"): every
             # judge construction site passes device="cpu" explicitly now
             # (relevance_judge.py), so this assertion measures the actual
@@ -559,23 +629,24 @@ def test_c3a_cached_judge_load_makes_zero_network_requests() -> None:
         }))
         """
     )
-    result = _run_subprocess_script(script)
+    result = _run_subprocess_script(script, tmp_path)
     assert result["model_id"] == "BAAI/bge-reranker-v2-m3"
     assert result["score_is_float"]
+    assert result["telemetry_flag_after"] is True, "the offline load switched the library's telemetry back on"
     assert result["device"] == "cpu", (
         f"expected the S81 device='cpu' construction to land the judge on cpu, "
         f"got {result['device']!r}"
     )
     assert result["hf_session_calls"] == 0, (
         f"expected zero huggingface_hub HTTP-session calls for a cached judge load, "
-        f"got {result['hf_session_calls']}"
+        f"got {result['hf_session_calls']}: {result['hf_session_requests']}"
     )
     assert result["connect_calls"] == 0, (
         f"expected zero network connects for a cached judge load, got {result['connect_calls']}"
     )
 
 
-def test_c3b_uncached_judge_id_attempts_network_load() -> None:
+def test_c3b_uncached_judge_id_attempts_network_load(tmp_path: Path) -> None:
     """C3(b): with a cache dir that does NOT have the judge cached (a fresh
     empty tmp dir passed as `cache_dir`), `offline_load_kwargs` returns `{}`
     (no offline kwargs at all) -- so the caller falls through to today's
@@ -588,8 +659,8 @@ def test_c3b_uncached_judge_id_attempts_network_load() -> None:
     script = textwrap.dedent(
         """
         import json
+        import os
         import socket
-        import tempfile
 
         _connect_calls = [0]
 
@@ -601,7 +672,8 @@ def test_c3b_uncached_judge_id_attempts_network_load() -> None:
 
         import brain.memory.relevance_judge as rj
 
-        empty_cache_dir = tempfile.mkdtemp()
+        empty_cache_dir = os.path.join(os.environ["RSS_TEST_SCRATCH_DIR"], "empty-hf-cache")
+        os.makedirs(empty_cache_dir)
         kwargs = rj.offline_load_kwargs("BAAI/bge-reranker-v2-m3", empty_cache_dir)
 
         # offline_load_kwargs itself must have already tried (and failed) the
@@ -623,7 +695,7 @@ def test_c3b_uncached_judge_id_attempts_network_load() -> None:
         }))
         """
     )
-    result = _run_subprocess_script(script)
+    result = _run_subprocess_script(script, tmp_path)
     assert not result["hf_cached_probe_itself_touched_network"], (
         "the _hf_cached probe (local_files_only=True) must decide 'not cached' without "
         "ever touching the network itself"

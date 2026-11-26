@@ -22,11 +22,21 @@ type Props = {
   onDismiss: (auditId: string) => void;
   onMounted: (auditId: string) => void;
   isStreaming?: boolean;
+  /** Text to start the reply box with: a reply whose send could not get a session is given back here (#523). */
+  initialDraft?: string;
 };
 
-export function InitiateBanner({ message, companionName, onSendReply, onDismiss, onMounted, isStreaming = false }: Props) {
+export function InitiateBanner({
+  message,
+  companionName,
+  onSendReply,
+  onDismiss,
+  onMounted,
+  isStreaming = false,
+  initialDraft = "",
+}: Props) {
   const firedRef = useRef(false);
-  const [draft, setDraft] = useState("");
+  const [draft, setDraft] = useState(initialDraft);
 
   useEffect(() => {
     // 2-second on-screen timer that respects document visibility:

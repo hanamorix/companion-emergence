@@ -5,6 +5,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import pytest
+
+from brain import process_identity
 from brain.bridge import state_file
 
 
@@ -90,6 +93,10 @@ def test_clean_shutdown_predicate(persona_dir: Path):
 
 
 def test_running_predicate_with_live_pid(persona_dir: Path):
+    # #456: a live pid counts as the bridge only with its identity token (a token-less, pre-PR record must also prove
+    # by command line that it is a bridge; tests/bridge/test_identity_readers.py covers that).
+    from brain import process_identity
+
     s = state_file.BridgeState(
         persona="test-persona",
         pid=os.getpid(),
@@ -98,6 +105,8 @@ def test_running_predicate_with_live_pid(persona_dir: Path):
         stopped_at=None,
         shutdown_clean=False,
         client_origin="cli",
+        pid_token=process_identity.own_token(),
+        identity="token",
     )
     state_file.write(persona_dir, s)
     assert state_file.is_running(persona_dir) is True
@@ -115,3 +124,107 @@ def test_running_predicate_with_dead_pid(persona_dir: Path):
     )
     state_file.write(persona_dir, s)
     assert state_file.is_running(persona_dir) is False
+
+
+# ---- a reader process and the owning writer on bridge.json (the heal-on-read question) ----
+# state_file.read has always healed (it used attempt_heal, with no cross-process lock); under json_io the heal takes
+# <name>.heal.lock, the same lock the owner's backup-chain write takes, and re-validates under it. These pin that a
+# reader can never clobber or interleave with the owner's write, and that a healthy file is only ever read.
+
+
+def _state(pid: int) -> state_file.BridgeState:
+    return state_file.BridgeState(
+        persona="p", pid=pid, port=51000 + pid, started_at="2026-10-19T00:00:00Z", stopped_at=None,
+        shutdown_clean=False, client_origin="cli",
+    )
+
+
+def _tree(d: Path) -> dict[str, bytes]:
+    return {p.name: p.read_bytes() for p in sorted(d.iterdir()) if p.is_file() and not p.name.endswith(".lock")}
+
+
+def test_a_reader_of_a_healthy_bridge_json_leaves_every_file_byte_identical(persona_dir: Path):
+    for pid in (1, 2, 3):
+        state_file.write(persona_dir, _state(pid))
+    before = _tree(persona_dir)
+    for _ in range(3):
+        assert state_file.read(persona_dir) == _state(3)
+    assert _tree(persona_dir) == before  # no heal, no quarantine, no rewrite of the file or its .bak chain
+
+
+def test_reading_a_corrupt_bridge_json_restores_it_from_the_previous_save(persona_dir: Path):
+    """The contract the CLI and the daemon rely on (unchanged by the migration): a damaged file heals on read."""
+    state_file.write(persona_dir, _state(1))
+    state_file.write(persona_dir, _state(2))
+    (persona_dir / "bridge.json").write_text("{nope")
+    assert state_file.read(persona_dir) == _state(1)  # .bak1 holds the previous save
+    assert state_file.read(persona_dir) == _state(1)  # and the live file is whole again
+
+
+def test_a_healing_reader_never_undoes_or_interleaves_with_the_owners_writes(persona_dir: Path):
+    import threading
+
+    state_file.write(persona_dir, _state(1))
+    state_file.write(persona_dir, _state(2))
+    (persona_dir / "bridge.json").write_text("{nope")
+    last = 40
+    errors: list[BaseException] = []
+    seen: list[int | None] = []
+    barrier = threading.Barrier(4)
+
+    def owner() -> None:
+        try:
+            barrier.wait()
+            for pid in range(3, last + 1):
+                state_file.write(persona_dir, _state(pid))
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def reader() -> None:
+        try:
+            barrier.wait()
+            for _ in range(60):
+                s = state_file.read(persona_dir)
+                seen.append(None if s is None else s.pid)
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    threads = [threading.Thread(target=owner)] + [threading.Thread(target=reader) for _ in range(3)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert not errors, errors
+    assert state_file.read(persona_dir) == _state(last)  # the owner's last write stands: no heal reinstalled an older bak
+    assert all(pid is not None and pid in range(1, last + 1) for pid in seen)  # every read saw a whole state
+    left = [p.name for p in persona_dir.iterdir() if ".tmp" in p.name or p.name.endswith(".new")]
+    assert not left, left
+
+
+# ---- update(): the bridge writes only its own record (HN2 moved the own-identity test to process_identity) -----------------
+
+_PIN = "pins what update() already did before the own-identity test moved to process_identity"
+
+
+@pytest.mark.no_base_failure(reason=_PIN)
+def test_update_writes_a_record_with_this_pid_and_no_token_when_this_process_has_none(persona_dir: Path, monkeypatch):
+    monkeypatch.setattr(process_identity, "own_token", lambda: None)
+    state_file.write(persona_dir, _state(os.getpid()))
+    assert state_file.update(persona_dir, lambda s: setattr(s, "port", 1234)) is True
+    assert state_file.read(persona_dir).port == 1234
+
+
+@pytest.mark.no_base_failure(reason=_PIN)
+def test_update_skips_a_record_of_another_pid(persona_dir: Path, monkeypatch):
+    monkeypatch.setattr(process_identity, "own_token", lambda: None)
+    state_file.write(persona_dir, _state(os.getpid() + 1))
+    assert state_file.update(persona_dir, lambda s: setattr(s, "port", 1234)) is False
+    assert state_file.read(persona_dir).port != 1234
+
+
+@pytest.mark.no_base_failure(reason=_PIN)
+def test_update_skips_a_record_with_another_token(persona_dir: Path, monkeypatch):
+    monkeypatch.setattr(process_identity, "own_token", lambda: "linux:mine:1:1")
+    state = _state(os.getpid())
+    state.pid_token = "linux:other:1:1"
+    state_file.write(persona_dir, state)
+    assert state_file.update(persona_dir, lambda s: setattr(s, "port", 1234)) is False
+    assert state_file.read(persona_dir).port != 1234

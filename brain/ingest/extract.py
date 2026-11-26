@@ -15,9 +15,12 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 from brain import prompt_strings
+from brain.bridge.cli_throttle import ShutdownDeferred, ThrottleDeferred
 from brain.bridge.provider import LLMProvider
+from brain.health.parse_failures import record_parse_failure
 from brain.ingest.types import ExtractedItem
 
 logger = logging.getLogger(__name__)
@@ -44,65 +47,65 @@ class ExtractionOutcome:
     ``items=[]`` is valid when the transcript contained no durable memories.
     ``failed=True`` means provider/parse failures exhausted retries and the
     caller should retain the source buffer for a future retry.
+    ``deferred=True`` means the model call was refused as "not now" (an expired
+    login, a lost slot; a ``ThrottleDeferred``, #473): nothing was tried and
+    nothing failed, so the caller leaves everything as it is, counts no failure
+    and records no backoff. A bridge that is stopping (``ShutdownDeferred``,
+    #456) is raised instead, so the sweep ends.
     """
 
     items: list[ExtractedItem]
     failed: bool = False
     error: str | None = None
+    deferred: bool = False
+
+
+def format_turn_line(turn: dict, user_label: str, assistant_label: str) -> str | None:
+    """Format one buffer row as its ``"speaker: text"`` transcript line, or None for a compaction ``summary`` row.
+
+    A ``summary`` row is a faded recap of the conversation, NOT a turn to extract: returning None here (the single
+    chokepoint feeding the extractor) means no extraction path ever re-ingests a summary as memory.
+
+    ``user_label`` / ``assistant_label`` replace the generic ``user`` / ``assistant`` speakers (Bug A in the 2026-05-05
+    audit-3: naming both speakers stops the extractor attributing the user's statements to people the assistant's replies
+    mention). Any other speaker keeps its own name. Attached images become inline ``[image: <first 8 hex>]`` markers so the
+    extractor records that an image was shared (commit.py matches the marker back to the row's ``image_shas``); bytes are
+    never inlined. A row body may span several physical lines.
+    """
+    speaker = turn.get("speaker", "?")
+    if speaker == "summary":
+        return None
+    if speaker == "user":
+        label = user_label
+    elif speaker == "assistant":
+        label = assistant_label
+    else:
+        label = speaker
+    body = turn.get("text", "")
+    shas = turn.get("image_shas") or []
+    if shas:
+        markers = " ".join(f"[image: {s[:8]}]" for s in shas)
+        body = f"{markers} {body}".strip() if body else markers
+    return f"{label}: {body}"
 
 
 def format_transcript(
     turns: list[dict],
-    max_tokens: int = 6000,
     *,
     user_name: str | None = None,
     assistant_name: str | None = None,
 ) -> str:
-    """Format turns as "speaker: text" lines, capped to max_tokens*4 chars.
+    """Format turns as ``"speaker: text"`` lines (``format_turn_line``) joined by newlines; summary rows are skipped.
 
-    The crude 4-chars-per-token estimate matches the OG implementation.
-    When the transcript is too long, the *tail* is kept — recent context
-    is more relevant for extraction.
+    Formatting only, never a cut: the size of one extraction call is bounded by the chunker
+    (``brain.ingest.ingest_utils.chunk_turns``), which splits a span on row boundaries so every row reaches the extractor.
 
-    user_name / assistant_name: when provided, replace the generic
-    "user:" / "assistant:" speaker labels with the actual names. This
-    disambiguates extraction when the assistant's replies reference
-    historical figures by name (Bug A in the 2026-05-05 audit-3:
-    Hana's framework work was attributed to Jordan because Jordan was
-    mentioned in the assistant's soul-context lines).
+    user_name / assistant_name: when provided, replace the generic "user" / "assistant" speaker labels (each falls back
+    to the generic label on its own when unset; see ``format_turn_line``).
     """
     user_label = user_name if user_name else "user"
     assistant_label = assistant_name if assistant_name else "assistant"
-    lines = []
-    for t in turns:
-        speaker = t.get("speaker", "?")
-        # A compaction `summary` row is a faded recap of the conversation, NOT a
-        # turn to extract — skip it here (the single chokepoint feeding the
-        # extractor) so NO extraction path (extract_session_snapshot OR
-        # close_session) ever re-ingests the summary as memory.
-        if speaker == "summary":
-            continue
-        if speaker == "user":
-            label = user_label
-        elif speaker == "assistant":
-            label = assistant_label
-        else:
-            label = speaker
-        body = t.get("text", "")
-        # Surface attached images as inline markers so the extractor
-        # records that an image was shared in this turn — the marker
-        # carries the first 8 hex of the sha so commit.py can match
-        # back to the buffer's image_shas list. Bytes never inline.
-        shas = t.get("image_shas") or []
-        if shas:
-            markers = " ".join(f"[image: {s[:8]}]" for s in shas)
-            body = f"{markers} {body}".strip() if body else markers
-        lines.append(f"{label}: {body}")
-    text = "\n".join(lines)
-    cap = max_tokens * 4
-    if len(text) > cap:
-        text = text[-cap:]
-    return text
+    return "\n".join(line for t in turns if (line := format_turn_line(t, user_label, assistant_label)) is not None)
 
 
 def parse_extraction(raw: str | None) -> list[ExtractedItem] | None:
@@ -218,8 +221,10 @@ def extract_items_with_status(
     assistant_name: str | None = None,
     emotion_vocab: str = "",
     user_pronouns: object = None,
+    persona_dir: Path | None = None,
 ) -> ExtractionOutcome:
     """Call the provider and distinguish valid-empty from failed-empty.
+    Each unparseable reply is kept in the parse-failure log (#364).
 
     Backward-compatible ``extract_items`` intentionally keeps returning just a
     list. The ingest pipeline uses this richer outcome so provider/parse
@@ -256,6 +261,13 @@ def extract_items_with_status(
         raw_text: str | None = None
         try:
             raw_text = provider.generate(prompt)
+        except ShutdownDeferred:
+            # #456: the bridge is stopping: the sweep ends here (its callers re-raise), nothing is recorded.
+            raise
+        except ThrottleDeferred as exc:
+            # "Not now" (#473): no retry (the next call would be refused too), no failure.
+            logger.info("extract_items: provider.generate deferred: %s", exc)
+            return ExtractionOutcome(items=[], deferred=True, error=str(exc))
         except Exception as exc:  # noqa: BLE001
             last_error = f"provider.generate failed on attempt {attempt}: {exc}"
             logger.warning(
@@ -268,7 +280,7 @@ def extract_items_with_status(
             return ExtractionOutcome(items=items)
 
         last_error = f"parse failed on attempt {attempt}/{max_retries}"
-        logger.warning("extract_items: parse failed on attempt %d/%d", attempt, max_retries)
+        record_parse_failure(persona_dir, site="ingest_extract", raw=raw_text or "", error=last_error)
 
     logger.warning("extract_items: gave up after %d retries", max_retries)
     return ExtractionOutcome(

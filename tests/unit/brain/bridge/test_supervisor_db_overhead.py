@@ -93,6 +93,21 @@ def _seed_overdue_cadence(persona_dir: Path, filename: str) -> None:
     )
 
 
+class _EndOfTickStop(threading.Event):
+    """A stop_event that sets itself at the END of a loop iteration (the loop's inter-tick ``wait``) once
+    ``done()`` says enough ticks have run. #456 (C1): a stop requested mid-iteration skips that iteration's later
+    blocks, so these harnesses end the loop at the tick boundary instead of from inside the tick."""
+
+    def __init__(self, done=lambda: True):
+        super().__init__()
+        self._done = done
+
+    def wait(self, timeout=None):
+        if self._done():
+            self.set()
+        return super().wait(timeout)
+
+
 def _drive_ticks(
     persona_dir: Path,
     *,
@@ -119,9 +134,9 @@ def _drive_ticks(
     disabled") stubs the central pass out so only the per-tick store is
     constructed; tests that exercise a gated job pass ``central_pass=True``.
     """
-    stop_event = threading.Event()
     bus = bus or _CapturingBus()
     counter = _TickCounter()
+    stop_event = _EndOfTickStop(lambda: counter.n >= num_ticks)
     constructions: list[dict] = []
     closes: list[dict] = []
     maker_calls: list[dict] = []
@@ -140,8 +155,6 @@ def _drive_ticks(
     def _make_memory_store(*args, **kwargs):
         counter.n += 1
         this_tick = counter.n
-        if this_tick >= num_ticks:
-            stop_event.set()
         if memstore_raises_on_tick and this_tick in memstore_raises_on_tick:
             raise RuntimeError(f"simulated store-open failure on tick {this_tick}")
         obj = _CountingStore(*args, **kwargs)
@@ -590,11 +603,10 @@ def test_build_app_kwargs_to_run_folded_carry_no_silence_minutes_key():
 
 def _drive_one_maintenance_tick(persona_dir: Path, *, throttle_grants: bool):
     _seed_overdue_cadence(persona_dir, "maintenance_cadence.json")
-    stop_event = threading.Event()
+    stop_event = _EndOfTickStop()
     real_memory_store = brain.memory.store.MemoryStore
 
     def _stop_after_sweep(*a, **kw):
-        stop_event.set()
         return real_memory_store(*a, **kw)
 
     # A shared call-order list, not just two independent MagicMocks — two
@@ -695,11 +707,10 @@ def test_forgetting_failure_does_not_skip_narrative_pass(tmp_path):
     """
     persona_dir = _persona_dir(tmp_path)
     _seed_overdue_cadence(persona_dir, "maintenance_cadence.json")
-    stop_event = threading.Event()
+    stop_event = _EndOfTickStop()
     real_memory_store = brain.memory.store.MemoryStore
 
     def _stop_after_sweep(*a, **kw):
-        stop_event.set()
         return real_memory_store(*a, **kw)
 
     narrative_spy = MagicMock()

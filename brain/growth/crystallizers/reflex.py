@@ -1,7 +1,7 @@
 """Reflex crystallizer — emergence + pruning judgment via Claude CLI.
 
 Phase 2 of the reflex engine. Deferred — see
-`docs/superpowers/specs/2026-04-28-reflex-phase-2-emergent-arc-crystallization-design.md`
+the 2026-04-28 reflex phase-2 emergent-arc crystallization design (never committed and lost, #797)
 §14; chunks 7–8 (apply + acceptance gate) never landed, zero prod callers.
 
 This module currently exposes:
@@ -24,7 +24,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider, ProviderError
+from brain.emotion.vocabulary import pool_by_canonical_name
 from brain.engines.reflex import ArcFire, ReflexArc
 from brain.growth.arc_storage import read_removed_arcs
 from brain.growth.log import read_growth_log
@@ -33,6 +35,8 @@ from brain.growth.proposal import (
     ReflexCrystallizationResult,
     ReflexPruneProposal,
 )
+from brain.health.json_io import read_json
+from brain.health.parse_failures import record_parse_failure
 from brain.memory.store import MemoryStore
 
 logger = logging.getLogger(__name__)
@@ -69,16 +73,12 @@ def _build_corpus(
     # 1. Fire log — load from reflex_log.json (raw, defensive)
     fire_log_path = persona_dir / "reflex_log.json"
     all_fires: list[ArcFire] = []
-    if fire_log_path.exists():
+    raw = read_json(fire_log_path, default=dict, expect=dict)  # missing/corrupt/unreadable: no fires (module warns)
+    for f in raw.get("fires", []):
         try:
-            raw = json.loads(fire_log_path.read_text(encoding="utf-8"))
-            for f in raw.get("fires", []):
-                try:
-                    all_fires.append(ArcFire.from_dict(f))
-                except (KeyError, ValueError, TypeError):
-                    pass  # skip malformed entries
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("could not read fire log at %s: %s", fire_log_path, exc)
+            all_fires.append(ArcFire.from_dict(f))
+        except (KeyError, ValueError, TypeError):
+            pass  # skip malformed entries
 
     fires_in_window = [f for f in all_fires if f.fired_at >= cutoff]
     fires_by_arc: dict[str, list[ArcFire]] = {}
@@ -131,7 +131,7 @@ def _build_corpus(
         excerpt = ""
         if f.output_memory_id:
             try:
-                mem = store.get(f.output_memory_id)
+                mem = store.get(f.output_memory_id, bump=False)  # a judging pass, not a recall (#587)
                 if mem is not None:
                     excerpt = (mem.content or "")[:200]
             except Exception:
@@ -385,6 +385,8 @@ def crystallize_reflex(
     # Provider call — never raise out of this function
     try:
         response_text = provider.generate(prompt)
+    except ThrottleDeferred:
+        raise  # #456: "not now": no growth run is recorded for this tick
     except ProviderError as exc:
         logger.warning("crystallize_reflex: provider failed: %s", exc)
         return ReflexCrystallizationResult(emergences=[], prunings=[])
@@ -394,6 +396,7 @@ def crystallize_reflex(
 
     parsed = _parse_response(response_text)
     if parsed is None:
+        record_parse_failure(persona_dir, site="reflex", raw=response_text, error="not a JSON object")
         return ReflexCrystallizationResult(emergences=[], prunings=[])
 
     raw_emergences = parsed.get("emergences", [])
@@ -406,7 +409,7 @@ def crystallize_reflex(
     # Validate emergences
     accepted_emergences: list[ReflexArcProposal] = []
     current_arc_names = {a.name for a in current_arcs}
-    existing_trigger_keysets = [frozenset(a.trigger.keys()) for a in current_arcs]
+    existing_trigger_keysets = [frozenset(pool_by_canonical_name(a.trigger)) for a in current_arcs]
 
     for prop_dict in raw_emergences:
         if not isinstance(prop_dict, dict):
@@ -477,7 +480,7 @@ def crystallize_reflex(
     # Phase 4.2 — emit one initiate candidate per accepted decision. Wrapped
     # in try/except so a downstream emit failure can never crash the
     # crystallizer: reflex emergence is physiology, initiate is signal.
-    aggregated_vector = _aggregate_recent_emotion_vector(store, now=now)
+    aggregated_vector = _aggregate_recent_emotion_vector(store, now=now, persona_dir=persona_dir)
     for emergence in accepted_emergences:
         _emit_initiate_candidate(
             persona_dir=persona_dir,
@@ -502,29 +505,24 @@ def _aggregate_recent_emotion_vector(
     store: MemoryStore,
     *,
     now: datetime,
+    persona_dir: Path,
     look_back_days: int = 7,
 ) -> dict[str, float]:
-    """Return a max-pooled emotion vector across recent active memories.
+    """Return her recent emotion vector: the emotion engine's short averages above 0. Context only.
 
     Used by crystallizers to give their initiate candidates a real
-    emotional context — what's been alive in the persona over the
-    last week, not a moment-in-time felt state. Empty dict on any
-    failure (the emit candidate just carries no vector — better than
-    a zero-filled lie).
+    emotional context. Empty while the engine is not reading (not switched
+    over, or its state cannot be read), and on any failure: the emit
+    candidate just carries no vector, better than a zero-filled lie. The
+    old max-pool of recent memories went in emotion rework B1 PR 7.
     """
     try:
-        from brain.emotion.aggregate import aggregate_state
+        from brain.emotion.engine import engine_for
 
-        cutoff = now - timedelta(days=look_back_days)
-        recent: list[Any] = []
-        for mtype in _CONVERSATION_TYPES:
-            for mem in store.list_by_type(mtype, active_only=True):
-                if mem.created_at >= cutoff and mem.emotions:
-                    recent.append(mem)
-        if not recent:
+        eng = engine_for(persona_dir)
+        if not eng.is_live():
             return {}
-        state = aggregate_state(recent)
-        return dict(state.emotions)
+        return {name: r.short for name, r in eng.read().items() if r.short > 0}
     except Exception as exc:  # noqa: BLE001
         logger.warning("reflex: recent-emotion aggregation failed: %s", exc)
         return {}
@@ -644,7 +642,8 @@ def _validate_emergence_proposal(
         return False, "gate 5: prompt_template fails format_map smoke test"
 
     # Gate 8: trigger non-overlap with existing arcs (strict subset/superset)
-    proposed_keyset = frozenset(trigger_typed.keys())
+    # Both sides are keyed by canonical name, so a proposal spelled differently from an arc still overlaps it.
+    proposed_keyset = frozenset(pool_by_canonical_name(trigger_typed))
     for existing_keyset in existing_trigger_keysets:
         if proposed_keyset == existing_keyset:
             # Exact match — would have been gate 2 caught if same name; if
@@ -766,15 +765,6 @@ def _load_emotion_vocabulary(persona_dir: Path) -> set[str]:
 
     Missing file or corruption → empty set (gate 4 will reject any trigger).
     """
-    path = persona_dir / "emotion_vocabulary.json"
-    if not path.exists():
-        return set()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        emotions = data.get("emotions", [])
-        return {
-            e["name"] for e in emotions if isinstance(e, dict) and isinstance(e.get("name"), str)
-        }
-    except (json.JSONDecodeError, OSError, KeyError) as exc:
-        logger.warning("could not read emotion_vocabulary.json: %s", exc)
-        return set()
+    data = read_json(persona_dir / "emotion_vocabulary.json", default=dict, expect=dict)
+    emotions = data.get("emotions", [])
+    return {e["name"] for e in emotions if isinstance(e, dict) and isinstance(e.get("name"), str)}

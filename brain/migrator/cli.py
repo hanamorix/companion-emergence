@@ -11,11 +11,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.bridge.state_file import pid_is_alive
+from brain import process_identity
 from brain.emotion import vocabulary as _vocabulary
-from brain.health.attempt_heal import save_with_backup_text
+from brain.health.json_io import write_json
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from brain.migrator.install_swap import PersonaInUseError, install_over, refuse_if_in_use
 from brain.migrator.og import FileManifest, OGReader
 from brain.migrator.og_interests import extract_interests_from_og, extract_soul_names_best_effort
 from brain.migrator.og_journal_dna import migrate_creative_dna, migrate_journal_memories
@@ -28,6 +29,7 @@ from brain.migrator.og_vocabulary import extract_persona_vocabulary
 from brain.migrator.report import MigrationReport, format_report, write_source_manifest
 from brain.migrator.transform import SkippedMemory, transform_memory
 from brain.paths import get_persona_dir
+from brain.utils.atomic_write import save_with_backup_text
 
 _MIGRATOR_MARKER_FILES = frozenset({"migration-report.md", "source-manifest.json", "memories.db"})
 
@@ -56,12 +58,14 @@ def _acquire_migrate_lock(lock_path: Path) -> int:
         fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
         existing_pid: int | None = None
+        existing_token: str | None = None
         try:
-            first_line = lock_path.read_text(encoding="utf-8").splitlines()[0]
-            existing_pid = int(first_line.strip())
+            lines = lock_path.read_text(encoding="utf-8").splitlines()
+            existing_pid = int(lines[0].strip())
+            existing_token = lines[2].strip() if len(lines) > 2 else None  # #472: holder identity (newer format)
         except (OSError, ValueError, IndexError):
             existing_pid = None
-        if existing_pid is None or not pid_is_alive(existing_pid):
+        if existing_pid is None or not process_identity.holder_alive(existing_pid, existing_token):
             # Stale or unreadable — take over.
             try:
                 lock_path.unlink()
@@ -72,7 +76,8 @@ def _acquire_migrate_lock(lock_path: Path) -> int:
             f"another migrate is in progress: pid={existing_pid} holds {lock_path}. "
             f"If you're sure no other migrate is running, remove the lockfile."
         ) from None
-    payload = f"{os.getpid()}\n{datetime.now(UTC).isoformat()}\n"
+    # Line 1 stays the bare pid (older readers parse only it); line 3 is this process's identity token (#472).
+    payload = f"{os.getpid()}\n{datetime.now(UTC).isoformat()}\n{process_identity.own_token() or ''}\n"
     os.write(fd, payload.encode("utf-8"))
     return fd
 
@@ -145,6 +150,7 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
                 f"Persona directory already exists: {final_dir}. "
                 "Pass --force to back up and overwrite."
             )
+        refuse_if_in_use(final_dir)  # #754: before any work; install_over checks again at the swap
         # Write to <name>.new alongside the final dir for atomic rename.
         work_dir = final_dir.with_name(f"{args.install_as}.new")
         if work_dir.exists():
@@ -180,7 +186,7 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
                 )
                 continue
             seen_ids.add(mem.id)
-            store.create(mem)
+            store.create(mem, fold=False)
             migrated_count += 1
     finally:
         store.close()
@@ -210,12 +216,7 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
                 og_memories_for_vocab,
                 framework_baseline_names=framework_baseline_names,
             )
-            _vocab_tmp = vocab_target.with_suffix(vocab_target.suffix + ".new")
-            _vocab_tmp.write_text(
-                json.dumps({"version": 1, "emotions": vocab_entries}, indent=2) + "\n",
-                encoding="utf-8",
-            )
-            os.replace(_vocab_tmp, vocab_target)
+            write_json(vocab_target, {"version": 1, "emotions": vocab_entries}, fsync=False)
             vocabulary_emotions_migrated = len(vocab_entries)
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             vocabulary_skipped_reason = f"migrate_error: {exc}"
@@ -268,12 +269,7 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
             try:
                 soul_names = extract_soul_names_best_effort(args.input_dir)
                 og_interests = extract_interests_from_og(og_interests_path, soul_names=soul_names)
-                _interests_tmp = interests_target.with_suffix(interests_target.suffix + ".new")
-                _interests_tmp.write_text(
-                    json.dumps({"version": 1, "interests": og_interests}, indent=2) + "\n",
-                    encoding="utf-8",
-                )
-                os.replace(_interests_tmp, interests_target)
+                write_json(interests_target, {"version": 1, "interests": og_interests}, fsync=False)
                 interests_migrated = len(og_interests)
             except (OSError, json.JSONDecodeError, ValueError) as exc:
                 interests_skipped_reason = f"migrate_error: {exc}"
@@ -426,17 +422,12 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
     # a half-written migration-report.md and the operator wouldn't know the
     # SQLite DBs already committed successfully.
     save_with_backup_text(work_dir / "migration-report.md", report_text)
-    print(report_text)
 
-    # ---- finalise install-as with backup + atomic rename ----
+    # ---- finalise install-as: back up the live folder and rename the build in, under the start lock ----
     if finalise_target is not None:
-        if finalise_target.exists():
-            ts = datetime.now(UTC).strftime("%Y-%m-%dT%H%M%S")
-            backup = finalise_target.with_name(f"{finalise_target.name}.backup-{ts}")
-            os.rename(finalise_target, backup)
-        finalise_target.parent.mkdir(parents=True, exist_ok=True)
-        os.rename(work_dir, finalise_target)
+        install_over(finalise_target, work_dir)  # #754: takes the start lock; raises PersonaInUseError while it is held
 
+    print(report_text)  # after the swap: a refused install prints only its refusal (#754 review)
     return report
 
 
@@ -597,7 +588,20 @@ def build_parser(subparsers: argparse._SubParsersAction | None = None) -> argpar
 def _dispatch(args: argparse.Namespace) -> int:
     """Argparse-compatible handler: convert Namespace → run the right
     migrator for the chosen ``--source`` (nellbrain or emergence-kit).
+
+    A forced install over a persona in use (#754) is refused with its plain message and exit 1, not a traceback.
     """
+    import sys as _sys
+
+    try:
+        return _dispatch_source(args)
+    except PersonaInUseError as exc:
+        print(exc, file=_sys.stderr)
+        return 1
+
+
+def _dispatch_source(args: argparse.Namespace) -> int:
+    """Run the migrator for ``args.source``; `_dispatch` turns a refused install into exit 1."""
     import sys as _sys
 
     emit_json = getattr(args, "json", False) or not _sys.stdout.isatty()

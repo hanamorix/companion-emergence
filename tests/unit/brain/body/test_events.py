@@ -1,6 +1,6 @@
 """Unit tests for brain/body/events.py — record_climax_event helper.
 
-Spec: docs/superpowers/specs/2026-04-29-body-state-design.md.
+Spec: docs/source-spec/2026-04-29-body-state-design.md §5.1.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from brain.body.events import record_climax_event
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import read_jsonl
 from brain.memory.store import Memory, MemoryStore
 
 
@@ -68,9 +68,9 @@ def test_journal_carries_originating_emotions(store, persona_dir):
         persona_dir=persona_dir,
     )
     j = store.list_by_type("journal_entry", active_only=True)[0]
-    assert j.emotions["climax"] == 8.0
-    assert j.emotions["arousal"] == 8.0
-    assert j.emotions["desire"] == 8.0
+    assert j._stored_emotions["climax"] == 8.0
+    assert j._stored_emotions["arousal"] == 8.0
+    assert j._stored_emotions["desire"] == 8.0
 
 
 def test_journal_content_includes_originating_snippet(store, persona_dir):
@@ -96,7 +96,7 @@ def test_emits_behavioral_log_entry(store, persona_dir):
     )
     log_path = persona_dir / "behavioral_log.jsonl"
     assert log_path.exists()
-    entries = list(read_jsonl_skipping_corrupt(log_path))
+    entries = list(read_jsonl(log_path))
     assert len(entries) == 1
     e = entries[0]
     assert e["kind"] == "climax_event"

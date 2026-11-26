@@ -26,13 +26,14 @@ from brain.bridge.supervisor import (
     run_folded,
 )
 from brain.engines import interest_sweep
+from tests.thread_support import finish_threads
 
 
 @pytest.fixture(autouse=True)
 def _no_leaked_supervisor_threads():
     """Fail the test that leaks a live thread, not the innocent one downstream.
 
-    17 tests in this file start a supervisor thread and none used try/finally.
+    Many tests in this file start a supervisor thread and none used try/finally.
     An assertion between `t.start()` and `stop.set()` therefore leaves a daemon
     thread running for the whole session; the heartbeat-failure test's thread
     logs ERROR every tick, which is how it broke an unrelated maker test on
@@ -90,7 +91,7 @@ def _running_supervisor(stop: threading.Event, runner):
         yield t
     finally:
         stop.set()
-        t.join(timeout=_STARTUP_BUDGET_S)
+        finish_threads(t)
 
 
 def _ran_a_few_passes(bus: _CapturingBus) -> bool:
@@ -108,6 +109,17 @@ def test_audit_logs_registered_for_rotation() -> None:
     assert "chat_usage.jsonl" in registered
     assert "file_access.jsonl" in registered
     assert "attunement_errors.jsonl" in registered
+
+
+def test_consolidation_archive_is_never_rotated() -> None:
+    """#430 C6: the forgetting exemption reads every merge row of consolidation_archive.jsonl
+    (``brain.soul.candidates.merge_target_map``). Rotating or archiving it away un-protects merged
+    soul moments, so it must stay out of both rotation tables."""
+    from brain.bridge.supervisor import _YEARLY_ARCHIVE_LOGS
+    from brain.engines.consolidation import _ARCHIVE_FILENAME
+
+    assert _ARCHIVE_FILENAME not in {name for name, _ in _ROLLING_LOG_POLICIES}
+    assert _ARCHIVE_FILENAME not in {name for name, _ in _YEARLY_ARCHIVE_LOGS}
 
 
 def _persona_dir(tmp_path: Path) -> Path:
@@ -293,7 +305,7 @@ def test_run_folded_retries_heartbeat_soon_after_a_skip_not_a_full_interval(
         assert len(seen_last_heartbeat_at) >= 4, "did not observe enough heartbeat attempts"
     finally:
         stop.set()
-        t.join(timeout=_STARTUP_BUDGET_S)
+        finish_threads(t)
     assert not t.is_alive()
 
     # The two SKIPPED calls (both None) must have been handed the exact
@@ -361,7 +373,7 @@ def test_heartbeat_failure_does_not_break_supervisor_loop(tmp_path: Path) -> Non
         )
     finally:
         stop.set()
-        t.join(timeout=30.0)
+        finish_threads(t)
     assert not t.is_alive()
 
 
@@ -372,7 +384,6 @@ def test_run_heartbeat_tick_publishes_result_event(tmp_path: Path) -> None:
 
     # Fake HeartbeatEngine returns a result we can predict
     fake_result = MagicMock(
-        memories_decayed=0,
         edges_pruned=0,
         dream_id=None,
         reflex_fired=(),
@@ -390,9 +401,10 @@ def test_run_heartbeat_tick_publishes_result_event(tmp_path: Path) -> None:
     ):
         _run_heartbeat_tick(persona_dir, FakeProvider(), bus)
 
-    assert any(e.get("type") == "heartbeat_tick" for e in bus.events), (
-        "heartbeat_tick event was not published"
-    )
+    ticks = [e for e in bus.events if e.get("type") == "heartbeat_tick"]
+    assert ticks, "heartbeat_tick event was not published"
+    assert "memories_decayed" not in ticks[0]
+    assert ticks[0]["edges_pruned"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -446,7 +458,7 @@ def test_supervisor_snapshot_sweep_keeps_session_alive(
     t.start()
     _wait_until(lambda: "session_snapshot" in [e.get("type") for e in bus.events])
     stop.set()
-    t.join(timeout=30.0)
+    finish_threads(t)
 
     buf = persona_dir / "active_conversations" / f"{sid}.jsonl"
     assert buf.exists(), "snapshot sweep must NOT delete the buffer"
@@ -501,7 +513,7 @@ def test_supervisor_snapshot_sweep_defers_while_chat_active(
         lambda: len([e for e in bus.events if e.get("type") == "supervisor_tick"]) >= 3
     )
     stop.set()
-    t.join(timeout=30.0)
+    finish_threads(t)
 
     types = [e.get("type") for e in bus.events]
     assert "session_snapshot" not in types, (
@@ -550,7 +562,7 @@ def test_supervisor_tick_embeds_backlogged_memory(tmp_path: Path) -> None:
     t.start()
     _wait_until(lambda: "supervisor_tick" in [e.get("type") for e in bus.events])
     stop.set()
-    t.join(timeout=30.0)
+    finish_threads(t)
 
     store2 = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
     try:
@@ -607,7 +619,7 @@ def test_supervisor_embedding_backfill_defers_while_chat_active(tmp_path: Path) 
         lambda: len([e for e in bus.events if e.get("type") == "supervisor_tick"]) >= 3
     )
     stop.set()
-    t.join(timeout=30.0)
+    finish_threads(t)
 
     store2 = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
     try:
@@ -640,7 +652,7 @@ def test_supervisor_clustering_tick_writes_row_and_centroids_not_embeddings_db(
     from brain.memory.store import Memory, MemoryStore
 
     test_model_id = "fake-clustering-tick-model"
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, test_model_id)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, test_model_id)
 
     persona_dir = _persona_dir(tmp_path)
     store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
@@ -694,11 +706,14 @@ def test_supervisor_startup_deletes_legacy_embeddings_db_when_fully_embedded(
     all, proving the hook lives before that loop, not inside it — and
     actually deletes the stale file once every active row already carries a
     current-model embedding."""
+    from brain.bridge import model_tier
     from brain.memory import embeddings as embeddings_mod
     from brain.memory.store import Memory, MemoryStore
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    # The deletion gate reads the current model id without building a provider.
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     persona_dir = _persona_dir(tmp_path)
     store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
@@ -736,11 +751,14 @@ def test_supervisor_startup_defers_legacy_embeddings_db_deletion_with_backlog(
     """Same startup hook, other half: a still-un-embedded active row means
     the backlog gate is non-empty, so the legacy file must be left in place
     for the next startup rather than deleted early."""
+    from brain.bridge import model_tier
     from brain.memory import embeddings as embeddings_mod
     from brain.memory.store import Memory, MemoryStore
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    # The deletion gate reads the current model id without building a provider.
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     persona_dir = _persona_dir(tmp_path)
     store = MemoryStore(str(persona_dir / "memories.db"), integrity_check=False)
@@ -772,10 +790,19 @@ def test_supervisor_startup_defers_legacy_embeddings_db_deletion_with_backlog(
 
 
 def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:
-    """The hourly finalize cadence at 24h silence runs, deletes the buffer
-    + cursor, evicts from _SESSIONS, and publishes session_finalized."""
+    """The hourly finalize cadence at 24h silence runs, evicts the session from _SESSIONS and publishes
+    session_finalized. Finalize is extraction-only: it never deletes or moves the buffer (the rollover owns that). Here
+    the fake provider's reply never parses, so after three recorded failures finalize sets the failing chunk aside in
+    poison/ and moves the cursor past it; the buffer, now fully dealt with, stays until a rollover reaps it, which the
+    weekly rollover does once its oldest turn is a week old."""
+    import json as _json
+
+    from brain.chat.compaction import _ROLLOVER_QUIET_GAP, _WEEKLY_ROLLOVER_AGE
+    from brain.chat.rollover import maybe_weekly_rollover
     from brain.chat.session import create_session, get_session, reset_registry
-    from brain.ingest.buffer import ingest_turn
+    from brain.ingest.buffer import ingest_turn, read_backoff, read_cursor
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import MemoryStore
 
     reset_registry()
     persona_dir = _persona_dir(tmp_path)
@@ -805,14 +832,35 @@ def test_supervisor_finalize_cadence_drops_old_sessions(tmp_path: Path) -> None:
     )
     t.start()
     buf = persona_dir / "active_conversations" / f"{sid}.jsonl"
-    _wait_until(lambda: not buf.exists())
+    span = persona_dir / "active_conversations" / "poison" / f"{sid}.span.jsonl"
+    _wait_until(lambda: span.exists() and read_cursor(persona_dir, sid) is not None)
     stop.set()
-    t.join(timeout=30.0)
+    finish_threads(t)
 
-    assert not buf.exists(), "finalize must delete the buffer"
+    set_aside = [_json.loads(line) for line in span.read_text(encoding="utf-8").splitlines()]
+    assert [r["text"] for r in set_aside] == ["ancient"], "finalize must set the failing chunk aside"
+    assert read_cursor(persona_dir, sid) == old_ts, "the cursor moves past the chunk set aside"
+    assert read_backoff(persona_dir, sid) is None, "the failure record is cleared"
+    assert buf.exists(), "finalize never deletes or moves the buffer; the rollover reaps it"
     assert get_session(sid) is None, "finalize must remove from _SESSIONS"
     types = [e.get("type") for e in bus.events]
     assert "session_finalized" in types
+
+    # The buffer does not stay forever: once its oldest turn is a week old, the weekly rollover (the daily compaction job)
+    # reaps it, with nothing left to extract.
+    store = MemoryStore(persona_dir / "memories.db")
+    hebbian = HebbianMatrix(persona_dir / "hebbian.db")
+    try:
+        new_sid = maybe_weekly_rollover(
+            persona_dir, sid, persona_dir.name,
+            weekly_age=_WEEKLY_ROLLOVER_AGE, quiet_gap=_ROLLOVER_QUIET_GAP,
+            now=datetime.now(UTC) + _WEEKLY_ROLLOVER_AGE, provider=FakeProvider(),
+            store=store, hebbian=hebbian,
+        )
+    finally:
+        store.close()
+        hebbian.close()
+    assert new_sid is not None and not buf.exists(), "the weekly rollover reaps the old buffer"
     reset_registry()
 
 
@@ -853,6 +901,17 @@ def test_run_log_rotation_tick_rotates_oversize_heartbeat(tmp_path: Path) -> Non
     assert (persona_dir / "heartbeats.log.jsonl.1.gz").exists()
     types = [e.get("type") for e in bus.events]
     assert "log_rotation" in types
+
+
+def test_run_log_rotation_tick_rotates_oversize_extractor_errors(tmp_path: Path) -> None:
+    """#559: extractor_errors.jsonl is append-only with no reader (only the extractor and monologue capture write it),
+    so it is bounded like the other error logs."""
+    persona_dir = _persona_dir(tmp_path)
+    _write_oversize_log(persona_dir, "extractor_errors.jsonl", size_bytes=200_000)
+
+    _run_log_rotation_tick(persona_dir, _CapturingBus(), rolling_size_bytes=10_000)
+
+    assert (persona_dir / "extractor_errors.jsonl.1.gz").exists()
 
 
 def test_run_log_rotation_tick_archives_old_year_in_soul_audit(
@@ -979,81 +1038,6 @@ def test_run_folded_fires_log_rotation_after_interval(tmp_path: Path) -> None:
     assert not t.is_alive()
 
 
-def test_run_folded_fires_self_model_tick_when_due(tmp_path: Path) -> None:
-    """run_folded wires the self-model reflection into its own cadence block,
-    fault-isolated. The tick is persisted-cadence-gated internally (mirrors
-    soul review); its cadence is seeded overdue so it is due on the first
-    iteration (ram-spike-fix INC-9: a missing file means "last ran now")."""
-    persona_dir = _persona_dir(tmp_path)
-    _seed_self_model_overdue(persona_dir)
-    bus = EventBus()
-    stop = threading.Event()
-    fired = threading.Event()
-
-    def fake_tick(*args, **kwargs):
-        fired.set()
-
-    def runner():
-        with patch(
-            "brain.bridge.supervisor._run_self_model_tick",
-            side_effect=fake_tick,
-        ):
-            run_folded(
-                stop,
-                persona_dir=persona_dir,
-                provider=FakeProvider(),
-                event_bus=bus,
-                tick_interval_s=0.05,
-                heartbeat_interval_s=None,
-                soul_review_interval_s=None,
-                finalize_interval_s=None,
-                log_rotation_interval_s=None,
-                initiate_review_interval_s=None,
-                voice_reflection_interval_s=None,
-                self_model_interval_s=0.0,  # enabled
-            )
-
-    with _running_supervisor(stop, runner) as t:
-        assert fired.wait(timeout=_STARTUP_BUDGET_S), "self-model tick never fired despite enabled cadence"
-    assert not t.is_alive()
-
-
-def test_run_folded_skips_self_model_when_disabled(tmp_path: Path) -> None:
-    """self_model_interval_s=None disables the self-model cadence block."""
-    persona_dir = _persona_dir(tmp_path)
-    bus = _CapturingBus()
-    stop = threading.Event()
-    fired: list[int] = []
-
-    def fake_tick(*args, **kwargs):
-        fired.append(1)
-
-    def runner():
-        with patch(
-            "brain.bridge.supervisor._run_self_model_tick",
-            side_effect=fake_tick,
-        ):
-            run_folded(
-                stop,
-                persona_dir=persona_dir,
-                provider=FakeProvider(),
-                event_bus=bus,
-                tick_interval_s=0.05,
-                heartbeat_interval_s=None,
-                soul_review_interval_s=None,
-                finalize_interval_s=None,
-                log_rotation_interval_s=None,
-                initiate_review_interval_s=None,
-                voice_reflection_interval_s=None,
-                self_model_interval_s=None,
-            )
-
-    with _running_supervisor(stop, runner) as t:
-        assert _ran_a_few_passes(bus), "supervisor loop never ran"
-    assert not t.is_alive()
-    assert fired == [], "self-model tick fired even though disabled"
-
-
 def test_run_folded_self_model_fault_isolated(tmp_path: Path) -> None:
     """A self-model tick that raises must not take down the supervisor loop."""
     persona_dir = _persona_dir(tmp_path)
@@ -1121,72 +1105,6 @@ def test_run_folded_skips_log_rotation_when_disabled(tmp_path: Path) -> None:
         assert _ran_a_few_passes(bus), "supervisor loop never ran"
     assert not t.is_alive()
     assert fired == [], "log rotation fired even though disabled"
-
-
-def test_run_folded_fires_initiate_review_after_interval(tmp_path: Path) -> None:
-    """run_folded wires initiate review into the cadence loop."""
-    persona_dir = _persona_dir(tmp_path)
-    bus = EventBus()
-    stop = threading.Event()
-    fired = threading.Event()
-
-    def fake_initiate(*args, **kwargs):
-        fired.set()
-
-    def runner():
-        with patch(
-            "brain.bridge.supervisor._run_initiate_review_tick",
-            side_effect=fake_initiate,
-        ):
-            run_folded(
-                stop,
-                persona_dir=persona_dir,
-                provider=FakeProvider(),
-                event_bus=bus,
-                tick_interval_s=0.05,
-                heartbeat_interval_s=None,
-                soul_review_interval_s=None,
-                finalize_interval_s=None,
-                log_rotation_interval_s=None,
-                initiate_review_interval_s=0.0,
-            )
-
-    with _running_supervisor(stop, runner) as t:
-        assert fired.wait(timeout=_STARTUP_BUDGET_S), "initiate review never fired"
-    assert not t.is_alive()
-
-
-def test_run_folded_skips_initiate_review_when_disabled(tmp_path: Path) -> None:
-    persona_dir = _persona_dir(tmp_path)
-    bus = _CapturingBus()
-    stop = threading.Event()
-    fired: list[int] = []
-
-    def fake_initiate(*args, **kwargs):
-        fired.append(1)
-
-    def runner():
-        with patch(
-            "brain.bridge.supervisor._run_initiate_review_tick",
-            side_effect=fake_initiate,
-        ):
-            run_folded(
-                stop,
-                persona_dir=persona_dir,
-                provider=FakeProvider(),
-                event_bus=bus,
-                tick_interval_s=0.05,
-                heartbeat_interval_s=None,
-                soul_review_interval_s=None,
-                finalize_interval_s=None,
-                log_rotation_interval_s=None,
-                initiate_review_interval_s=None,
-            )
-
-    with _running_supervisor(stop, runner) as t:
-        assert _ran_a_few_passes(bus), "supervisor loop never ran"
-    assert not t.is_alive()
-    assert fired == []
 
 
 def test_run_folded_fires_voice_reflection_after_interval(tmp_path: Path) -> None:
@@ -1258,6 +1176,122 @@ def test_run_folded_skips_voice_reflection_when_disabled(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
+# The self-model, initiate-review and interest-sweep cadences are gated jobs of the central cadence function: the
+# thread tests that ran a real supervisor to see them "fire when due" or "stay off when disabled" became two
+# deterministic checks (#540). What each job does when due is tested in test_central_cadence.py
+# (test_c15a_all_17_due_run_in_s55_order_real_table, test_c6_completed_interval_job_advances_by_its_interval,
+# test_c21_*); here: the job table has the job exactly when its interval is not None, and run_folded hands every
+# interval argument to the table builder unchanged.
+# ---------------------------------------------------------------------------
+
+_TABLE_INTERVALS = (
+    "finalize_interval_s",
+    "initiate_review_interval_s",
+    "maintenance_interval_s",
+    "self_model_interval_s",
+    "compaction_interval_s",
+    "calibration_interval_s",
+    "interest_sweep_interval_s",
+    "judge_selftune_interval_s",
+    "clustering_interval_s",
+)
+
+
+def _job_names(persona_dir: Path, **intervals: float | None) -> list[str]:
+    from brain.bridge import supervisor as sup
+
+    kwargs = dict.fromkeys(_TABLE_INTERVALS)
+    kwargs.update(intervals)
+    jobs = sup._build_gated_jobs(
+        persona_dir=persona_dir,
+        provider=FakeProvider(),
+        event_bus=EventBus(),
+        is_session_busy=None,
+        finalize_after_hours=24.0,
+        intensity_drivers=lambda: None,
+        tick_stats={"closed_sessions": 0, "pruned_empty_sessions": 0},
+        **kwargs,
+    )
+    return [j.name for j in jobs]
+
+
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
+@pytest.mark.parametrize(
+    "job, knob",
+    [
+        ("self_model_articulation", "self_model_interval_s"),
+        ("initiate_review", "initiate_review_interval_s"),
+        ("interest_sweep", "interest_sweep_interval_s"),
+    ],
+)
+@pytest.mark.parametrize("interval", [0.0, 3600.0])
+def test_a_gated_job_is_in_the_table_exactly_when_its_interval_is_not_none(
+    tmp_path: Path, job: str, knob: str, interval: float
+) -> None:
+    persona_dir = _persona_dir(tmp_path)
+    assert job not in _job_names(persona_dir, **{knob: None}), "interval None must leave the job out"
+    assert job in _job_names(persona_dir, **{knob: interval}), "a number (zero included) must put the job in"
+
+
+@pytest.mark.no_base_failure(reason='#540 audit guard, snapshot or registry of what already exists (it replaces removed tests); passes on the old code by design')
+def test_run_folded_hands_every_interval_to_the_job_table_unchanged(tmp_path: Path) -> None:
+    """The arguments of run_folded reach the table builder as given (None included: no ``x or default``), and the
+    defaults leave the calibration and sweep jobs on. The supervisor thread tests this replaces ran with the defaults,
+    so a default of None here would have switched deploy recalibration and calibration off in production."""
+    import inspect
+
+    from brain.bridge import supervisor as sup
+
+    given = {
+        "soul_review_interval_s": 11.0,
+        "finalize_interval_s": 12.0,
+        "initiate_review_interval_s": 13.0,
+        "self_model_interval_s": 14.0,
+        "compaction_interval_s": 15.0,
+        "calibration_interval_s": 16.0,
+        "interest_sweep_interval_s": 17.0,
+        "judge_selftune_interval_s": 18.0,
+        "clustering_interval_s": 19.0,
+    }
+    to_table = {"soul_review_interval_s": "maintenance_interval_s"}  # run_folded's name -> the builder's name
+    real_build = sup._build_gated_jobs
+
+    def run_with(where: str, **intervals: float | None) -> dict:
+        (tmp_path / where).mkdir()
+        seen: list[dict] = []
+        stop = threading.Event()
+        stop.set()  # the table is built before the loop; a stopped supervisor returns right after
+
+        def spy(**kwargs):
+            seen.append(kwargs)
+            return real_build(**kwargs)
+
+        with patch("brain.bridge.supervisor._build_gated_jobs", side_effect=spy):
+            run_folded(
+                stop,
+                persona_dir=_persona_dir(tmp_path / where),
+                provider=FakeProvider(),
+                event_bus=EventBus(),
+                tick_interval_s=0.05,
+                heartbeat_interval_s=None,
+                **intervals,
+            )
+        assert len(seen) == 1, "run_folded must build the job table exactly once"
+        return seen[0]
+
+    got = run_with("given", **given)
+    for knob, value in given.items():
+        assert got[to_table.get(knob, knob)] == value, knob
+    off = run_with("none", **dict.fromkeys(given))
+    for knob in given:
+        assert off[to_table.get(knob, knob)] is None, knob
+    defaults = inspect.signature(run_folded).parameters
+    assert defaults["calibration_interval_s"].default is not None
+    assert defaults["interest_sweep_interval_s"].default is not None
+    assert defaults["initiate_review_interval_s"].default is not None
+
+
+# ---------------------------------------------------------------------------
 # B7 — supervisor passes is_rest_state derived from body energy into
 #       _run_initiate_review_tick (fail-open: body read error → False)
 # ---------------------------------------------------------------------------
@@ -1291,7 +1325,7 @@ def test_supervisor_initiate_review_tick_passes_rest_state_low_energy(tmp_path: 
 
     with (
         patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
-        patch("brain.body.state.compute_body_state", return_value=low_energy_body),
+        patch("brain.body.state.body_state_from_short", return_value=low_energy_body),
         patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
     ):
         _run_initiate_review_tick(persona_dir, MagicMock(), bus)
@@ -1328,7 +1362,7 @@ def test_supervisor_initiate_review_tick_passes_rest_state_active_energy(tmp_pat
 
     with (
         patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
-        patch("brain.body.state.compute_body_state", return_value=active_energy_body),
+        patch("brain.body.state.body_state_from_short", return_value=active_energy_body),
         patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
     ):
         _run_initiate_review_tick(persona_dir, MagicMock(), bus)
@@ -1352,7 +1386,7 @@ def test_supervisor_initiate_review_tick_rest_state_fail_open(tmp_path: Path) ->
 
     with (
         patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
-        patch("brain.body.state.compute_body_state", side_effect=RuntimeError("body read failed")),
+        patch("brain.body.state.body_state_from_short", side_effect=RuntimeError("body read failed")),
         patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
     ):
         _run_initiate_review_tick(persona_dir, MagicMock(), bus)
@@ -1367,49 +1401,6 @@ def test_supervisor_initiate_review_tick_rest_state_fail_open(tmp_path: Path) ->
 # maintenance block's load-at-startup / is_due-gate / fully-wrapped-body /
 # end-of-block-advance+save discipline (defer #21 pattern).
 # ---------------------------------------------------------------------------
-
-
-def test_run_folded_fires_interest_sweep_when_due(tmp_path: Path) -> None:
-    """An overdue interest_sweep_cadence.json (seeded; ram-spike-fix INC-9: a
-    MISSING file now means "last ran now") is due on the very first tick:
-    run_folded must call run_sweep_tick and advance
-    the persisted cadence past now, even though the tick was a no-op."""
-    persona_dir = _persona_dir(tmp_path)
-    _seed_overdue(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
-    bus = EventBus()
-    stop = threading.Event()
-    fired = threading.Event()
-    calls: list[dict] = []
-
-    def fake_sweep(**kwargs):
-        calls.append(kwargs)
-        fired.set()
-        return {"spawned": 0, "retired": 0, "error": None}
-
-    def runner():
-        with patch("brain.engines.interest_sweep.run_sweep_tick", side_effect=fake_sweep):
-            run_folded(
-                stop,
-                persona_dir=persona_dir,
-                provider=FakeProvider(),
-                event_bus=bus,
-                tick_interval_s=0.05,
-                heartbeat_interval_s=None,
-                soul_review_interval_s=None,
-                finalize_interval_s=None,
-                log_rotation_interval_s=None,
-                initiate_review_interval_s=None,
-                voice_reflection_interval_s=None,
-            )
-
-    with _running_supervisor(stop, runner) as t:
-        assert fired.wait(timeout=_STARTUP_BUDGET_S), "interest sweep never fired"
-    assert not t.is_alive()
-    assert len(calls) == 1
-
-    state = persisted_cadence.load_cadence(persona_dir, interest_sweep.SWEEP_CADENCE_FILE)
-    assert state.next_at is not None
-    assert state.next_at > datetime.now(UTC), "cadence must advance past now even on a no-op result"
 
 
 def test_run_folded_interest_sweep_advances_cadence_even_when_tick_raises(tmp_path: Path) -> None:
@@ -1452,51 +1443,116 @@ def test_run_folded_interest_sweep_advances_cadence_even_when_tick_raises(tmp_pa
     assert state.next_at > datetime.now(UTC), "cadence must advance even when the tick raised"
 
 
-def test_run_folded_interest_sweep_interval_none_disables_it(tmp_path: Path) -> None:
-    """interest_sweep_interval_s=None disables the sweep entirely — no tick, no
-    cadence file. Parity with the other six cadences' None-gate.
+def test_supervisor_initiate_review_tick_live_rest_gate_reads_short_averages_and_opens_no_store(
+    tmp_path: Path, emotion_engine_stub, monkeypatch
+) -> None:
+    """The gate's body is built from the engine's short averages (not the store's
+    rows), reports rest when the energy is low, and opens no memory store."""
+    from datetime import UTC, datetime
+    from unittest.mock import MagicMock, patch
 
-    Load-bearing for anything driving a real supervisor in a sandbox (e.g. the
-    tests/harness live rig): the sweep calls a real provider and writes
-    interests.json, so a run that hasn't opted in must be able to switch it off.
-    """
+    from brain.body.state import BodyState
+    from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
+    from brain.emotion.engine import Reading
+    from brain.initiate.review import _REST_ENERGY_THRESHOLD  # type: ignore[attr-defined]
+    from brain.memory.store import Memory, MemoryStore
+
     persona_dir = _persona_dir(tmp_path)
-    bus = _CapturingBus()
-    stop = threading.Event()
-    calls: list[dict] = []
-    errors: list[BaseException] = []
+    seeded = MemoryStore(persona_dir / "memories.db")
+    seeded.create(Memory.create_new(content="x", memory_type="fact", domain="us", emotions={"joy": 9.0}))
+    seeded.close()
+    emotion_engine_stub.readings = {"rest_need": Reading(short=8.5, long=0.0, difference=0.0, shift=0)}
 
-    def runner():
-        try:
-            with patch(
-                "brain.engines.interest_sweep.run_sweep_tick",
-                side_effect=lambda **kw: calls.append(kw),
-            ):
-                run_folded(
-                    stop,
-                    persona_dir=persona_dir,
-                    provider=FakeProvider(),
-                    event_bus=bus,
-                    tick_interval_s=0.05,
-                    heartbeat_interval_s=None,
-                    soul_review_interval_s=None,
-                    finalize_interval_s=None,
-                    log_rotation_interval_s=None,
-                    initiate_review_interval_s=None,
-                    voice_reflection_interval_s=None,
-                    interest_sweep_interval_s=None,
-                )
-        except BaseException as exc:  # noqa: BLE001 - surfaced via `errors` below
-            errors.append(exc)
-
-    with _running_supervisor(stop, runner) as t:
-        assert _ran_a_few_passes(bus), "supervisor loop never ran"
-    assert not t.is_alive()
-    # Guard against a vacuous pass: if run_folded rejected the kwarg the thread
-    # would die and the assertions below would hold for the wrong reason.
-    assert errors == [], f"run_folded raised: {errors}"
-
-    assert calls == [], "sweep must not fire when disabled"
-    assert not (persona_dir / interest_sweep.SWEEP_CADENCE_FILE).exists(), (
-        "disabled sweep must not write its cadence file"
+    seen: dict[str, object] = {"emotions": None, "opened": 0}
+    low = BodyState(
+        energy=_REST_ENERGY_THRESHOLD,
+        temperature=5,
+        exhaustion=4,
+        session_hours=0.0,
+        days_since_contact=1.0,
+        body_emotions={"rest_need": 8.5},
+        computed_at=datetime.now(UTC),
     )
+
+    def fake_from_short(short, *, feels_high, **kwargs):
+        seen["emotions"] = dict(short)
+        return low
+
+    real_init = MemoryStore.__init__
+
+    def counting_init(self, *args, **kwargs):
+        seen["opened"] += 1
+        return real_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(MemoryStore, "__init__", counting_init)
+
+    captured: dict[str, object] = {}
+
+    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False, should_pause=None, paused_out=None):
+        captured["is_rest_state"] = is_rest_state
+
+    with (
+        patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
+        patch("brain.body.state.body_state_from_short", fake_from_short),
+        patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
+    ):
+        _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
+
+    assert seen["emotions"] == {"rest_need": 8.5}
+    assert captured["is_rest_state"] is True
+    assert seen["opened"] == 0, "the gate reads no memory, so it opens no store"
+
+
+def test_supervisor_initiate_review_tick_live_rest_gate_read_that_raises_is_fail_open(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    from unittest.mock import MagicMock, patch
+
+    from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
+
+    persona_dir = _persona_dir(tmp_path)
+
+    asked: list[str] = []
+
+    def boom():
+        asked.append("read")
+        raise RuntimeError("engine fault")
+
+    emotion_engine_stub.read = boom
+    captured: dict[str, object] = {}
+
+    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False, should_pause=None, paused_out=None):
+        captured["is_rest_state"] = is_rest_state
+
+    with (
+        patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
+        patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
+    ):
+        _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
+    assert asked, "the live rest gate must ask the engine for its read"
+    assert captured["is_rest_state"] is False
+
+
+def test_live_rest_gate_asks_the_engines_predicate_for_body_energy(tmp_path: Path, emotion_engine_stub) -> None:
+    """With the engine live the rest gate's body projection takes the engine's `feels_high`, not a fixed level."""
+    from unittest.mock import MagicMock, patch
+
+    import brain.body.state as body_state
+    from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
+
+    persona_dir = _persona_dir(tmp_path)
+    seen: list[object] = []
+    real = body_state.body_state_from_short
+
+    def recording(short, *, feels_high, **kwargs):
+        seen.append(feels_high)
+        return real(short, feels_high=feels_high, **kwargs)
+
+    with (
+        patch("brain.bridge.supervisor.run_initiate_review_tick", lambda *a, **k: None),
+        patch("brain.body.state.body_state_from_short", recording),
+        patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
+    ):
+        _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
+
+    assert seen == [emotion_engine_stub.feels_high]

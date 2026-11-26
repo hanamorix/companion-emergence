@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -151,10 +152,16 @@ def test_soul_store_transient_disk_io_error_retries_then_succeeds(
         kwargs.setdefault("factory", _FlakyConn)
         return real_connect(*args, **kwargs)
 
+    sleeps: list[float] = []
+    monkeypatch.setattr("brain.health.integrity_retry.time", SimpleNamespace(sleep=sleeps.append))
     monkeypatch.setattr("brain.soul.store.sqlite3.connect", _connect)
     store = SoulStore(str(tmp_path / "soul.db"))
     store.close()
     assert calls["n"] == dev_constants.SQLITE_INTEGRITY_CHECK_RETRY_ATTEMPTS
+    # one pause per failed attempt, each the configured delay (nothing really slept)
+    assert sleeps == [dev_constants.SQLITE_INTEGRITY_CHECK_RETRY_DELAY_S] * (
+        dev_constants.SQLITE_INTEGRITY_CHECK_RETRY_ATTEMPTS - 1
+    )
 
 
 def test_save_and_list_voice_evolution(tmp_path: Path) -> None:
@@ -213,3 +220,190 @@ def test_list_voice_evolution_chronological_order(tmp_path: Path) -> None:
         assert [v.id for v in retrieved] == ["ve_0", "ve_1", "ve_2"]
     finally:
         store.close()
+
+
+def _schema_objects(db_path: Path) -> list[tuple]:
+    """Every object in the database file, read through a separate connection."""
+    import sqlite3
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        return conn.execute("SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY name").fetchall()
+    finally:
+        conn.close()
+
+
+def test_source_memory_reader_on_a_base_database_reads_nothing_and_writes_nothing(tmp_path: Path) -> None:
+    """#371 C4(c): a database that never had a link has no side table. Opening it and asking for
+    the linked memory ids returns [] and must NOT create the table, so no opener ever writes."""
+    db = tmp_path / "crystallizations.db"
+    store = SoulStore(db)
+    store.create(_make_crystal())
+    store.close()
+    before = _schema_objects(db)
+    # Positive precondition (stage-6 F4): merely opening a SoulStore must not create the side table. If the
+    # DDL ever moved into _SCHEMA, `before` would already contain it and the equality below would pass blind.
+    assert "crystallization_sources" not in {row[1] for row in before}
+
+    store = SoulStore(db)
+    try:
+        assert store.list_active_source_memory_ids() == []
+    finally:
+        store.close()
+
+    assert _schema_objects(db) == before
+
+
+def test_link_source_memory_round_trip_is_idempotent_and_follows_revoke(tmp_path: Path) -> None:
+    """#371: a link survives while ANY crystallization naming the memory is active, linking twice is
+    harmless, and the read is sorted by memory id."""
+    store = SoulStore(tmp_path / "crystallizations.db")
+    try:
+        a, b = _make_crystal(), _make_crystal()
+        store.create(a)
+        store.create(b)
+
+        store.link_source_memory(a.id, "m-2")
+        store.link_source_memory(a.id, "m-2")  # idempotent
+        store.link_source_memory(b.id, "m-1")
+        store.link_source_memory(b.id, "m-2")  # same memory, second crystallization
+        assert store.list_active_source_memory_ids() == ["m-1", "m-2"]
+
+        store.mark_revoked(a.id, "test")
+        assert store.list_active_source_memory_ids() == ["m-1", "m-2"]  # m-2 is still linked via b
+
+        store.mark_revoked(b.id, "test")
+        assert store.list_active_source_memory_ids() == []
+    finally:
+        store.close()
+
+
+def test_two_first_time_linkers_with_stale_schema_caches_both_succeed(tmp_path: Path) -> None:
+    """#371 C5 (concurrency): both stores are opened BEFORE either links, so each holds a schema cache
+    that does not contain the side table. A creates it; B (stale cache) then creates it again. With
+    ``CREATE TABLE IF NOT EXISTS`` both links land. A plain ``CREATE TABLE`` would raise on B."""
+    db = tmp_path / "crystallizations.db"
+    store_a, store_b = SoulStore(db), SoulStore(db)
+    try:
+        a, b = _make_crystal(), _make_crystal()
+        store_a.create(a)
+        store_b.create(b)
+
+        store_a.link_source_memory(a.id, "m-a")
+        store_b.link_source_memory(b.id, "m-b")
+
+        assert store_a.list_active_source_memory_ids() == ["m-a", "m-b"]
+        assert store_b.list_active_source_memory_ids() == ["m-a", "m-b"]
+    finally:
+        store_a.close()
+        store_b.close()
+
+
+# The crystallizations DDL exactly as shipped before #371. An older brain only knows this table.
+_BASE_CRYSTALLIZATIONS_DDL = """
+CREATE TABLE crystallizations (
+    id              TEXT PRIMARY KEY,
+    moment          TEXT NOT NULL,
+    love_type       TEXT NOT NULL,
+    why_it_matters  TEXT NOT NULL,
+    who_or_what     TEXT NOT NULL DEFAULT '',
+    resonance       INTEGER NOT NULL DEFAULT 8,
+    crystallized_at TEXT NOT NULL,
+    permanent       INTEGER NOT NULL DEFAULT 1,
+    revoked_at      TEXT,
+    revoked_reason  TEXT NOT NULL DEFAULT ''
+)
+"""
+
+
+def test_a_link_leaves_the_crystallizations_table_readable_by_an_older_brain(tmp_path: Path) -> None:
+    """#371 C4(a)(b): linking must not change ``crystallizations`` at all. (a) its columns equal the
+    pre-#371 DDL, compared against a reference table built from that literal DDL; (b) the pre-#371
+    ``create()`` INSERT (explicit column list) and row mapper still work on a database that has a link."""
+    import sqlite3
+
+    db = tmp_path / "crystallizations.db"
+    store = SoulStore(db)
+    try:
+        c = _make_crystal()
+        store.create(c)
+        store.link_source_memory(c.id, "m-1")
+    finally:
+        store.close()
+
+    ref = sqlite3.connect(":memory:")
+    ref.execute(_BASE_CRYSTALLIZATIONS_DDL)
+    expected_columns = ref.execute("PRAGMA table_info(crystallizations)").fetchall()
+    ref.close()
+
+    conn = sqlite3.connect(str(db))
+    conn.row_factory = sqlite3.Row
+    try:
+        actual_columns = [tuple(r) for r in conn.execute("PRAGMA table_info(crystallizations)")]
+        assert actual_columns == expected_columns
+
+        # the pre-#371 create() statement, verbatim
+        conn.execute(
+            """
+            INSERT INTO crystallizations (
+                id, moment, love_type, why_it_matters, who_or_what,
+                resonance, crystallized_at, permanent, revoked_at, revoked_reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            ("old-brain-row", "m", "craft", "w", "", 8, "2026-01-01T00:00:00+00:00", 1, None, ""),
+        )
+        conn.commit()
+        row = conn.execute("SELECT * FROM crystallizations WHERE id = ?", ("old-brain-row",)).fetchone()
+        old = _pre_371_row_to_crystal(row)
+        assert (old.id, old.moment, old.love_type, old.why_it_matters) == ("old-brain-row", "m", "craft", "w")
+        assert (old.who_or_what, old.resonance, old.permanent, old.revoked_at, old.revoked_reason) == ("", 8, True, None, "")
+    finally:
+        conn.close()
+
+
+def _pre_371_row_to_crystal(row) -> Crystallization:
+    """``brain.soul.store._row_to_crystal`` exactly as shipped before #371 (named columns only)."""
+    from brain.soul.crystallization import _coerce_utc
+
+    crystallized_at = _coerce_utc(row["crystallized_at"])
+    revoked_at = _coerce_utc(row["revoked_at"]) if row["revoked_at"] else None
+
+    return Crystallization(
+        id=row["id"],
+        moment=row["moment"],
+        love_type=row["love_type"],
+        why_it_matters=row["why_it_matters"],
+        crystallized_at=crystallized_at,
+        who_or_what=row["who_or_what"] or "",
+        resonance=int(row["resonance"]),
+        permanent=bool(row["permanent"]),
+        revoked_at=revoked_at,
+        revoked_reason=row["revoked_reason"] or "",
+    )
+
+
+def test_list_active_page_is_newest_first_with_a_total_order() -> None:
+    """#596: pages walk every active row exactly once, even on shared timestamps."""
+    store = _make_store()
+    same = datetime(2026, 1, 1, tzinfo=UTC)
+    crystals = [
+        Crystallization(
+            id=str(uuid.uuid4()),
+            moment=f"m{i}",
+            love_type="craft",
+            why_it_matters="w",
+            crystallized_at=same if i < 6 else datetime(2026, 2, i, tzinfo=UTC),
+        )
+        for i in range(10)
+    ]
+    for c in crystals:
+        store.create(c)
+    store.mark_revoked(crystals[0].id, "test")
+
+    pages = [store.list_active_page(offset=o, limit=3) for o in range(0, 12, 3)]
+    seen = [c.id for page in pages for c in page]
+    assert len(seen) == len(set(seen)) == 9
+    assert set(seen) == {c.id for c in crystals[1:]}
+    stamps = [c.crystallized_at for page in pages for c in page]
+    assert stamps == sorted(stamps, reverse=True)
+    store.close()

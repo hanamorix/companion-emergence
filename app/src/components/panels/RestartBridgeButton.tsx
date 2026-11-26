@@ -4,7 +4,7 @@
  * already visible. Owns no state; defers to useRestartBridge for the
  * full restart choreography.
  *
- * Spec: docs/superpowers/specs/2026-05-17-bridge-restart-button-design.md
+ * Spec: the 2026-05-17 bridge-restart-button design, never committed and lost (#797).
  * §3 (frontend), §5 (labels), §6 (re-entry guard).
  */
 
@@ -20,18 +20,19 @@ interface Props {
 }
 
 const LABELS: Record<RestartState, string> = {
-  idle: "End conversation and restart",
-  closing: "Ending conversation…",
-  shutting_down: "Shutting bridge down…",
-  waiting_for_health: "Waiting for bridge to come back…",
-  forcing: "Bridge not responding — forcing restart…",
+  idle: "Restart the brain",
+  requesting: "Asking the brain to stop…",
+  stopping: "Waiting for the brain to finish…",
+  forcing: "The brain is not answering, ending it…",
+  starting: "Starting the brain…",
+  waiting_for_health: "Waiting for the brain to come back…",
   reconnecting: "Reconnecting…",
   success: "Restarted ✓",
   failed: "Retry",
 };
 
 export function RestartBridgeButton({ persona, currentMode }: Props) {
-  const { state, errorDetail, restart } = useRestartBridge(persona, currentMode);
+  const { state, errorDetail, fellThrough, restart } = useRestartBridge(persona, currentMode);
   const interactive = state === "idle" || state === "failed";
 
   return (
@@ -56,6 +57,19 @@ export function RestartBridgeButton({ persona, currentMode }: Props) {
       >
         {LABELS[state]}
       </button>
+      {(state === "forcing" || state === "failed") && fellThrough && (
+        <div
+          style={{
+            fontSize: 10,
+            color: "var(--text-mute)",
+            marginTop: 6,
+            lineHeight: 1.45,
+            wordBreak: "break-word",
+          }}
+        >
+          Had to end the brain: {fellThrough}
+        </div>
+      )}
       {state === "failed" && errorDetail && (
         <div
           style={{

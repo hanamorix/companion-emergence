@@ -23,6 +23,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from brain.health.json_io import Recovery, read_jsonl, write_jsonl
+from brain.health.parse_failures import record_parse_failure
+from brain.utils.llm_output import find_json_object_block
+
 if TYPE_CHECKING:
     from brain.bridge.provider import LLMProvider
     from brain.memory.store import MemoryStore
@@ -98,7 +102,7 @@ def _build_messages(
     related: list[str],
     emotional_summary: str,
     soul_size: int,
-    companion_name: str = "Nell",
+    companion_name: str,
     draft_fragments: list[str] | None = None,
     source_moment: str | None = None,
 ) -> list[dict]:
@@ -177,20 +181,8 @@ def _build_messages(
 
 
 def _extract_json_block(text: str) -> str | None:
-    """Find the first {...} JSON block in text. Tolerant of preamble."""
-    start = text.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    for i in range(start, len(text)):
-        ch = text[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start : i + 1]
-    return None
+    """The soul-review answer in ``text``: the shared string-aware scan, preferring an object with a ``decision`` (#478)."""
+    return find_json_object_block(text, prefer_key="decision")
 
 
 def parse_decision(raw: str, candidate_id: str) -> Decision:
@@ -213,7 +205,7 @@ def parse_decision(raw: str, candidate_id: str) -> Decision:
 
     try:
         data = json.loads(block)
-    except json.JSONDecodeError as exc:
+    except (ValueError, RecursionError) as exc:  # JSONDecodeError is a ValueError; RecursionError: nested past the limit
         return Decision(
             candidate_id=candidate_id,
             decision="defer",
@@ -273,28 +265,13 @@ def parse_decision(raw: str, candidate_id: str) -> Decision:
 
 def _load_soul_candidates(persona_dir: Path) -> list[dict]:
     """Read soul_candidates.jsonl, skipping corrupt lines."""
-    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
-
-    return read_jsonl_skipping_corrupt(persona_dir / "soul_candidates.jsonl")
+    # RAISE: _save_soul_candidates rewrites the file from this read, so a failed read must not look like a short file.
+    return read_jsonl(persona_dir / "soul_candidates.jsonl", recover=Recovery.RAISE)
 
 
 def _save_soul_candidates(persona_dir: Path, records: list[dict]) -> None:
     """Write soul_candidates.jsonl atomically via temp file + rename."""
-    candidates_path = persona_dir / "soul_candidates.jsonl"
-    tmp_path = candidates_path.with_suffix(".jsonl.tmp")
-
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            for record in records:
-                f.write(json.dumps(record, ensure_ascii=False) + "\n")
-        tmp_path.replace(candidates_path)
-    except OSError as exc:
-        logger.warning("failed to save soul_candidates.jsonl: %s", exc)
-        try:
-            tmp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
+    write_jsonl(persona_dir / "soul_candidates.jsonl", records, fsync=False, nonfinite="null")
 
 
 def _mark_candidate(record: dict, status: str, **extra: object) -> None:
@@ -310,12 +287,14 @@ def _source_memory_snippet(store: MemoryStore, candidate: dict) -> str | None:
     """Return up to 400 chars of the memory that generated this candidate.
 
     Fail-soft: missing memory_id, missing memory, or store error all return None.
+
+    Reads without counting as an access (`bump=False`): the excerpt goes into the review prompt, but a background re-check of a memory is not an access.
     """
     mid = str(candidate.get("memory_id") or "").strip()
     if not mid:
         return None
     try:
-        mem = store.get(mid)
+        mem = store.get(mid, bump=False)
     except Exception as exc:
         logger.debug("_source_memory_snippet: store.get(%r) raised: %s", mid, exc)
         return None
@@ -336,9 +315,13 @@ def _related_memory_snippets(
 
     Best-effort — if search fails, returns empty list. The decision still
     happens, it just has less context.
+
+    Reads without counting as an access (`bump=False`): the excerpt goes into the review prompt, but a background re-check of a memory is not an access.
     """
     try:
-        memories = store.search_text(candidate_text[:200], active_only=True, limit=limit)
+        memories = store.search_text(
+            candidate_text[:200], active_only=True, limit=limit, bump=False
+        )
     except Exception as exc:
         logger.warning("related memory lookup failed: %s", exc)
         return []
@@ -351,14 +334,14 @@ def _related_memory_snippets(
     return snippets
 
 
-def _current_emotional_summary(store: MemoryStore) -> str:
-    """One-line summary of current dominant emotion + intensity."""
+def _current_emotional_summary(persona_dir: Path) -> str:
+    """One-line summary of current dominant emotion + intensity (the emotion engine's short averages)."""
     try:
-        from brain.emotion.aggregate import aggregate_state
+        from brain.emotion import engine
 
-        recent = store.list_active(limit=50)
-        state = aggregate_state(recent)
-        scores = dict(state.emotions)
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+        # pending or retrying, read() returns nothing and the summary says neutral.
+        scores = engine.short_values(engine.engine_for(persona_dir).read())
     except Exception as exc:
         logger.warning("emotional state lookup failed: %s", exc)
         return "unknown"
@@ -584,12 +567,13 @@ def _review_pending_candidates_locked(
         pending_at_start=len(pending_indices),
         dry_run=dry_run,
     )
+    refused: BaseException | None = None
 
     if not pending_indices:
         logger.info("soul review: no pending candidates")
         return report
 
-    emotional_summary = _current_emotional_summary(store)
+    emotional_summary = _current_emotional_summary(persona_dir)
     soul_size = soul_store.count()
 
     to_examine = pending_indices[:max_decisions]
@@ -661,6 +645,13 @@ def _review_pending_candidates_locked(
 
             try:
                 raw = provider.generate(user_content, system=system_content)
+            except cli_throttle.ThrottleDeferred as exc:
+                # #456/#473: "not now" is not a model failure: no audit entry, no failure counted, this candidate
+                # untouched. Stop here; the decisions already made this pass are saved below (an accepted
+                # candidate is already crystallised, so it must not stay pending).
+                refused = exc
+                report.examined -= 1
+                break
             except Exception as exc:
                 logger.warning(
                     "soul review: model call failed for candidate %s: %s",
@@ -691,6 +682,7 @@ def _review_pending_candidates_locked(
             decision = parse_decision(raw, candidate_id)
             if decision.parse_error:
                 report.parse_failures += 1
+                record_parse_failure(persona_dir, site="soul_review", raw=raw, error=decision.parse_error)
 
             # Confidence rail: low confidence forces defer regardless of decision
             if decision.confidence < confidence_threshold and decision.decision != "defer":
@@ -740,8 +732,10 @@ def _review_pending_candidates_locked(
 
             report.decisions.append(decision)
 
-    if not dry_run:
+    if not dry_run and (refused is None or report.decisions):
         _save_soul_candidates(persona_dir, records)
+    if refused is not None:
+        raise refused
 
     logger.info(
         "soul review complete: accepted=%d rejected=%d deferred=%d parse_failures=%d audit_failures=%d dry_run=%s",

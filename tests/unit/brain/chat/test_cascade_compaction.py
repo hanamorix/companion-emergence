@@ -23,7 +23,6 @@ Also maps to changes/compaction-defects-fix/1.5-criteria.md:
   C-B4a/b/c/f/g  tier-3 replacement/eviction, idempotence-preserved, the
            emergency_fold_24h backstop also evicts, and a degenerate
            all-evicted pass installs cleanly (Bug 4)
-  C-B4d    stale retain-forever docstrings replaced with the replacement model
   C14 (updated)  the two pre-existing gating tests below are updated to the
            owner's replacement model (retired "terminal, re-compacted forever")
 
@@ -44,6 +43,7 @@ from pathlib import Path
 import pytest
 
 from brain.bridge.chat import ChatMessage
+from brain.bridge.model_tier import TIER_COMPACTION
 from brain.chat.budget import _COMPACTION_SUMMARY_PREFIX, apply_budget
 from brain.chat.compaction import (
     _CONDENSE_PROMPT,
@@ -470,7 +470,7 @@ def test_c7_cursor_guard_and_idempotence(tmp_path: Path) -> None:
 def test_c13_interior_not_starved(tmp_path: Path) -> None:
     marker = "MARKERC13 a persisting interior thought"
     store = MemoryStore(tmp_path / "memories.db")
-    write_trace_memory(store, marker)
+    write_trace_memory(store, marker, feed_digest="a digest", persona_dir=None)
     store.close()
 
     sid = "sess_c13"
@@ -833,7 +833,7 @@ def test_condense_prompt_realmodel(tmp_path: Path) -> None:
         target_words=target_words, target_pct=target_pct,
     )
 
-    provider = get_provider("claude-cli", model_override="haiku")
+    provider = get_provider("claude-cli", tier=TIER_COMPACTION)
     out = _generate_validated_fold(provider, prompt)
 
     assert out is not None, "the real model's output was rejected by _validate_fold_output"
@@ -1010,29 +1010,6 @@ def test_cb4c_idempotent_rerun_same_now_is_noop(tmp_path: Path) -> None:
     r2 = cascade_conversation(tmp_path, sid, provider=provider, now=now, min_keep_tail=0)
     assert r2.compacted is False
     assert r2.reason == "nothing_aged"
-
-
-def test_cb4d_docstrings_reflect_replacement_model() -> None:
-    """Bug 4 (C-B4d, docs match code): the retain-forever docstrings/comments no
-    longer say "terminal / re-compacted forever" or "leaving tiers 2/3
-    untouched", and the replacement model wording is present instead. Fails on
-    pre-change code (which contains the stale phrases)."""
-    import inspect
-
-    import brain.chat.compaction as comp
-
-    source = inspect.getsource(comp)
-    stale_phrases = [
-        "STAYS in tier 3 (terminal, re-compacted forever",
-        "a terminal, multi-input tier 3",
-        "then stays in tier 3 (terminal, re-compacted forever)",
-        "Tier 3 is a terminal, multi-input",
-        "leaving tiers 2/3 untouched",
-    ]
-    for phrase in stale_phrases:
-        assert phrase not in source, f"stale retain-forever wording still present: {phrase!r}"
-    assert "evicted" in source.lower()
-    assert "replaced" in source.lower() or "replacement" in source.lower()
 
 
 def test_cb4f_emergency_fold_evicts_stale_section(tmp_path: Path) -> None:

@@ -8,7 +8,8 @@ Ported from OG NellBrain/nell_bridge_session.py (F36) with adaptations:
 
 Design note: persistence across process restarts is intentionally out of
 scope for the registry (matching OG). Sessions are in-memory only; on CLI
-exit the REPL flushes the buffer via close_session → ingest pipeline.
+exit the REPL flushes the buffer through the ingest pipeline: a non-destructive
+snapshot by default (``nell chat --close`` runs close_session instead).
 
 Phase B sticky sessions (F-201): although the registry itself is process-
 local, ``get_or_hydrate_session`` lets handlers rebuild a registry entry

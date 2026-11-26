@@ -13,7 +13,7 @@ def test_trivial_turn_gets_only_core():
 
 
 def test_low_salience_question_can_still_search():
-    """Regression: the Phoebe dog-name failure (v0.0.33 spec, Track 1).
+    """Regression: the dog-name failure (v0.0.33 spec, Track 1).
 
     'what's my dog's name?' scores ~0.19 salience with no recruitment flags;
     pre-v0.0.33 the model could not search at all on such turns.
@@ -148,3 +148,18 @@ def test_force_files_default_off_does_not_over_recruit():
     assert signal.score < 0.999
     allowed = select_tools(signal)  # force_files defaults False
     assert "read_file" not in allowed
+
+
+def test_add_name_tool_is_reflexive_core_and_recruited_on_an_ordinary_turn():
+    """N2 / S69 (pending owner review): the add-name tool is in the always-available
+    tier, so `select_tools` returns it for a non-maximal signal with no memory-salience
+    flag, and the trivial-turn set equals the core."""
+    from brain.tools.schemas import ADD_NAME_TOOL_NAME
+
+    assert ADD_NAME_TOOL_NAME in REFLEXIVE_CORE
+    signal = assess_salience("ok")
+    assert signal.score < 0.999
+    assert not (signal.references_past or signal.mentions_entity_or_date or signal.topic_shift)
+    allowed = select_tools(signal)
+    assert ADD_NAME_TOOL_NAME in allowed
+    assert set(allowed) == set(REFLEXIVE_CORE)

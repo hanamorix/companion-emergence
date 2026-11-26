@@ -273,6 +273,33 @@ def test_reflection_run_escalates_on_malformed_haiku(tmp_path):
     assert result.decisions[0].decision == "filter"
 
 
+def test_reflection_records_the_malformed_haiku_reply(tmp_path):
+    """#364: the escalation keeps the reply that caused it."""
+    import json as _json
+    from datetime import UTC, datetime
+
+    from brain.health.parse_failures import PARSE_FAILURE_LOG
+    from brain.initiate.reflection import ReflectionDeps, run
+    from brain.initiate.schemas import InitiateCandidate, SemanticContext
+
+    now = datetime(2026, 5, 12, 10, 0, 0, tzinfo=UTC)
+    cand = InitiateCandidate(candidate_id="ic_a", ts=now.isoformat(), kind="message",
+                             source="dream", source_id="d1", semantic_context=SemanticContext())
+    deps = ReflectionDeps(
+        companion_name="Nell", user_name="Hana", voice_template_path=tmp_path / "voice.md",
+        outbound_recall_block="(none)",
+        haiku_call=lambda *, system, user: ("I cannot comply with this request.", 200, 400, 50),
+        sonnet_call=lambda *, system, user: ("still not json", 700, 400, 100),
+        now=now, tick_id="t1", persona_dir=tmp_path,
+    )
+    run([cand], deps=deps)
+    rows = [_json.loads(line) for line in (tmp_path / PARSE_FAILURE_LOG).read_text(encoding="utf-8").splitlines()]
+    assert [(r["site"], r["raw"]) for r in rows] == [
+        ("d_reflection_haiku", "I cannot comply with this request."),
+        ("d_reflection_sonnet", "still not json"),
+    ]
+
+
 def test_reflection_run_filters_when_both_tiers_low_confidence(tmp_path):
     """If Sonnet's confidence is also low, decision is forced to filter."""
     from datetime import UTC, datetime, timedelta

@@ -9,7 +9,7 @@ from brain.recovery.cli import RecoverArgs, run_recover_cli
 def _persona_and_source(tmp_path, monkeypatch):
     monkeypatch.setenv("KINDLED_HOME", str(tmp_path / "home"))
     from brain.paths import get_persona_dir
-    p = get_persona_dir("Phoebe")
+    p = get_persona_dir("Canary")
     p.mkdir(parents=True)
     s = MemoryStore(p / "memories.db")
     s.create(Memory(id="S", content="s", memory_type="conversation", domain="us",
@@ -29,7 +29,7 @@ def _persona_and_source(tmp_path, monkeypatch):
 
 def test_cli_dry_run_emits_json(tmp_path, monkeypatch, capsys):
     p, src = _persona_and_source(tmp_path, monkeypatch)
-    rc = run_recover_cli(RecoverArgs(persona="Phoebe", source_dir=src,
+    rc = run_recover_cli(RecoverArgs(persona="Canary", source_dir=src,
                                      force=True, dry_run=True, json_out=True))
     assert rc == 0
     payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
@@ -53,7 +53,7 @@ def test_cli_refuses_live_bridge_without_force(tmp_path, monkeypatch):
     # A bridge.json pointing at THIS (alive) process simulates a live bridge.
     (p / "bridge.json").write_text(json.dumps({"pid": os.getpid()}))
     with pytest.raises(SystemExit):
-        run_recover_cli(RecoverArgs(persona="Phoebe", source_dir=src,
+        run_recover_cli(RecoverArgs(persona="Canary", source_dir=src,
                                     force=False, dry_run=False, json_out=True))
 
 

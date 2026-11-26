@@ -10,7 +10,7 @@ def _run_init(monkeypatch, tmp_path: Path, argv: list[str]) -> int:
 
 
 _FRESH_FLAGS = [
-    "--persona", "phoebe",
+    "--persona", "canary",
     "--user-name", "",
     "--fresh",
     "--voice-template", "skip",
@@ -22,7 +22,7 @@ def test_init_writes_app_config_when_missing(tmp_path, monkeypatch):
     rc = _run_init(monkeypatch, tmp_path, _FRESH_FLAGS)
     assert rc == 0
     cfg = json.loads((tmp_path / "app_config.json").read_text())
-    assert cfg["selected_persona"] == "phoebe"
+    assert cfg["selected_persona"] == "canary"
 
 
 def test_init_leaves_existing_app_config_alone(tmp_path, monkeypatch):

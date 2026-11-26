@@ -18,7 +18,7 @@ runtime dump is the in-situ cross-check on the real assembled bytes.
 from __future__ import annotations
 
 import hashlib
-import json
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -88,29 +88,29 @@ _VOLATILE_MARKERS = (
 
 def test_context_block_omits_clock_when_flag_false() -> None:
     """include_block_clock=False drops the Current time line AND its explainer
-    from the top of the JSONL block; the JSONL records (and their ts) remain."""
+    from the top of the block; the narrative lines (and their times) remain."""
     msgs = [
         ChatMessage(role="user", content="a", ts="2026-05-20T10:00:00Z"),
         ChatMessage(role="assistant", content="b", ts="2026-05-20T10:05:00Z"),
     ]
     block = _format_claude_context_block(msgs, includes_latest_user=True, include_block_clock=False)
     assert "Current time" not in block
-    # The per-message ts values still ride in the JSONL records, rendered in
+    # The per-message times still ride in the narrative lines, rendered in
     # local wall-clock time (#217) rather than the raw UTC string. Exact
     # offset depends on the CI runner's OS timezone, so assert what's
     # deterministic regardless of it: not the raw 'Z'-suffixed string, and
     # the same underlying instant.
-    records = [json.loads(line) for line in block.splitlines() if line.startswith("{")]
-    assert records[0]["ts"] != "2026-05-20T10:00:00Z"
-    assert records[1]["ts"] != "2026-05-20T10:05:00Z"
-    assert not records[0]["ts"].endswith("Z")
-    assert not records[1]["ts"].endswith("Z")
-    assert datetime.fromisoformat(records[0]["ts"]).astimezone(UTC) == datetime(
-        2026, 5, 20, 10, 0, 0, tzinfo=UTC
-    )
-    assert datetime.fromisoformat(records[1]["ts"]).astimezone(UTC) == datetime(
-        2026, 5, 20, 10, 5, 0, tzinfo=UTC
-    )
+    times = [
+        re.match(r"^(\d{4}-\d{2}-\d{2}T\S+) (?:User|you): ", line).group(1)
+        for line in block.splitlines()
+        if re.match(r"^(\d{4}-\d{2}-\d{2}T\S+) (?:User|you): ", line)
+    ]
+    assert times[0] != "2026-05-20T10:00:00Z"
+    assert times[1] != "2026-05-20T10:05:00Z"
+    assert not times[0].endswith("Z")
+    assert not times[1].endswith("Z")
+    assert datetime.fromisoformat(times[0]).astimezone(UTC) == datetime(2026, 5, 20, 10, 0, 0, tzinfo=UTC)
+    assert datetime.fromisoformat(times[1]).astimezone(UTC) == datetime(2026, 5, 20, 10, 5, 0, tzinfo=UTC)
 
 
 def test_context_block_keeps_clock_by_default() -> None:
@@ -121,7 +121,7 @@ def test_context_block_keeps_clock_by_default() -> None:
 
 
 def test_print_prompt_appends_suffix_multi_message() -> None:
-    """A+: the volatile suffix lands after the JSONL block, with no top clock."""
+    """A+: the volatile suffix lands after the context block, with no top clock."""
     msgs = [
         ChatMessage(role="user", content="hi", ts="2026-05-20T10:00:00Z"),
         ChatMessage(role="assistant", content="hello", ts="2026-05-20T10:01:00Z"),
@@ -226,11 +226,12 @@ def test_static_system_message_has_no_volatile_markers(
 
 def test_static_system_message_contains_preamble_voice_epistemic(persona_dir: Path) -> None:
     from brain.chat.prompt import _EPISTEMIC_INSTRUCTION
+    from brain.tools.naming import fill_tool_prefix
 
     static = build_static_system_message(persona_dir, voice_md="# Nell\n\nsweater novelist.")
     assert "nell" in static.lower()
     assert "sweater novelist" in static
-    assert _EPISTEMIC_INSTRUCTION in static
+    assert fill_tool_prefix(_EPISTEMIC_INSTRUCTION, "") in static
 
 
 def test_static_system_message_contains_harness_fence(persona_dir: Path) -> None:
@@ -261,10 +262,17 @@ def _seed_rich_persona(persona_dir: Path, store: MemoryStore, soul_store: SoulSt
 
 
 def test_information_completeness_static_union_volatile(
-    persona_dir: Path, store: MemoryStore, soul_store: SoulStore
+    persona_dir: Path, store: MemoryStore, soul_store: SoulStore, emotion_engine_stub
 ) -> None:
     """Every block the pre-change build_system_message emitted must be present
     across (static ∪ volatile) for the same inputs — only repositioned (C4)."""
+    from brain.emotion.engine import Reading
+
+    # The mood summary ("current emotions:") is the engine's read.
+    emotion_engine_stub.readings = {
+        "love": Reading(short=8.0, long=8.0, difference=0.0, shift=0),
+        "tenderness": Reading(short=6.0, long=6.0, difference=0.0, shift=0),
+    }
     _seed_rich_persona(persona_dir, store, soul_store)
     voice = "# Nell\n\nsouthern novelist."
     kwargs = {
@@ -283,11 +291,12 @@ def test_information_completeness_static_union_volatile(
     # Block-signature markers the full pre-change message produced for these
     # inputs. Each must survive into static OR volatile.
     from brain.chat.prompt import _EPISTEMIC_INSTRUCTION
+    from brain.tools.naming import fill_tool_prefix
 
     expected_markers = [
         "You are nell",  # preamble (static)
         "southern novelist",  # voice (static)
-        _EPISTEMIC_INSTRUCTION,  # epistemic (static)
+        fill_tool_prefix(_EPISTEMIC_INSTRUCTION, ""),  # epistemic (static)
         "── brain context ──",  # volatile
         "current emotions:",  # volatile
         "recall",  # volatile (recall block)
@@ -387,3 +396,33 @@ def test_volatile_context_starts_with_ambient_framing(
         user_input="hello there friend",
     )
     assert volatile.startswith(_AMBIENT_FRAMING)
+
+
+def test_volatile_context_carries_the_live_trail(persona_dir, soul_store):
+    """#688: once the engine is live the interior block in the volatile tail is a trail of whole notes."""
+    from datetime import UTC, datetime
+
+    from brain.monologue.trace import write_trace_memory
+    from tests.unit.brain.emotion._engine_support import make_live
+
+    live_header = "── interior continuity (your recent thoughts, as you noted them) ──"
+    old_header = "── interior continuity (your own recent thought) ──"
+    store = MemoryStore(db_path=persona_dir / "memories.db")
+    store.create(Memory.create_new(content="seed", memory_type="conversation", domain="us", emotions={"joy": 5.0}))
+    make_live(persona_dir, datetime.now(UTC))
+    digests = [f"{i}" + "d" * 219 for i in range(3)]
+    for d in digests:
+        write_trace_memory(store, "raw " + d, feed_digest=d, persona_dir=persona_dir, live=True)
+    volatile = build_volatile_context(
+        persona_dir,
+        voice_md="voice",
+        daemon_state=DaemonState(),
+        soul_store=soul_store,
+        store=store,
+        user_input="hi",
+    )
+    assert live_header in volatile
+    for d in digests:
+        assert d in volatile
+    assert old_header not in volatile
+    store.close()

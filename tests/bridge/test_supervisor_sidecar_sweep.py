@@ -42,7 +42,11 @@ def test_supervisor_sweeps_stale_sidecars_on_maintenance(
     monkeypatch.setattr(
         "brain.bridge.supervisor._run_voice_reflection_tick", lambda *a, **k: None
     )
-    threading.Timer(3.0, stop_event.set).start()
+    # Failure-path ceiling only (the sweep sets stop_event itself). Generous: a Windows runner's first
+    # supervisor pass can take several seconds, and a short ceiling would stop the loop before it reports.
+    watchdog = threading.Timer(60.0, stop_event.set)
+    watchdog.daemon = True
+    watchdog.start()
 
     run_folded(
         stop_event,
@@ -54,5 +58,6 @@ def test_supervisor_sweeps_stale_sidecars_on_maintenance(
         soul_review_interval_s=0.05,
         finalize_interval_s=None,
     )
+    watchdog.cancel()
 
     assert len(sweep_calls) >= 1

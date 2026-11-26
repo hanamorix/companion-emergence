@@ -7,14 +7,15 @@ from pathlib import Path
 import pytest
 
 from brain.tools.dispatch import _DISPATCH, _PROVIDER_TOOLS, ToolDispatchError, dispatch
+from brain.tools.schemas import ADD_NAME_TOOL_NAME, REMOVE_NAME_TOOL_NAME
 
 
 def _make_ctx(tmp_path: Path) -> dict:
-    """Build a minimal dispatch context with in-memory store + hebbian."""
+    """Build a minimal dispatch context with a file-backed store (#375) + in-memory hebbian."""
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import MemoryStore
 
-    store = MemoryStore(":memory:")
+    store = MemoryStore(tmp_path / "memories.db")
     hebbian = HebbianMatrix(":memory:")
     return {"store": store, "hebbian": hebbian, "persona_dir": tmp_path}
 
@@ -273,6 +274,8 @@ def test_all_dispatched_tools_dispatch_without_crash(tmp_path: Path) -> None:
             "domain": "self",
             "emotions": {"love": 10, "joy": 8},
         },
+        ADD_NAME_TOOL_NAME: {"name": "Wren"},
+        REMOVE_NAME_TOOL_NAME: {"name": "Wren"},
         "boot": {},
         "get_soul": {},
         "crystallize_soul": {

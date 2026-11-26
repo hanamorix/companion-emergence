@@ -98,16 +98,18 @@ def test_legacy_integrity_diagnostic_surfaces_byte_mismatch(
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
 
-    # Force a corrupted write by patching write_bytes on the destination
-    # path (the "new" temp file before os.replace) to truncate.
-    real_write_bytes = Path.write_bytes
+    # Force a corrupted write by wrapping the shared bytes writer the copy goes through
+    # so the data written for that destination is truncated.
+    import brain.migrator.og_legacy as og_legacy
 
-    def truncating_write_bytes(self, data, *a, **kw):
-        if self.name == "nell_journal.json.new":
-            return real_write_bytes(self, data[:5], *a, **kw)  # truncate
-        return real_write_bytes(self, data, *a, **kw)
+    real_save = og_legacy.save_bytes_atomic
 
-    monkeypatch.setattr(Path, "write_bytes", truncating_write_bytes)
+    def truncating_save(path, data, **kw):
+        if path.name == "nell_journal.json":
+            return real_save(path, data[:5], **kw)  # truncate
+        return real_save(path, data, **kw)
+
+    monkeypatch.setattr(og_legacy, "save_bytes_atomic", truncating_save)
 
     preserved, _, integrity_issues = migrate_legacy_files(
         og_data_dir=og_data, persona_dir=persona_dir

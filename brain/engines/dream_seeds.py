@@ -1,18 +1,25 @@
 """Pure seed-selection logic for the dream cycle.
 
-No I/O and no engine dependencies — every function takes plain Memory /
-EmotionalState / Crystallization objects so it is unit-testable in isolation.
-See docs/superpowers/specs/2026-05-26-multi-signal-dream-seeds-design.md.
+No I/O — every function takes plain Memory / EmotionalState / Crystallization
+objects so it is unit-testable in isolation. The functions that read a memory's
+feelings take ``eng``: the live emotion engine, whose one per-memory read (faded
+values) they use, or None for the pure read of the stored values.
+Its design (the 2026-05-26 multi-signal dream-seeds design) was never committed and is lost (#797).
 """
 
 from __future__ import annotations
 
 import re
 from datetime import datetime
+from typing import TYPE_CHECKING
 
+from brain.emotion.engine_utils import feelings_of
 from brain.emotion.state import EmotionalState
 from brain.memory.store import Memory
 from brain.soul.crystallization import Crystallization
+
+if TYPE_CHECKING:
+    from brain.emotion.engine import EmotionEngine
 
 # Calibration defaults (overridable by callers / DreamEngine fields).
 MOOD_FLOOR = 0.5
@@ -23,11 +30,18 @@ W_GRIEF = 1.0
 W_REFRACTORY = 2.0
 
 
-def emotional_congruence(memory: Memory, mood: EmotionalState) -> float:
-    """Sum over emotions shared by mood and memory of (mood_intensity * memory_value)."""
+def emotional_congruence(memory: Memory, mood: EmotionalState, *, eng: EmotionEngine | None) -> float:
+    """Sum over emotions shared by mood and memory of (mood_intensity * memory_value).
+
+    The mood's channels are canonical emotion names (a mood is keyed by canonical name),
+    so the memory's feelings are read by canonical name too: the one read of a memory's feelings
+    (the engine's when ``eng`` is given, else the pure read with its stored values held to 0-10) gives
+    canonical names, and two spellings of one emotion in a memory count once, as their average.
+    """
+    memory_values = feelings_of(memory, eng).feelings
     total = 0.0
     for name, intensity in mood.emotions.items():
-        mv = memory.emotions.get(name, 0.0)
+        mv = memory_values.get(name, 0.0)
         if mv > 0.0:
             total += intensity * mv
     return total
@@ -84,12 +98,12 @@ def identity_congruence(
     return best
 
 
-def grief_pull(memory: Memory) -> float:
+def grief_pull(memory: Memory, *, eng: EmotionEngine | None) -> float:
     """Normalized bonus for actual grief breadcrumbs so loss gets reached
     within a grief-congruent pool. Fires only for grief_event memories."""
     if memory.memory_type != "grief_event":
         return 0.0
-    return memory.emotions.get("memory_grief", 0.0) / 10.0
+    return feelings_of(memory, eng).feelings.get("memory_grief", 0.0) / 10.0
 
 
 def refractory_penalty(memory_id: str, recent_seed_ids: list[str]) -> float:
@@ -104,6 +118,7 @@ def composite_score(
     crystallizations: list[Crystallization],
     *,
     recent_seed_ids: list[str],
+    eng: EmotionEngine | None,
     w_identity: float = W_IDENTITY,
     w_grief: float = W_GRIEF,
     w_refractory: float = W_REFRACTORY,
@@ -113,7 +128,7 @@ def composite_score(
     return (
         memory.importance / 10.0
         + w_identity * identity_congruence(memory, crystallizations)
-        + w_grief * grief_pull(memory)
+        + w_grief * grief_pull(memory, eng=eng)
         - w_refractory * refractory_penalty(memory.id, recent_seed_ids)
     )
 
@@ -124,6 +139,7 @@ def select_seed(
     crystallizations: list[Crystallization],
     *,
     recent_seed_ids: list[str],
+    eng: EmotionEngine | None,
     mood_floor: float = MOOD_FLOOR,
     min_congruent: int = MIN_CONGRUENT,
     w_identity: float = W_IDENTITY,
@@ -134,7 +150,7 @@ def select_seed(
     (the engine raises NoSeedAvailable before calling)."""
     pool = candidates
     if mood_is_active(mood, floor=mood_floor):
-        congruent = [m for m in candidates if emotional_congruence(m, mood) > 0.0]
+        congruent = [m for m in candidates if emotional_congruence(m, mood, eng=eng) > 0.0]
         if len(congruent) >= min_congruent:
             pool = congruent
 
@@ -142,6 +158,7 @@ def select_seed(
         score = composite_score(
             m, mood, crystallizations,
             recent_seed_ids=recent_seed_ids,
+            eng=eng,
             w_identity=w_identity, w_grief=w_grief, w_refractory=w_refractory,
         )
         return (score, m.created_at, m.id)

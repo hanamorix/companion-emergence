@@ -12,9 +12,10 @@ Each resolved value is traced so startup can report the effective source.
 from __future__ import annotations
 
 import os
-import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from brain.utils import toml_io
 
 # Config keys supported by the framework. Extended in later weeks.
 _SUPPORTED_KEYS: tuple[str, ...] = (
@@ -86,11 +87,12 @@ def _load_env_file(path: Path) -> dict[str, str]:
 
 def _load_persona_toml(persona_dir: Path) -> dict[str, str]:
     """Flatten persona.toml into the framework's config key namespace."""
-    toml_path = persona_dir / "persona.toml"
-    if not toml_path.exists():
-        return {}
-    with toml_path.open("rb") as fh:
-        data = tomllib.load(fh)
+    try:
+        data = toml_io.read_toml(persona_dir / "persona.toml")
+    except toml_io.TomlFileError as exc:
+        if exc.kind == "missing":
+            return {}
+        raise
 
     flat: dict[str, str] = {}
     bridge = data.get("bridge", {})

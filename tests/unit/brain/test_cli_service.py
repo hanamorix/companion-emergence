@@ -87,7 +87,7 @@ def test_service_print_plist_outputs_launchagent_xml(
     monkeypatch,
     capsys,
 ) -> None:
-    monkeypatch.setattr("sys.platform", "darwin")
+    monkeypatch.setattr("brain.service.current_platform", lambda: "darwin")
     home = tmp_path / "home"
     data_home = home / "data"
     home.mkdir()
@@ -118,7 +118,7 @@ def test_service_print_plist_outputs_launchagent_xml(
 
 
 def test_service_print_plist_invalid_nell_path_returns_1(monkeypatch, capsys) -> None:
-    monkeypatch.setattr("sys.platform", "darwin")
+    monkeypatch.setattr("brain.service.current_platform", lambda: "darwin")
     rc = cli.main(
         [
             "service",
@@ -211,7 +211,7 @@ def test_service_lifecycle_commands_use_current_backend(
 
 
 def test_service_print_plist_is_cleanly_unsupported_off_macos(monkeypatch, capsys) -> None:
-    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.setattr("brain.service.current_platform", lambda: "linux")
 
     rc = cli.main(["service", "print-plist", "--persona", "nell", "--nell-path", "/tmp/nell"])
 
@@ -224,7 +224,7 @@ def test_service_install_dry_run_prints_plist_without_bootstrap(
     monkeypatch,
     capsys,
 ) -> None:
-    monkeypatch.setattr("sys.platform", "darwin")
+    monkeypatch.setattr("brain.service.current_platform", lambda: "darwin")
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -251,7 +251,7 @@ def test_service_install_dry_run_prints_plist_without_bootstrap(
 
 
 def test_service_install_calls_launchd_install(monkeypatch, tmp_path: Path, capsys) -> None:
-    monkeypatch.setattr("sys.platform", "darwin")
+    monkeypatch.setattr("brain.service.current_platform", lambda: "darwin")
     nell = _make_executable(tmp_path / "nell")
 
     backend = _FakeBackend(tmp_path)
@@ -285,7 +285,7 @@ def test_service_install_calls_launchd_install(monkeypatch, tmp_path: Path, caps
 
 
 def test_service_uninstall_calls_launchd_uninstall(monkeypatch, tmp_path: Path, capsys) -> None:
-    monkeypatch.setattr("sys.platform", "darwin")
+    monkeypatch.setattr("brain.service.current_platform", lambda: "darwin")
 
     backend = _FakeBackend(tmp_path)
     monkeypatch.setattr("brain.service.current_backend", lambda: backend)
@@ -298,7 +298,7 @@ def test_service_uninstall_calls_launchd_uninstall(monkeypatch, tmp_path: Path, 
 
 
 def test_service_status_prints_launchd_state(monkeypatch, tmp_path: Path, capsys) -> None:
-    monkeypatch.setattr("sys.platform", "darwin")
+    monkeypatch.setattr("brain.service.current_platform", lambda: "darwin")
 
     backend = _FakeBackend(tmp_path)
     monkeypatch.setattr("brain.service.current_backend", lambda: backend)

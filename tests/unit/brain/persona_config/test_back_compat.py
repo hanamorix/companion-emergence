@@ -25,5 +25,5 @@ def test_legacy_thinking_budget_field_ignored(tmp_path: Path):
     )
     cfg = PersonaConfig.load(cfg_path)
     assert cfg.user_name == "Hana"
-    assert cfg.model == "sonnet"
+    assert cfg.legacy_model_settings == {"model": "sonnet"}  # kept raw for the one-time migration, not a setting
     assert not hasattr(cfg, "thinking_budget_tokens")

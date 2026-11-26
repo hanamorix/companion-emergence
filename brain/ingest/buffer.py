@@ -5,20 +5,39 @@ Each line is a JSON-encoded turn record:
   {session_id, speaker, text, ts}
 
 The append-only JSONL design is faithful to OG nell_conversation_ingest.py.
-Reads tolerate corrupt lines via read_jsonl_skipping_corrupt.
+Reads tolerate corrupt lines via brain.health.json_io.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import re
-import time
 import uuid
-from datetime import UTC, datetime
+from collections.abc import Iterator
+from contextlib import ExitStack, closing, contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import (
+    Recovery,
+    append_jsonl,
+    encode_jsonl,
+    iter_jsonl_reversed,
+    read_json,
+    read_jsonl,
+    write_json,
+    write_jsonl,
+)
+from brain.utils.atomic_write import fsync_dir, save_with_backup_text
+from brain.utils.file_lock import file_lock
+from brain.utils.file_ops import delete_file, list_dir, stat_path
+from brain.utils.log_throttle import warn_throttled
+from brain.utils.time import lenient_utc
+
+logger = logging.getLogger(__name__)
 
 # session_id grammar: UUIDs (hyphens included) and the `sess_<8 hex>` fallback
 # both fit. Letters / digits / hyphen / underscore only — no slashes, dots, or
@@ -98,10 +117,32 @@ def ingest_turn(persona_dir: Path, turn: dict) -> str:
         # Defensive copy so callers passing tuples or generators end up
         # with a JSON-serialisable list on the record.
         record["image_shas"] = list(image_shas)
-    path = _session_path(persona_dir, session_id)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    append_jsonl(_session_path(persona_dir, session_id), record)
     return session_id
+
+
+@contextmanager
+def session_append_lock(persona_dir: Path, session_id: str) -> Iterator[None]:
+    """Hold the buffer's append lock: the lock ``ingest_turn`` takes (through ``append_jsonl``) for this session.
+
+    A caller that reads the buffer and then removes it (the session rollover) holds this across the read,
+    the archive write and the removal, so a row appended in between waits and cannot be removed unseen.
+    Not re-entrant: an ``ingest_turn`` of the same session inside the block, on any thread of this process,
+    waits for the block to end. Lock order: take the chat registry lock (``brain.chat.session.registry_lock``)
+    first when a caller needs both, and never take the registry lock while holding this one.
+
+    When the sidecar lock cannot be taken (``OSError``: a filesystem that refuses the lock) a warning is logged
+    and the block runs unlocked, as ``append_jsonl`` does, since the appenders are unlocked there too and
+    refusing would stop the caller for good. An exception raised by the block propagates once."""
+    stack = ExitStack()
+    try:
+        stack.enter_context(file_lock(_session_path(persona_dir, session_id)))
+    except OSError as exc:
+        logger.warning(
+            "could not take the append lock for session %s (%s); continuing without it", session_id, exc
+        )
+    with stack:
+        yield
 
 
 def list_active_sessions(persona_dir: Path) -> list[str]:
@@ -113,9 +154,10 @@ def list_active_sessions(persona_dir: Path) -> list[str]:
 
 
 def read_session(persona_dir: Path, session_id: str) -> list[dict]:
-    """Return the turns from a session buffer, skipping malformed lines."""
-    path = _session_path(persona_dir, session_id)
-    return read_jsonl_skipping_corrupt(path)
+    """Return the turns from a session buffer, skipping malformed lines (a line the JSON parser cannot load stops the read)."""
+    # RAISE: compaction rewrites the buffer from this read and ingest advances its cursor on it, so a failed
+    # read must raise (as it always did), never look like an empty session.
+    return read_jsonl(_session_path(persona_dir, session_id), recover=Recovery.RAISE)
 
 
 def session_silence_minutes(turns: list[dict]) -> float:
@@ -136,33 +178,10 @@ def session_silence_minutes(turns: list[dict]) -> float:
     return delta.total_seconds() / 60.0
 
 
-_UNLINK_RETRIES = 8
-_UNLINK_RETRY_SLEEP_S = 0.05
-
-
-def _unlink_with_retry(path: Path) -> None:
-    """Unlink with a short bounded retry on transient PermissionError.
-
-    Windows cannot delete a file another handle holds open (WinError 32) —
-    a just-flushed writer, a not-yet-GC'd reader generator, or the CI
-    runner's antivirus/indexer briefly pins freshly-written files. On POSIX
-    the retry never triggers. Re-raises after the budget so a *real*
-    permission problem still surfaces (fail-loud, matching the ingest
-    pipeline's error counters)."""
-    for attempt in range(_UNLINK_RETRIES):
-        try:
-            path.unlink(missing_ok=True)
-            return
-        except PermissionError:
-            if attempt == _UNLINK_RETRIES - 1:
-                raise
-            time.sleep(_UNLINK_RETRY_SLEEP_S * (attempt + 1))
-
-
 def delete_session_buffer(persona_dir: Path, session_id: str) -> None:
-    """Unlink the buffer file. Idempotent — no-op when file is missing."""
+    """Delete the buffer file. Idempotent — no-op when file is missing; a transient sharing violation is retried."""
     path = _session_path(persona_dir, session_id)
-    _unlink_with_retry(path)
+    delete_file(path)
 
 
 def _cursor_path(persona_dir: Path, session_id: str) -> Path:
@@ -173,6 +192,14 @@ def _cursor_path(persona_dir: Path, session_id: str) -> Path:
     """
     _validate_session_id(session_id)
     return _active_conversations_dir(persona_dir) / f"{session_id}.cursor"
+
+
+def extract_lock_path(persona_dir: Path, session_id: str) -> Path:
+    """Resolve <persona>/active_conversations/<session_id>.extract, the path whose ``file_lock``
+    sidecar serialises extraction of one session (#477). The ``.jsonl`` glob of
+    ``list_active_sessions`` never picks it up; ``_validate_session_id`` keeps it inside the dir."""
+    _validate_session_id(session_id)
+    return _active_conversations_dir(persona_dir) / f"{session_id}.extract"
 
 
 def read_cursor(persona_dir: Path, session_id: str) -> str | None:
@@ -199,15 +226,15 @@ def write_cursor(persona_dir: Path, session_id: str, ts: str) -> None:
     """Atomically write the cursor file. Raises ValueError on bad ts."""
     datetime.fromisoformat(ts.replace("Z", "+00:00"))
     path = _cursor_path(persona_dir, session_id)
-    tmp = path.with_suffix(".cursor.tmp")
-    tmp.write_text(ts, encoding="utf-8")
-    os.replace(tmp, path)
+    # The shared atomic text writer (#477): a unique temp per save, a bounded retry of a
+    # transient PermissionError on the replace, fsync, and the temp removed on failure.
+    save_with_backup_text(path, ts, keep_backups=False)
 
 
 def delete_cursor(persona_dir: Path, session_id: str) -> None:
-    """Idempotent unlink of the cursor file (retry — see _unlink_with_retry)."""
+    """Idempotent delete of the cursor file (retried: ``file_ops.delete_file``)."""
     path = _cursor_path(persona_dir, session_id)
-    _unlink_with_retry(path)
+    delete_file(path)
 
 
 def _rolled_to_path(persona_dir: Path, session_id: str) -> Path:
@@ -220,30 +247,23 @@ def _rolled_to_path(persona_dir: Path, session_id: str) -> Path:
 
 
 def write_rolled_to(persona_dir: Path, session_id: str, successor_id: str) -> None:
-    """Atomically write the successor pointer (tmp + fsync + os.replace). Written
+    """Atomically write the successor pointer (through the shared atomic writer). Written
     under the compaction lock BEFORE the old buffer is deleted, so the old sid never
     resolves to nothing."""
     _validate_session_id(session_id)
     _validate_session_id(successor_id)
-    path = _rolled_to_path(persona_dir, session_id)
-    tmp = path.with_suffix(".rolled_to.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump({"successor": successor_id, "at": _now_iso()}, fh)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    write_json(
+        _rolled_to_path(persona_dir, session_id),
+        {"successor": successor_id, "at": _now_iso()},
+        indent=None,
+        fsync=True,
+    )
 
 
 def read_rolled_to(persona_dir: Path, session_id: str) -> str | None:
     """Return the successor sid this session rolled over to, or None if absent/malformed."""
-    path = _rolled_to_path(persona_dir, session_id)
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, json.JSONDecodeError):
-        return None
-    succ = data.get("successor") if isinstance(data, dict) else None
+    data = read_json(_rolled_to_path(persona_dir, session_id), default=dict, expect=dict)
+    succ = data.get("successor")
     return succ if isinstance(succ, str) and succ else None
 
 
@@ -260,43 +280,39 @@ def _backoff_path(persona_dir: Path, session_id: str) -> Path:
 
 
 def read_backoff(persona_dir: Path, session_id: str) -> dict | None:
-    """Return the backoff state ({failures: int, first_failure_at: str}) or
-    None if the file is missing, empty, or malformed."""
-    path = _backoff_path(persona_dir, session_id)
-    if not path.exists():
+    """Return the backoff state ({failures: int, first_failure_at: str}, plus ``failing_end_ts`` when the failing chunk's end
+    was recorded) or None if the file is missing, empty, or malformed."""
+    data = read_json(_backoff_path(persona_dir, session_id), default=lambda: None, expect=dict)
+    if data is None or "failures" not in data or "first_failure_at" not in data:
         return None
     try:
-        text = path.read_text(encoding="utf-8").strip()
-        if not text:
-            return None
-        data = json.loads(text)
-        if not isinstance(data, dict):
-            return None
-        if "failures" not in data or "first_failure_at" not in data:
-            return None
         # Validate ts parses
         datetime.fromisoformat(str(data["first_failure_at"]).replace("Z", "+00:00"))
-        return data
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (ValueError, TypeError):
         return None
+    return data
 
 
-def write_backoff(persona_dir: Path, session_id: str, failures: int, first_failure_at: str) -> None:
-    """Atomically write the backoff state. Raises ValueError on bad ts."""
+def write_backoff(
+    persona_dir: Path, session_id: str, failures: int, first_failure_at: str, failing_end_ts: str | None = None
+) -> None:
+    """Atomically write the backoff state. Raises ValueError on bad ts.
+
+    ``failing_end_ts``: the end (the ``cursor_ts``) of the chunk whose extraction failed, so that setting it aside in
+    ``poison/`` takes only the rows that attempt carried. Optional: the key is left out when unknown, and a reader that does
+    not know it (an older brain) ignores it.
+    """
     datetime.fromisoformat(first_failure_at.replace("Z", "+00:00"))  # validate
-    path = _backoff_path(persona_dir, session_id)
-    tmp = path.with_suffix(".backoff.tmp")
-    tmp.write_text(
-        json.dumps({"failures": failures, "first_failure_at": first_failure_at}),
-        encoding="utf-8",
-    )
-    os.replace(tmp, path)
+    state = {"failures": failures, "first_failure_at": first_failure_at}
+    if failing_end_ts is not None:
+        state["failing_end_ts"] = failing_end_ts
+    write_json(_backoff_path(persona_dir, session_id), state, indent=None, fsync=False)
 
 
 def delete_backoff(persona_dir: Path, session_id: str) -> None:
-    """Idempotent unlink of the backoff sidecar (retry — see _unlink_with_retry)."""
+    """Idempotent delete of the backoff sidecar (retried: ``file_ops.delete_file``)."""
     path = _backoff_path(persona_dir, session_id)
-    _unlink_with_retry(path)
+    delete_file(path)
 
 
 def rewrite_session_atomic(persona_dir: Path, session_id: str, turns: list[dict]) -> None:
@@ -308,29 +324,14 @@ def rewrite_session_atomic(persona_dir: Path, session_id: str, turns: list[dict]
     compaction to install ``[summary, *retained_tail]``. Temp file + os.replace
     mirrors ``write_cursor`` so a reader never sees a torn buffer.
 
-    The replace gets the same bounded retry as ``_unlink_with_retry`` (#198):
+    The replace gets the shared bounded retry (``file_ops.retry_transient``, #198):
     Windows refuses ``os.replace`` over a file another handle holds open — a
     ``GET /chat/history`` streaming this buffer is the realistic case, and it
     finishes in milliseconds. On POSIX the retry never triggers. After the
     budget the error re-raises (the old buffer is intact) and the temp file is
     removed so a repeated collision cannot litter ``active_conversations``.
     """
-    path = _session_path(persona_dir, session_id)
-    tmp = path.with_suffix(".jsonl.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        for rec in turns:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        fh.flush()
-        os.fsync(fh.fileno())
-    for attempt in range(_UNLINK_RETRIES):
-        try:
-            os.replace(tmp, path)
-            return
-        except PermissionError:
-            if attempt == _UNLINK_RETRIES - 1:
-                tmp.unlink(missing_ok=True)
-                raise
-            time.sleep(_UNLINK_RETRY_SLEEP_S * (attempt + 1))
+    write_jsonl(_session_path(persona_dir, session_id), turns, fsync=True)
 
 
 # Archive rotation (1d). A single unbounded ``<sid>.jsonl`` grows without limit on
@@ -358,7 +359,7 @@ def _archive_segments(persona_dir: Path, session_id: str) -> list[tuple[int, Pat
     out: list[tuple[int, Path]] = []
     for p in d.glob(f"{session_id}.*.jsonl"):
         mid = p.name[len(prefix) : -len(suffix)]
-        if mid.isdigit():
+        if mid.isascii() and mid.isdigit():  # str.isdigit() also accepts "²", which int() rejects
             out.append((int(mid), p))
     out.sort(key=lambda t: t[0])
     return out
@@ -375,24 +376,6 @@ def _archive_read_order(persona_dir: Path, session_id: str) -> list[Path]:
     return paths
 
 
-def _fsync_dir(path: Path) -> None:
-    """fsync a directory so a newly-created entry is durable (crash-mid-roll
-    protection, C11). POSIX-only — Windows has no O_DIRECTORY and raises; guarded
-    like brain/health/attempt_heal.py so Windows CI does not break."""
-    if os.name != "posix":
-        return
-    try:
-        dir_fd = os.open(str(path), os.O_DIRECTORY)
-    except OSError:
-        return
-    try:
-        os.fsync(dir_fd)
-    except OSError:
-        pass
-    finally:
-        os.close(dir_fd)
-
-
 def append_archive(persona_dir: Path, session_id: str, records: list[dict]) -> int:
     """Append ``records`` to the conversation archive, fsync, return byte count.
 
@@ -407,8 +390,7 @@ def append_archive(persona_dir: Path, session_id: str, records: list[dict]) -> i
         return 0
     _validate_session_id(session_id)
     d = _archived_conversations_dir(persona_dir)
-    payload = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records)
-    data = payload.encode("utf-8")
+    data = encode_jsonl(records)
 
     # Choose the active target: the highest existing segment, else a legacy single
     # file if one exists, else a fresh segment 000.
@@ -431,13 +413,10 @@ def append_archive(persona_dir: Path, session_id: str, records: list[dict]) -> i
             active_path = d / f"{session_id}.{next_num:03d}.jsonl"
             is_new_segment = True
 
-    with open(active_path, "a", encoding="utf-8") as fh:
-        fh.write(payload)
-        fh.flush()
-        os.fsync(fh.fileno())
+    written = append_jsonl(active_path, data, fsync=True)
     if is_new_segment:
-        _fsync_dir(d)
-    return len(data)
+        fsync_dir(d)
+    return written
 
 
 def read_archive(persona_dir: Path, session_id: str) -> list[dict]:
@@ -446,8 +425,180 @@ def read_archive(persona_dir: Path, session_id: str) -> list[dict]:
     zero-length trailing segment left by a crash mid-roll)."""
     out: list[dict] = []
     for p in _archive_read_order(persona_dir, session_id):
-        out.extend(read_jsonl_skipping_corrupt(p))
+        out.extend(read_jsonl(p, recover=Recovery.RAISE))
     return out
+
+
+# --- The time of the user's last turn -----------------------------------------------------------------------------
+# The one place it is computed (``days_since_human`` and the user-presence silence both call it). It reads the
+# conversation files and nothing else: no memory, no presence file. A reader must not write, so neither step creates a
+# folder (``_active_conversations_dir`` and ``_archived_conversations_dir`` both do).
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _latest_user_ts_in_file(path: Path) -> datetime | None:
+    """The ``ts`` of the last ``speaker == "user"`` row of one conversation file (the last in file order), or None.
+
+    The file is read from its end backwards and the read stops at that row (``iter_jsonl_reversed``), so only a file with no
+    user row, or whose last user row sits near its start, is read to its start. A user row whose ``ts`` does not parse is
+    skipped with a warning and the read goes on backwards. A bad line, including one the JSON parser cannot load, is skipped
+    by the reader with its own warning, so it never hides an earlier user row. A file that cannot be read reads as empty
+    (the reader warns)."""
+    with closing(iter_jsonl_reversed(path)) as rows:
+        for row in rows:
+            if row.get("speaker") != "user":
+                continue
+            ts = lenient_utc(row.get("ts"))
+            if ts is None:
+                warn_throttled(
+                    logger, "last_user_turn_ts:bad_ts", "last_user_turn_ts: a user row of %s has no usable ts", path.name,
+                    exc_info=False,
+                )
+                continue
+            return ts
+    return None
+
+
+def _latest_user_ts_in_active_files(persona_dir: Path) -> datetime | None:
+    try:
+        session_ids = list_active_sessions(persona_dir)
+    except OSError:
+        warn_throttled(
+            logger, "last_user_turn_ts:unlistable_active", "last_user_turn_ts: the active conversations folder cannot be listed"
+        )
+        return None
+    latest: datetime | None = None
+    for session_id in session_ids:
+        try:
+            path = _session_path(persona_dir, session_id)  # the folder exists (it was just listed): nothing is created
+        except ValueError:
+            continue  # a file name that is not a session id is not a session buffer
+        ts = _latest_user_ts_in_file(path)
+        if ts is not None and (latest is None or ts > latest):
+            latest = ts
+    return latest
+
+
+def _latest_user_ts_in_session_archive(persona_dir: Path, session_id: str) -> datetime | None:
+    """The latest user ``ts`` of one archived session: its files from the last backwards, stopping at the first that holds one."""
+    try:
+        files = _archive_read_order(persona_dir, session_id)
+    except OSError:
+        warn_throttled(
+            logger, "last_user_turn_ts:unlistable_session", "last_user_turn_ts: the archived files of session %s cannot be listed",
+            session_id,
+        )
+        return None
+    for path in reversed(files):
+        ts = _latest_user_ts_in_file(path)
+        if ts is not None:
+            return ts
+    return None
+
+
+def _archived_file_session(name: str) -> tuple[str, int] | None:
+    """The session id and rank of an archived conversation file's name, or None for any other name.
+
+    ``<sid>.jsonl`` is the legacy single file (rank -1, before every segment); ``<sid>.<NNN>.jsonl`` is segment NNN. A session id
+    holds no dot, so the first dot ends it."""
+    if not name.endswith(".jsonl"):
+        return None
+    session_id, _, segment = name[: -len(".jsonl")].partition(".")
+    if not _SESSION_ID_RE.fullmatch(session_id):
+        return None
+    if not segment:
+        return session_id, -1
+    if segment.isascii() and segment.isdigit():  # str.isdigit() also accepts "²", which int() rejects
+        return session_id, int(segment)
+    return None
+
+
+def archived_files_written_since(persona_dir: Path, since: datetime) -> list[Path]:
+    """The archived conversation files (every session's legacy file and segments) last written at or after ``since``, in name order.
+
+    A file's rows are no later than its last write, so a file last written before ``since`` holds no turn from ``since`` on and is
+    left out without being opened. Reads only: a missing folder lists as [] and nothing is created. An unlistable folder lists as
+    [], and a file that cannot be inspected is left out, each with a warning."""
+    folder = persona_dir / "archived_conversations"
+    try:
+        names = list_dir(folder)
+    except OSError:
+        warn_throttled(logger, "archived_files_written_since:unlistable", "the archived conversations folder cannot be listed")
+        return []
+    since_ns = (since - _EPOCH) // timedelta(microseconds=1) * 1000
+    out: list[Path] = []
+    for name in names:
+        if _archived_file_session(name) is None:
+            continue
+        try:
+            stat = stat_path(folder / name)
+        except OSError:
+            warn_throttled(
+                logger, "archived_files_written_since:stat", "the archived file %s cannot be inspected; skipped", name
+            )
+            continue
+        if stat is not None and stat.is_file and stat.mtime_ns >= since_ns:
+            out.append(folder / name)
+    return out
+
+
+def _latest_user_ts_in_archive(persona_dir: Path, best: datetime | None) -> datetime | None:
+    """The later of ``best`` (the newest user ``ts`` already found, None for none) and the newest archived user ``ts``."""
+    # Not ``_archived_conversations_dir``: it creates the folder. A missing folder lists as [].
+    folder = persona_dir / "archived_conversations"
+    try:
+        names = list_dir(folder)
+    except OSError:
+        warn_throttled(
+            logger, "last_user_turn_ts:unlistable_archive", "last_user_turn_ts: the archived conversations folder cannot be listed"
+        )
+        return best
+    # Each session's last file is read off this one listing: its largest numbered segment, else the legacy file.
+    last_file: dict[str, tuple[int, str]] = {}
+    for name in names:
+        parsed = _archived_file_session(name)
+        if parsed is None:
+            continue
+        session_id, rank = parsed
+        if session_id not in last_file or (rank, name) > last_file[session_id]:
+            last_file[session_id] = (rank, name)
+    # Session ids are not in time order, so the sessions are visited newest file first by modification time (a file's
+    # last row cannot be later than the time the file was last written).
+    visits: list[tuple[datetime, str]] = []
+    for session_id, (_, name) in last_file.items():
+        try:
+            stat = stat_path(folder / name)
+        except OSError:
+            warn_throttled(
+                logger, "last_user_turn_ts:stat", "last_user_turn_ts: the archived file %s cannot be inspected; skipped", name
+            )
+            continue
+        if stat is None or not stat.is_file:  # gone since the listing, or not a file
+            continue
+        visits.append((_EPOCH + timedelta(microseconds=stat.mtime_ns // 1000), session_id))
+    visits.sort(reverse=True)
+    for mtime, session_id in visits:
+        if best is not None and best >= mtime:
+            break  # no later session can hold a turn newer than the best found, so no further file is opened
+        ts = _latest_user_ts_in_session_archive(persona_dir, session_id)
+        if ts is not None and (best is None or ts > best):
+            best = ts
+    return best
+
+
+def last_user_turn_ts(persona_dir: Path) -> datetime | None:
+    """The ``ts`` (aware, UTC) of the user's last turn, from the conversation files, or None when no file holds one.
+
+    Every conversation file is read from its end backwards to its last ``speaker == "user"`` row (``_latest_user_ts_in_file``).
+    Active step: every ``active_conversations/*.jsonl``, the latest of those rows' ``ts`` across the files. Archive step, always run, seeded with the active result (a
+    lingering active buffer must not hide a newer archived session; after a full fold the successor holds only a summary
+    row): the archived sessions visited newest file first, each read from its last file backwards to the first that holds
+    a user turn, the walk ending as soon as the best ``ts`` found (the active one included) is not older than the next
+    session's last-file modification time, so the read is bounded with no window constant. The answer is the later of the
+    active files' and the archive's newest user ``ts``. A naive ``ts`` means UTC. Reads only: no folder is created.
+    """
+    return _latest_user_ts_in_archive(persona_dir, _latest_user_ts_in_active_files(persona_dir))
 
 
 # --- Archive commit marker (Bug 3: idempotent archive-under-crash-retry) -----
@@ -479,21 +630,62 @@ def read_archive_marker(persona_dir: Path, session_id: str) -> str | None:
 
 
 def write_archive_marker(persona_dir: Path, session_id: str, key: str) -> None:
-    """Atomically write the archive commit-marker (temp + os.replace + fsync),
-    mirroring ``write_cursor`` but WITH an fsync — this marker must be durable
+    """Atomically write the archive commit-marker through the shared atomic text writer
+    (unique temp + retried replace + fsync), as ``write_cursor`` does, and fsync the directory
+    for a new marker — this marker must be durable
     across a crash landing immediately after the archive append's own fsync."""
     path = _archive_marker_path(persona_dir, session_id)
     is_new = not path.exists()
-    tmp = path.with_suffix(".archived.tmp")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        fh.write(key)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    save_with_backup_text(path, key, keep_backups=False, fsync=True)
     if is_new:
         # fsync the containing dir so the new sidecar's directory entry is durable
         # (crash-mid-create), matching append_archive's new-segment durability.
-        _fsync_dir(path.parent)
+        fsync_dir(path.parent)
+
+
+def turn_identity(t: dict) -> tuple:
+    """A stable identity for a buffer turn, used to match archived turns against
+    a re-read buffer (race-safe rewrite). (ts, speaker, text) is unique enough;
+    a collision means two byte-identical turns in the same second, where keeping
+    or dropping one is harmless."""
+    return (t.get("ts"), t.get("speaker"), t.get("text"))
+
+
+def _archive_batch_key(records: list[dict], new_gen: int) -> str:
+    """A stable identity for one archive-append batch: sha256 over ``new_gen`` and
+    the ORDERED ``(ts, speaker, text)`` identity of every record — never any
+    generated fold text. Two invocations that recompute the identical batch (a
+    crash-retry over an unchanged buffer) hash to the SAME key; a later,
+    genuinely-different batch (different ``new_gen`` or different records) never
+    collides (Bug 3)."""
+    h = hashlib.sha256()
+    h.update(str(new_gen).encode("utf-8"))
+    for r in records:
+        h.update(repr(turn_identity(r)).encode("utf-8"))
+    return h.hexdigest()
+
+
+def archive_once(persona_dir: Path, session_id: str, records: list[dict], *, new_gen: int) -> int:
+    """The one archive-with-dedup write: archive ``records`` exactly once for this batch, proven by a
+    durable commit marker (Bug 3). Compaction, the cascade and the session rollover archive the turns they
+    remove from a conversation buffer through this, before they remove anything.
+
+    ``new_gen`` is the generation the batch belongs to (the summary generation being written, or the one
+    the rollover carries); it is part of the batch key. Skips the append ONLY when the marker key matches
+    — i.e. the marker PROVES a completed prior append of this exact batch — never by inferring from turn
+    identity, so two byte-identical raw turns are always both archived (or both re-archived on a true
+    partial-write retry), never silently collapsed (L2). Returns the byte count written, or ``1`` as a
+    skip sentinel (a proven-already-archived batch; still ``> 0`` for the caller's write-verify). An
+    empty batch writes nothing and returns 0. A crash between the append and the marker write repeats
+    the batch on the retry (repeats, never a missing row)."""
+    if not records:
+        return 0
+    key = _archive_batch_key(records, new_gen)
+    if read_archive_marker(persona_dir, session_id) == key:
+        return 1  # proven already archived this pass -> skip append (no dup, no loss)
+    n = append_archive(persona_dir, session_id, records)
+    write_archive_marker(persona_dir, session_id, key)
+    return n
 
 
 def _compacting_lock_path(persona_dir: Path, session_id: str) -> Path:
@@ -503,23 +695,6 @@ def _compacting_lock_path(persona_dir: Path, session_id: str) -> Path:
     _validate_session_id keeps it inside the dir."""
     _validate_session_id(session_id)
     return _active_conversations_dir(persona_dir) / f"{session_id}.compacting"
-
-
-def _pid_alive(pid: int) -> bool:
-    """True if a process with ``pid`` exists.
-
-    Delegates to state_file.pid_is_alive, which carries the Windows-safe
-    branch. NEVER use a raw ``os.kill(pid, 0)`` probe here: on Windows,
-    signal 0 is CTRL_C_EVENT, and probing a bogus pid delivers a real
-    Ctrl+C to our OWN console group (this aborted the whole pytest session
-    on windows-latest CI, and in production would interrupt whatever
-    console hosts the bridge). Lazy import: ingest is a lower layer than
-    bridge, so the dependency stays function-local."""
-    if pid <= 0:
-        return False
-    from brain.bridge.state_file import pid_is_alive
-
-    return pid_is_alive(pid)
 
 
 def acquire_compaction_lock(
@@ -534,7 +709,9 @@ def acquire_compaction_lock(
     (skip). The caller releases via release_compaction_lock in a finally.
     """
     path = _compacting_lock_path(persona_dir, session_id)
-    payload = json.dumps({"pid": os.getpid(), "ts": _now_iso()})
+    from brain import process_identity
+
+    payload = json.dumps({"pid": os.getpid(), "ts": _now_iso(), "token": process_identity.own_token()})  # json-io: ok -- O_EXCL lock-file payload: a lock protocol, not a state file
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -543,12 +720,13 @@ def acquire_compaction_lock(
     except FileExistsError:
         # Held — decide whether it is stale and reapable.
         reap = False
+        holder = read_json(path, default=dict, expect=dict)  # empty/torn payload (or unreadable): not alive
         try:
-            holder = json.loads(path.read_text(encoding="utf-8"))
             holder_pid = int(holder.get("pid", -1))
-        except (OSError, ValueError, TypeError):
+        except (TypeError, ValueError):
             holder_pid = -1
-        if not _pid_alive(holder_pid):
+        holder_token = holder.get("token") if isinstance(holder.get("token"), str) else None
+        if holder_pid <= 0 or not process_identity.holder_alive(holder_pid, holder_token):
             reap = True
         else:
             try:

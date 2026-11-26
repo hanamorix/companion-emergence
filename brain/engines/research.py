@@ -1,6 +1,7 @@
 """Research — autonomous exploration of developed interests.
 
-See docs/superpowers/specs/2026-04-24-week-4-research-engine-design.md.
+See docs/source-spec/2026-07-13-research-engine-redesign-design.md (the 2026-04-24 week-4 design it replaced was never
+committed, #797).
 This module ships the types + engine scaffold. run_tick body lands in Task 3.
 """
 
@@ -18,7 +19,9 @@ from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, build_tier_provi
 from brain.bridge.provider import LLMProvider
 from brain.engines._interests import Interest, InterestSet, spawn_interest
 from brain.engines.research_notes import append_session_notes, read_notes_tail
-from brain.engines.research_session import parse_session_output
+from brain.engines.research_session import extract_felt_lines, parse_session_output
+from brain.health.json_io import Recovery, read_json_result, write_json
+from brain.health.parse_failures import record_parse_failure
 from brain.memory.store import Memory, MemoryStore
 from brain.search.base import WebSearcher
 from brain.utils.emotion import format_emotion_summary
@@ -49,6 +52,9 @@ _TOPIC_OVERLAP_PROMPT_SEGMENTS = prompt_strings.register_segments(
 _RENDER_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments(
     "engines.research.render_system_prompt_segments"
 )
+_RENDER_SYSTEM_PROMPT_SEGMENTS_LIVE = prompt_strings.register_segments(
+    "engines.research.render_system_prompt_segments_live"
+)
 
 
 def _compute_topic_overlap_via_haiku(
@@ -58,6 +64,7 @@ def _compute_topic_overlap_via_haiku(
     recent_conversation_excerpt: str,
     provider,
     user_name: str,
+    persona_dir: Path | None = None,
 ) -> float:
     """Score how relevant a matured research thread is to recent conversation."""
     system = _TOPIC_OVERLAP_SYSTEM.format(user_name=user_name)
@@ -69,10 +76,13 @@ def _compute_topic_overlap_via_haiku(
 
     try:
         raw = provider.generate(prompt, system=system)
-        data = json.loads(extract_json_object(raw))
-        score = float(data["score"])
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError, OSError) as exc:
+    except (ValueError, KeyError, TypeError, OSError) as exc:
         logger.warning("topic_overlap haiku call failed (%s); returning 0.0", exc)
+        return 0.0
+    try:
+        score = float(json.loads(extract_json_object(raw))["score"])
+    except (ValueError, KeyError, TypeError) as exc:
+        record_parse_failure(persona_dir, site="research_topic_overlap", raw=raw, error=str(exc))
         return 0.0
     return max(0.0, min(1.0, score))
 
@@ -186,20 +196,29 @@ class ResearchEngine:
         days_since = (
             days_since_human_override
             if days_since_human_override is not None
-            else days_since_human(self.store, now, persona_dir=self.interests_path.parent)
+            else days_since_human(now, persona_dir=self.interests_path.parent)
         )
         emo_state = emotion_state_override
+        from brain.emotion import engine
+
+        live_engine = engine.engine_for(self.interests_path.parent)
+        # `live` selects Hana's research writer branch (the prompt segments, the felt-line extraction and the stored
+        # research memory below; her B1 PR #686). It is not read for the emotion state, which always comes from the engine.
+        live = live_engine.is_live()
         if emo_state is None:
-            from brain.emotion.aggregate import aggregate_state
+            from brain.emotion.state import EmotionalState
 
-            all_mems = self.store.list_active(limit=None)
-            emo_state = aggregate_state(all_mems)
+            # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+            # pending or retrying, read() returns nothing and the research gate sees no high feeling.
+            # Built through the constructor, not `.set` (which drops zeros and raises on unknown names).
+            emo_state = EmotionalState(emotions=engine.short_values(live_engine.read()))
 
-        emo_peak = max(emo_state.emotions.values(), default=0.0)
+        # The engine's own reading of "high" (`engine.feels_high`): the research gate holds no level of its own.
+        emotion_gate = any(live_engine.feels_high(name) for name in emo_state.emotions)
 
         gate_ok = (
             days_since >= 1.5  # research_days_since_human_min default
-            or emo_peak >= 7.0  # research_emotion_threshold default
+            or emotion_gate
         )
         if not gate_ok:
             return ResearchResult(
@@ -265,7 +284,7 @@ class ResearchEngine:
                 )
 
             # Memory sweep: keyword-matched seed memories
-            memory_context = self._build_memory_context(winner)
+            memory_context, context_ids = self._memory_context(winner)
             notes_tail = read_notes_tail(self.interests_path.parent, winner.id)
 
             # Web search (conditional on scope)
@@ -283,10 +302,44 @@ class ResearchEngine:
             web_used = len(web_results) > 0
 
             prompt = self._render_prompt(
-                winner, why, notes_tail, memory_context, web_results, emo_state
+                winner, why, notes_tail, memory_context, web_results, emo_state, live=live
             )
-            raw = self.provider.generate(prompt, system=self._render_system_prompt())
-            session = parse_session_output(raw)
+            raw = self.provider.generate(prompt, system=self._render_system_prompt(live=live))
+            felt: dict[str, float] | None = None
+            rating: float | None = None
+            reply = raw
+            if live:
+                reply, felt, rating = extract_felt_lines(raw)
+                if felt is None or rating is None:
+                    # A missing or broken felt line never fails the fire: the memory is still written.
+                    record_parse_failure(
+                        self.interests_path.parent,
+                        site="research_felt",
+                        raw=raw,
+                        error="no readable "
+                        + " or ".join(
+                            name
+                            for name, value in (("EMOTIONS", felt), ("ENGAGEMENT", rating))
+                            if value is None
+                        )
+                        + " line at the end of the reply",
+                    )
+            session = parse_session_output(reply)
+
+            # A reply with notes but no memory or no verdict is a layout the parser did not read (the prompt asks for
+            # all three every time): the memory, the close and the spawned topics of the fire are lost without a trace
+            # unless it is recorded (#591). The fire itself carries on unchanged.
+            if session.notes and session.missing:
+                record_parse_failure(
+                    self.interests_path.parent,
+                    site="research_session",
+                    raw=raw,
+                    error=(
+                        "no NOTES marker, reply kept as notes"
+                        if session.degraded
+                        else "no readable " + " or ".join(session.missing) + " section in the reply"
+                    ),
+                )
 
             if session.notes:
                 try:
@@ -298,7 +351,8 @@ class ResearchEngine:
 
             # Persist memory — only when the session actually produced one.
             # The degraded (no-markers) path still counts as a fire (notes may
-            # have been captured above) but leaves output_memory_id None.
+            # have been captured above) but leaves output_memory_id None, and
+            # is recorded as a parse failure above.
             # Fail-soft per spec §5.3: a create failure (SQLite lock past
             # busy_timeout, disk full, ...) must not abort the tick — the
             # cooldown burn + log append below still need to run, or the same
@@ -306,14 +360,19 @@ class ResearchEngine:
             mem_id = None
             if session.memory:
                 try:
-                    mem = _create_research_memory(
+                    mem = build_research_memory(
                         content=session.memory,
-                        interest=winner,
-                        web_results=web_results,
+                        interest_id=winner.id,
+                        interest_topic=winner.topic,
+                        scope=winner.scope,
+                        web_urls=[r.url for r in web_results[:5]],
+                        web_result_count=len(web_results),
                         web_used=web_used,
                         trigger=trigger,
                         provider_name=self.provider.name(),
                         searcher_name=self.searcher.name() if web_used else None,
+                        emotions=felt or {},
+                        engagement_rating=rating,
                     )
                     from brain.memory.pending import route_write
 
@@ -350,6 +409,14 @@ class ResearchEngine:
                 output_memory_id=mem_id,
             )
             log.appended(fire).save(self.research_log_path)
+
+            # The session ran, so the memories in its prompt were in front of her: one recall each (#587). After the
+            # writes above and fail-soft, so a store error here can't cost the fire it follows.
+            try:
+                for mid in context_ids:
+                    self.store.get(mid)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("research recall tick failed for %r: %s", winner.id, exc)
 
             # D-reflection Task 18: emit research_completion initiate candidate (gated).
             # Best-effort: gate/emit failure does NOT prevent the research fire.
@@ -414,6 +481,10 @@ class ResearchEngine:
             raw = self.provider.generate(
                 prompt, system=_SELECT_SYSTEM.format(persona_name=self.persona_name)
             )
+        except (ValueError, KeyError, TypeError, OSError) as exc:
+            logger.warning("research select failed (%s); mechanical fallback", exc)
+            return eligible[0], ""
+        try:
             data = json.loads(extract_json_object(raw))
             why = str(data.get("why", "")).strip()[:280]
             choice = data.get("choice")
@@ -423,8 +494,10 @@ class ResearchEngine:
                 if i.id == str(choice):
                     return i, why
             return top[0], ""  # unknown id -> mechanical fallback
-        except (ValueError, KeyError, TypeError, json.JSONDecodeError, OSError) as exc:
-            logger.warning("research select failed (%s); mechanical fallback", exc)
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            record_parse_failure(
+                self.interests_path.parent, site="research_select", raw=raw, error=str(exc)
+            )
             return eligible[0], ""
 
     def _seed_interests_from_voice(self) -> bool:
@@ -503,31 +576,38 @@ class ResearchEngine:
             return False
 
     def _build_memory_context(self, interest: Interest) -> str:
-        """Keyword-seeded memory sweep. Returns formatted string.
+        """The formatted memory sweep for ``interest``; counts nothing as a recall (#587)."""
+        return self._memory_context(interest)[0]
+
+    def _memory_context(self, interest: Interest) -> tuple[str, list[str]]:
+        """Keyword-seeded memory sweep. Returns the formatted string and the ids it holds.
 
         Uses direct text search rather than Hebbian spreading activation
         because the engine doesn't hold a HebbianMatrix. This gives a
         thematic slice through related memories — sufficient for Phase 1.
+
+        Reads nothing as a recall (#587): the searches and the selection prompt
+        put nothing in front of the kindled. The fire ticks the returned ids
+        once its research session has run.
         """
         if not interest.related_keywords:
-            mems = self.store.search_text(interest.topic, active_only=True, limit=5)
+            mems = self.store.search_text(interest.topic, active_only=True, limit=5, bump=False)
         else:
             seed_ids: set[str] = set()
             for kw in interest.related_keywords[:5]:
-                for m in self.store.search_text(kw, active_only=True, limit=3):
+                for m in self.store.search_text(kw, active_only=True, limit=3, bump=False):
                     seed_ids.add(m.id)
             mems = []
             for sid in list(seed_ids)[:20]:
-                mem = self.store.get(sid)
+                mem = self.store.get(sid, bump=False)
                 if mem is not None:
                     mems.append(mem)
-        return (
-            "\n".join(f"- {m.content[:140]}" for m in mems[:20])
-            or "(no prior memories on this topic)"
-        )
+        mems = mems[:20]
+        text = "\n".join(f"- {m.content[:140]}" for m in mems) or "(no prior memories on this topic)"
+        return text, [m.id for m in mems]
 
-    def _render_system_prompt(self) -> str:
-        seg = _RENDER_SYSTEM_PROMPT_SEGMENTS
+    def _render_system_prompt(self, *, live: bool = False) -> str:
+        seg = _RENDER_SYSTEM_PROMPT_SEGMENTS_LIVE if live else _RENDER_SYSTEM_PROMPT_SEGMENTS
         return seg[0] + self.persona_name + seg[1] + self.persona_name + seg[2]
 
     def _render_prompt(
@@ -538,6 +618,8 @@ class ResearchEngine:
         memory_context: str,
         web_results: list,
         emo_state,
+        *,
+        live: bool = False,
     ) -> str:
         emo_summary = format_emotion_summary(emo_state.emotions) or "(neutral)"
         web_section = ""
@@ -547,6 +629,12 @@ class ResearchEngine:
             )
             web_section = f"\nFresh findings from the web today:\n{excerpts}\n"
         why_line = f"Why today: {why}\n" if why else ""
+        # The last line has to agree with the system prompt, or the two instructions contradict each other.
+        last_line = (
+            "Write NOTES / MEMORY / VERDICT, then EMOTIONS and ENGAGEMENT, now."
+            if live
+            else "Write NOTES / MEMORY / VERDICT now."
+        )
         return (
             f"Topic: {interest.topic}\n"
             f"{why_line}"
@@ -555,45 +643,57 @@ class ResearchEngine:
             f"Your notes so far:\n{notes_tail or '(first session on this topic)'}\n\n"
             f"What your own memories say:\n{memory_context}\n"
             f"{web_section}\n"
-            "Write NOTES / MEMORY / VERDICT now."
+            f"{last_line}"
         )
 
 
 # ---------- Module-level helpers ----------
 
 
-def _create_research_memory(
+def build_research_memory(
     *,
     content: str,
-    interest: Interest,
-    web_results: list,
+    interest_id: str,
+    interest_topic: str,
+    scope: str,
+    web_urls: list[str],
+    web_result_count: int,
     web_used: bool,
     trigger: str,
-    provider_name: str,
+    provider_name: str | None,
     searcher_name: str | None,
+    emotions: dict[str, float] | None = None,
+    engagement_rating: float | None = None,
 ) -> Memory:
-    """Factory helper — Memory.create_new with research-specific metadata shape."""
+    """Factory helper — Memory.create_new with research-specific metadata shape.
+
+    Shared by the live fire and by the recovery of fires whose reply was not split (brain/engines/research_recovery.py),
+    so both build the same fields.
+    """
+    metadata = {
+        "schema_version": RESEARCH_SCHEMA_VERSION,
+        "interest_id": interest_id,
+        "interest_topic": interest_topic,
+        "scope": scope,
+        "web_used": web_used,
+        "web_result_count": web_result_count,
+        "web_urls": web_urls,
+        "triggered_by": trigger,
+        "provider": provider_name,
+        "searcher": searcher_name,
+    }
+    if engagement_rating is not None:
+        metadata["engagement_rating"] = engagement_rating
     return Memory.create_new(
         content=content,
         memory_type="research",
         domain="us",
-        emotions={},
+        emotions=dict(emotions or {}),
         # P3 retention rework, Change 1: research is durable knowledge the
         # companion deliberately sought, not the ~0.0 the emotions={} default
         # would otherwise produce.
         importance=5.0,
-        metadata={
-            "schema_version": RESEARCH_SCHEMA_VERSION,
-            "interest_id": interest.id,
-            "interest_topic": interest.topic,
-            "scope": interest.scope,
-            "web_used": web_used,
-            "web_result_count": len(web_results),
-            "web_urls": [r.url for r in web_results[:5]],
-            "triggered_by": trigger,
-            "provider": provider_name,
-            "searcher": searcher_name,
-        },
+        metadata=metadata,
     )
 
 
@@ -696,6 +796,7 @@ def _emit_research_candidate(
             recent_conversation_excerpt=recent_excerpt,
             provider=provider,
             user_name=user_name,
+            persona_dir=persona_dir,
         )
 
         gate_ok, gate_reason = gate_research_completion(
@@ -756,7 +857,7 @@ class ResearchLog:
 
     Stored as a single JSON object ``{"version": 1, "fires": [...]}`` —
     atomic-rewrite, not append-only JSONL.  Corruption recovery delegates
-    to ``attempt_heal`` + ``.bak`` rotation; ``save_with_backup`` keeps up
+    to ``read_json_result`` (HEAL) + ``.bak`` rotation; ``write_json`` keeps up
     to three rolling backups for the adaptive-treatment layer.
     """
 
@@ -765,8 +866,6 @@ class ResearchLog:
     @classmethod
     def load(cls, path: Path) -> ResearchLog:
         """Load the log; heal from .bak rotation if corrupt, log WARNING."""
-        from brain.health.attempt_heal import attempt_heal
-
         def _default_factory() -> dict:
             return {"version": 1, "fires": []}
 
@@ -774,7 +873,8 @@ class ResearchLog:
             if not isinstance(data, dict) or not isinstance(data.get("fires"), list):
                 raise ValueError("research log schema invalid: missing 'fires' list")
 
-        data, anomaly = attempt_heal(path, _default_factory, schema_validator=_schema_validator)
+        _res = read_json_result(path, default=_default_factory, recover=Recovery.HEAL, validate=_schema_validator)
+        data, anomaly = _res.data, _res.anomaly
         if anomaly is not None:
             logger.warning(
                 "ResearchLog anomaly detected: %s action=%s file=%s",
@@ -786,13 +886,11 @@ class ResearchLog:
         return cls(fires=tuple(ResearchFire.from_dict(f) for f in fires_raw if isinstance(f, dict)))
 
     def save(self, path: Path) -> None:
-        """Atomic save via .bak rotation (save_with_backup)."""
+        """Atomic save via .bak rotation (write_json)."""
         from brain.health.adaptive import compute_treatment
-        from brain.health.attempt_heal import save_with_backup
-
         payload = {"version": 1, "fires": [f.to_dict() for f in self.fires]}
         treatment = compute_treatment(path.parent, path.name)
-        save_with_backup(path, payload, backup_count=treatment.backup_count)
+        write_json(path, payload, backups=treatment.backup_count)
 
     def appended(self, fire: ResearchFire) -> ResearchLog:
         return ResearchLog(fires=self.fires + (fire,))

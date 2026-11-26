@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from brain.bridge.server import build_app
@@ -23,16 +24,12 @@ def _patch_fake_provider(monkeypatch, reply: str = "default reply", extraction: 
     Must be called BEFORE opening a TestClient so the lifespan picks up the
     stub at app startup.
 
-    Patches brain.bridge.provider.get_provider (the SOURCE module) — both
-    `build_tier_provider` (used by e.g. the `/sessions/close` route's
-    housekeeping-tier extraction) and, since #154's completion,
-    `build_interactive_chat_provider` (server.py's live `/chat` provider) do a
-    fresh, function-scoped `from brain.bridge.provider import get_provider` on
-    every call, so patching the source module reaches both. (Previously also
-    patched `brain.bridge.server.get_provider` — server.py no longer imports
-    that name at all now that its lifespan calls
-    `model_tier.build_interactive_chat_provider` instead of `get_provider`
-    directly, so that patch target no longer exists; dropped.)
+    Patches brain.bridge.provider.get_provider (the SOURCE module).
+    `build_tier_provider` (the `/sessions/close` route's housekeeping-tier
+    extraction, and server.py's live `/chat` provider) does a fresh,
+    function-scoped `from brain.bridge.provider import get_provider` on every
+    call, so patching the source module reaches every site. server.py itself
+    does not import `get_provider`.
     """
     import brain.bridge.provider as provider_module
     from brain.bridge.chat import ChatResponse
@@ -64,6 +61,33 @@ def test_health_returns_ok(persona_dir: Path):
         assert body["supervisor_thread"] in ("not-started", "alive", "dead")
         assert body["health_scan"] == "ok"
         assert body["health_error"] is None
+
+
+def test_health_counts_recent_parse_failures_per_site(persona_dir: Path):
+    """#364: the parse-failure log's reader. A site whose replies stop parsing
+    shows up here instead of failing quietly behind its fallback."""
+    from brain.health.parse_failures import record_parse_failure
+
+    record_parse_failure(persona_dir, site="extractor", raw="```json\n{", error="bad")
+    record_parse_failure(persona_dir, site="extractor", raw="nope", error="bad")
+    record_parse_failure(persona_dir, site="attunement", raw="nope", error="bad")
+    with _make_client(persona_dir) as c:
+        body = c.get("/health").json()
+    assert body["parse_failures_24h"] == {"extractor": 2, "attunement": 1}
+
+
+def test_health_counts_a_quarantine_flood_as_a_pending_alarm(persona_dir: Path):
+    """#470 review item 5: the gate's quarantine file is read. A gate bug that quarantines everything raises a pending alarm."""
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    now = datetime.now(UTC)
+    rows = [json.dumps({"quarantined_at": (now - timedelta(minutes=i)).isoformat(), "entry": {"id": f"c{i}"}}) for i in range(6)]
+    (persona_dir / "consolidation_quarantine.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+    with _make_client(persona_dir) as c:
+        body = c.get("/health").json()
+    assert body["health_scan"] == "ok"
+    assert body["pending_alarms"] == 1
 
 
 def test_health_reports_scan_failure(persona_dir: Path, monkeypatch):
@@ -226,7 +250,7 @@ def test_sessions_close_with_report_errors_stays_retryable(persona_dir: Path, mo
     def fake_close(*args, **kwargs):
         nonlocal calls
         calls += 1
-        report = IngestReport(session_id=args[1])
+        report = IngestReport(session_id=args[1], reached_end=True)  # #523: a completed close reaches the end
         if calls == 1:
             report.errors = 1
             # #167 C5 (dynamic-error): a distinct, non-zero value chosen so a
@@ -263,7 +287,7 @@ def test_sessions_close_exception_stays_retryable(persona_dir: Path, monkeypatch
             raise RuntimeError("extractor exploded")
         from brain.ingest.types import IngestReport
 
-        return IngestReport(session_id=args[1])
+        return IngestReport(session_id=args[1], reached_end=True)  # #523: a completed close reaches the end
 
     monkeypatch.setattr("brain.bridge.server._close_session_blocking", fake_close)
 
@@ -318,6 +342,58 @@ def test_stream_round_trip(persona_dir: Path, monkeypatch):
     assert chunked == "hello world from nell"
 
 
+def test_stream_chunks_survive_a_worker_that_finishes_before_the_loop_resumes(
+    persona_dir: Path, monkeypatch
+):
+    """The end-of-reply sentinel must queue BEHIND every chunk the worker thread pushed.
+
+    The proxy pushes chunks with `loop.call_soon_threadsafe(put_nowait, ...)`. When the
+    worker finishes before the loop thread gets back to the `await asyncio.to_thread(...)`
+    (a short reply), the await returns without yielding and those callbacks are still
+    pending in the loop's ready queue; a direct `chunk_q.put_nowait(None)` in the handler's
+    `finally` overtook them, the forwarder stopped early and the client - which builds the
+    reply only from reply_chunk frames - showed a truncated reply (the persisted turn was
+    complete). This forces that ordering: the stand-in runs the worker to completion before
+    it returns, without yielding to the loop.
+    """
+    import asyncio
+    import threading
+
+    monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
+    _patch_fake_provider(monkeypatch, reply="hello world from nell")
+
+    async def _to_thread_that_finishes_first(fn, /, *args, **kwargs):
+        box: dict = {}
+
+        def _run() -> None:
+            try:
+                box["result"] = fn(*args, **kwargs)
+            except BaseException as exc:  # noqa: BLE001 - re-raised below, as to_thread would
+                box["error"] = exc
+
+        worker = threading.Thread(target=_run)
+        worker.start()
+        worker.join()  # the loop thread is parked here, so every callback the worker queued is pending
+        if "error" in box:
+            raise box["error"]
+        return box["result"]
+
+    with _make_client(persona_dir) as c:
+        sid = c.post("/session/new", json={"client": "tests"}).json()["session_id"]
+        monkeypatch.setattr(asyncio, "to_thread", _to_thread_that_finishes_first)
+        with c.websocket_connect(f"/stream/{sid}") as ws:
+            ws.send_json({"message": "hi"})
+            frames = []
+            while True:
+                f = ws.receive_json()
+                frames.append(f)
+                if f.get("type") == "done":
+                    break
+
+    chunked = "".join(f["text"] for f in frames if f.get("type") == "reply_chunk")
+    assert chunked == "hello world from nell", [f.get("type") for f in frames]
+
+
 def test_stream_emits_keepalive_during_silent_provider_stretch(persona_dir: Path, monkeypatch):
     """A silent provider stretch (first-token latency / tool round-trip) must
     produce server keepalive frames so the client's 60s idle timer never fires
@@ -327,11 +403,15 @@ def test_stream_emits_keepalive_during_silent_provider_stretch(persona_dir: Path
     import time as _time
 
     import brain.bridge.provider as provider_module
-    import brain.bridge.server as srv
+    from brain import paths
     from brain.bridge.chat import ChatResponse
 
-    # Tiny keepalive interval so the test doesn't sleep for the real 15s.
-    monkeypatch.setattr(srv, "_STREAM_KEEPALIVE_SECONDS", 0.05)
+    # Short keepalive interval so the test doesn't sleep for the real 15s. The settings file holds every setting, so the
+    # interval is set the way a user would set it (in the file), not by patching the code default. One second is the
+    # smallest interval an override may set (#524 raises anything lower to it), so the silent stretch below is longer.
+    from tests.tunables_file import write_values
+
+    write_values(paths.get_home(), {"bridge.stream_keepalive_seconds": 1.0})
     monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
 
     class _SlowFake:
@@ -341,15 +421,15 @@ def test_stream_emits_keepalive_during_silent_provider_stretch(persona_dir: Path
         def chat(self, messages, *, tools=None, options=None):
             # Simulate the model going silent (no streamed deltas) for well
             # over the keepalive interval before the reply lands.
-            _time.sleep(0.3)
+            _time.sleep(1.5)
             return ChatResponse(content="late reply", tool_calls=[])
 
         def generate(self, prompt, *, system=None):
             return "[]"
 
-    # #154: server.py's lifespan now calls model_tier.build_interactive_chat_
-    # provider (a function-scoped import of get_provider from the SOURCE
-    # module), not a module-level `server.get_provider` — patch the source.
+    # server.py's lifespan calls model_tier.build_tier_provider (a
+    # function-scoped import of get_provider from the SOURCE module), not a
+    # module-level `server.get_provider`: patch the source.
     monkeypatch.setattr(provider_module, "get_provider", lambda _name, **_kw: _SlowFake())
 
     with _make_client(persona_dir) as c:
@@ -1021,6 +1101,7 @@ def test_sessions_snapshot_preserves_buffer(persona_dir: Path, monkeypatch):
         assert buffer_path.exists(), "snapshot must preserve replay buffer"
 
 
+@pytest.mark.slow(reason='1.1 s of CPU in its call phase on ubuntu in CI (wall 1.4 s); #540, J12')
 def test_health_reports_brain_version(persona_dir: Path):
     """The version handshake (spec 2026-06-12) — frontend compares this
     against the app version to detect a stale pre-update bridge."""

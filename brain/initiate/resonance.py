@@ -5,7 +5,7 @@ Per-heartbeat-tick batch evaluator: walks the top-N most-active memories
 compares against per-memory EMA baseline, emits initiate candidates for
 memories whose activation has spiked vs. their own history.
 
-Spec: docs/superpowers/specs/2026-05-13-v0.0.11-design.md (Section D)
+Spec: the 2026-05-13 v0.0.11 design (Section D), never committed and lost (#797).
 """
 
 from __future__ import annotations
@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from brain import dev_constants
 from brain.initiate.emit import emit_initiate_candidate, read_candidates
 from brain.initiate.new_sources import (
     GateThresholds,
@@ -27,6 +28,7 @@ from brain.initiate.new_sources import (
 from brain.initiate.schemas import SemanticContext
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
+from brain.utils.time import iso_utc
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +63,7 @@ class MemoryActivationBaseline:
         # the bridge's MemoryStore writer; WAL removes the reader/writer lock.
         if ":memory:" not in str(self._db_path):
             self._conn.execute("PRAGMA journal_mode = WAL")
-            self._conn.execute("PRAGMA busy_timeout = 5000")
+            self._conn.execute(f"PRAGMA busy_timeout = {int(dev_constants.SQLITE_STORE_BUSY_TIMEOUT_S * 1000)}")
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS memory_activation_baseline (
@@ -106,7 +108,7 @@ class MemoryActivationBaseline:
         Seeds with (mean=current, var=0) if the memory has no row yet.
         """
         existing = self.get(memory_id)
-        now_iso = datetime.now().isoformat()
+        now_iso = iso_utc(datetime.now(UTC))  # aware UTC: the repo reads a naive stamp as UTC (#485)
         if existing is None:
             new_mean = current
             new_var = 0.0
@@ -305,7 +307,10 @@ def run_resonance_tick(
             if row is None or row.update_count < thresholds.recall_resonance_bootstrap_min_count:
                 continue
 
-            memory = store.get(memory_id) if store is not None else None
+            # bump=False: this read exists only to get last_accessed_at for the staleness gate below. It shows her
+            # nothing, so it is not an access; a default get would add 1.0 to recall_count and set last_accessed_at
+            # to now for each of up to 50 memories on every tick, about every 15 minutes.
+            memory = store.get(memory_id, bump=False) if store is not None else None
             if memory is None:
                 continue
 

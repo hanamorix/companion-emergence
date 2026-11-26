@@ -6,7 +6,7 @@ import pytest
 
 from brain.felt_time.state import FeltTimeState
 from brain.felt_time.state import persist as persist_felt_time
-from brain.forgetting import run_pass
+from brain.forgetting import FORGETTING_STATE_FILENAME, run_pass
 from brain.memory.store import Memory, MemoryStore
 
 
@@ -330,6 +330,81 @@ def test_run_pass_exempts_soul_crystallised_memory_through_real_files(tmp_path):
     assert summary["faded"] == 0
 
 
+def _crystallise_directly(persona_dir, *, source_memory_id=None) -> str:
+    """Make a crystallisation the way the model does: the real tool through the real ``dispatch``
+    (the MCP server calls exactly this), against the persona's own memories.db."""
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.tools.dispatch import dispatch
+
+    store = MemoryStore(persona_dir / "memories.db")
+    hebbian = HebbianMatrix(":memory:")
+    try:
+        args = {"moment": "a moment she chose", "love_type": "craft", "why_it_matters": "it mattered"}
+        if source_memory_id is not None:
+            args["source_memory_id"] = source_memory_id
+        result = dispatch("crystallize_soul", args, store=store, hebbian=hebbian, persona_dir=persona_dir)
+    finally:
+        store.close()
+        hebbian.close()
+    assert result["created"] is True
+    return result["id"]
+
+
+def _state_of(persona_dir, memory_id) -> str:
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        return store._conn.execute("SELECT state FROM memories WHERE id = ?", (memory_id,)).fetchone()["state"]
+    finally:
+        store.close()
+
+
+def test_run_pass_exempts_a_memory_named_by_a_direct_crystallisation_through_dispatch(tmp_path):
+    """CANARY (#371) — the direct path end to end: dispatch("crystallize_soul", {..., source_memory_id})
+    -> SoulStore link -> list_crystallised_memory_ids -> _load_soul_linked_ids -> run_pass is_exempt.
+
+    Two personas of identical shape. The LINKED arm names its memory and nothing may fade (the frozen C1
+    wording: faded == 0, exempt >= 1). The CONTROL arm crystallises WITHOUT naming a memory and its memory
+    must fade, so a pass in the linked arm means the link did the protecting, not a gentle fixture."""
+    linked_dir, control_dir = tmp_path / "linked", tmp_path / "control"
+    linked_dir.mkdir()
+    control_dir.mkdir()
+
+    linked = _old_low_salience_memory(linked_dir)
+    _crystallise_directly(linked_dir, source_memory_id=linked)
+    summary = run_pass(linked_dir, event_bus=MagicMock())
+    assert _state_of(linked_dir, linked) == "active", "a memory named by a direct crystallisation must be exempt"
+    assert summary["faded"] == 0
+    assert summary["exempt"] >= 1
+
+    control = _old_low_salience_memory(control_dir)
+    _crystallise_directly(control_dir)
+    control_summary = run_pass(control_dir, event_bus=MagicMock())
+    assert _state_of(control_dir, control) == "fading", "the unnamed control memory must still fade"
+    assert control_summary["faded"] == 1
+
+
+def test_revoking_a_direct_crystallisation_makes_its_named_memory_forgettable_again(tmp_path):
+    """#371 C2 / L2-a: protection must be real BEFORE the revoke (otherwise 'fading afterwards' proves
+    nothing), and revoke must end it. Same #362 ruling as for accepted candidates."""
+    from brain.soul.revoke import revoke_crystallization
+    from brain.soul.store import SoulStore
+
+    memory_id = _old_low_salience_memory(tmp_path)
+    crystallization_id = _crystallise_directly(tmp_path, source_memory_id=memory_id)
+
+    run_pass(tmp_path, event_bus=MagicMock())
+    assert _state_of(tmp_path, memory_id) == "active", "the link must protect the memory first"
+
+    soul = SoulStore(str(tmp_path / "crystallizations.db"))
+    try:
+        assert revoke_crystallization(soul, crystallization_id, "no longer true") is not None
+    finally:
+        soul.close()
+
+    run_pass(tmp_path, event_bus=MagicMock())
+    assert _state_of(tmp_path, memory_id) == "fading", "a revoked crystallisation must stop protecting it"
+
+
 def test_run_pass_forgets_memory_whose_crystallisation_was_revoked(tmp_path):
     """#362 decision (2026-10-13): a revoked crystallisation stops protecting its
     source memory — revoke is Hana ruling "this is not a soul moment", and the
@@ -357,13 +432,15 @@ def test_run_pass_forgets_memory_whose_crystallisation_was_revoked(tmp_path):
     assert row["state"] == "fading", "a revoked crystallisation must not keep protecting the memory"
 
 
-def test_load_soul_linked_ids_logs_instead_of_swallowing(tmp_path, monkeypatch, caplog):
-    """#362: both fail-soft handlers stay fail-soft (empty set, no crash) but must
-    say so — the silent swallow is what hid the dead crystallised leg."""
+def test_load_soul_linked_ids_raises_and_logs_both_legs_when_they_cannot_be_read(
+    tmp_path, monkeypatch, caplog
+):
+    """#392: an exemption set that cannot be read must not become an empty set. Both legs are still
+    attempted and logged (so one look at the log shows everything that failed), then the loader raises."""
     import logging
 
     import brain.soul.candidates as candidates
-    from brain.forgetting import _load_soul_linked_ids
+    from brain.forgetting import SoulExemptionsUnavailableError, _load_soul_linked_ids
 
     def _boom(_persona_dir):
         raise RuntimeError("boom")
@@ -372,29 +449,231 @@ def test_load_soul_linked_ids_logs_instead_of_swallowing(tmp_path, monkeypatch, 
     monkeypatch.setattr(candidates, "list_under_review_memory_ids", _boom)
 
     with caplog.at_level(logging.WARNING, logger="brain.forgetting"):
-        crystallised, under_review = _load_soul_linked_ids(tmp_path)
+        with pytest.raises(SoulExemptionsUnavailableError):
+            _load_soul_linked_ids(tmp_path)
 
-    assert (crystallised, under_review) == (set(), set())
     messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("crystallised" in m for m in messages), messages
     assert any("under-review" in m for m in messages), messages
 
 
-def test_unreadable_candidates_file_is_logged_for_both_legs(tmp_path, caplog):
-    """#370: a REAL read failure (a directory where soul_candidates.jsonl should
-    be) must surface for the under-review leg too. list_under_review_memory_ids
-    used to swallow it and return [], so under-review memories silently lost
-    their exemption with nothing in the log."""
+def test_unreadable_candidates_file_raises_and_is_logged_for_both_legs(tmp_path, caplog):
+    """#370 / #392: a REAL read failure (a directory where soul_candidates.jsonl should be) hits both
+    legs. Each is logged, and the loader raises instead of returning two empty sets."""
     import logging
 
-    from brain.forgetting import _load_soul_linked_ids
+    from brain.forgetting import SoulExemptionsUnavailableError, _load_soul_linked_ids
 
     (tmp_path / "soul_candidates.jsonl").mkdir()
 
     with caplog.at_level(logging.WARNING, logger="brain.forgetting"):
-        crystallised, under_review = _load_soul_linked_ids(tmp_path)
+        with pytest.raises(SoulExemptionsUnavailableError):
+            _load_soul_linked_ids(tmp_path)
 
-    assert (crystallised, under_review) == (set(), set())
     messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
     assert any("crystallised" in m for m in messages), messages
     assert any("under-review" in m for m in messages), messages
+
+
+def _break_candidates_file(persona_dir, _memory_id, _monkeypatch):
+    (persona_dir / "soul_candidates.jsonl").mkdir()
+
+
+def _break_revoked_read(persona_dir, memory_id, monkeypatch):
+    import sqlite3
+
+    from brain.soul.store import SoulStore
+
+    # An accepted candidate is what makes the revoked list get read at all.
+    _accept_candidate_for_real(persona_dir, memory_id)
+
+    def _boom(self):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(SoulStore, "list_revoked", _boom)
+
+
+def _break_store_open(persona_dir, _memory_id, _monkeypatch):
+    (persona_dir / "crystallizations.db").write_bytes(b"this is not a sqlite database")
+
+
+def _break_under_review_leg(_persona_dir, _memory_id, monkeypatch):
+    import brain.soul.candidates as candidates
+
+    def _boom(_persona_dir):
+        raise PermissionError("soul_candidates.jsonl")
+
+    monkeypatch.setattr(candidates, "list_under_review_memory_ids", _boom)
+
+
+@pytest.mark.parametrize(
+    "break_it",
+    [_break_candidates_file, _break_revoked_read, _break_store_open, _break_under_review_leg],
+    ids=["candidates-file", "revoked-read", "store-open", "under-review-leg"],
+)
+def test_run_pass_changes_nothing_when_the_soul_exemptions_cannot_be_read(
+    tmp_path, monkeypatch, caplog, break_it
+):
+    """CANARY (#392) — fail closed. If the exemption sets cannot be read, the pass must not run with an
+    empty set: fading is reversible, losing is not, and 'could not read' is not 'nothing is exempt'.
+
+    One failure injected at each place the load can fail. The memory is the shape forgetting fades; the
+    control below shows it fades when the load is healthy and empty, so 'still active' here is the skip,
+    not a gentle fixture."""
+    import logging
+
+    memory_id = _old_low_salience_memory(tmp_path)
+    break_it(tmp_path, memory_id, monkeypatch)
+    bus = MagicMock()
+
+    with caplog.at_level(logging.WARNING, logger="brain.forgetting"):
+        summary = run_pass(tmp_path, event_bus=bus)
+
+    assert _state_of(tmp_path, memory_id) == "active"
+    assert summary["faded"] == summary["unfaded"] == summary["lost"] == 0
+    assert summary["exemptions_unavailable"] == 1
+    # A skipped pass writes nothing: no counters persisted, no resume cursor left behind.
+    assert not (tmp_path / FORGETTING_STATE_FILENAME).exists()
+    published = [c.args[0] for c in bus.publish.call_args_list]
+    assert any(e["type"] == "forgetting_pass" and e["exemptions_unavailable"] == 1 for e in published)
+    messages = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("skipping this pass" in m for m in messages), messages
+
+
+def test_run_pass_control_the_same_memory_fades_when_the_load_is_healthy_and_empty(tmp_path):
+    """The control for the canary above: no exemptions at all, nothing broken -> the memory fades."""
+    memory_id = _old_low_salience_memory(tmp_path)
+
+    summary = run_pass(tmp_path, event_bus=MagicMock())
+
+    assert _state_of(tmp_path, memory_id) == "fading"
+    assert summary["faded"] == 1
+    assert "exemptions_unavailable" not in summary
+    # ...and a pass that runs does persist counters, which is what makes the canary's "not written" mean something.
+    assert (tmp_path / FORGETTING_STATE_FILENAME).exists()
+
+
+# --------------------------------------------------------------------------- #430
+def _old_memory(store, content):
+    m = Memory.create_new(content=content, memory_type="conversation", domain="us", emotions={})
+    object.__setattr__(m, "created_at", datetime.now(UTC) - timedelta(days=40))
+    store.create(m)
+    return m.id
+
+
+def _merge_a_candidate_into_a_target(persona_dir) -> tuple[str, str, str]:
+    """Build a merge through the REAL gate: an old target row, a gated candidate merged into it by
+    ``run_consolidation`` (stub merge classifier), and a control row shaped like a post-merge target
+    (same age, one recall bump from ``store.get``, as the gate's own ``store.get`` gives the target).
+    Returns (candidate_id, target_id, control_id). The candidate id never becomes a row."""
+    from brain.engines.consolidation import Decision, run_consolidation
+    from brain.memory.pending import PendingQueue
+
+    persist_felt_time(
+        FeltTimeState(lived_age_hours=100.0, last_tick_ts="2026-05-18T00:00:00+00:00"),
+        persona_dir,
+    )
+    store = MemoryStore(persona_dir / "memories.db")
+    try:
+        target_id = _old_memory(store, "Bob likes tea")
+        control_id = _old_memory(store, "Bob walked to the harbour")
+        store.get(control_id)  # the same recall bump the gate gives the target
+        cand = Memory.create_new(
+            content="Bob likes tea with honey", memory_type="conversation", domain="us", emotions={}
+        )
+        PendingQueue(persona_dir).enqueue(cand, source="x")
+        res = run_consolidation(
+            store,
+            persona_dir=persona_dir,
+            classifier=lambda c, _ctx: Decision(
+                "merge", target_id=target_id, merged_content="Bob likes tea with honey"
+            ),
+        )
+        assert res.merged == 1
+        assert store.get(cand.id, bump=False) is None  # merged away: never a row
+    finally:
+        store.close()
+    return cand.id, target_id, control_id
+
+
+def _candidate_records(persona_dir) -> list[dict]:
+    import json
+
+    path = persona_dir / "soul_candidates.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
+
+
+def test_430_c1_accepted_candidate_merged_away_protects_its_merge_target(tmp_path):
+    """#430 C1: the soul accepted a candidate whose memory the gate had merged into an existing row.
+    The moment now lives in the merge target, so forgetting must exempt the target. The control row,
+    shaped like a post-merge target but linked to nothing, fades in the same pass."""
+    cand_id, target_id, control_id = _merge_a_candidate_into_a_target(tmp_path)
+    _accept_candidate_for_real(tmp_path, cand_id)
+    records = _candidate_records(tmp_path)
+    assert [(r["memory_id"], r["status"]) for r in records] == [(cand_id, "accepted")]
+
+    run_pass(tmp_path, event_bus=MagicMock())
+
+    assert _state_of(tmp_path, control_id) == "fading", "control must fade, or the target's survival proves nothing"
+    assert _state_of(tmp_path, target_id) == "active", "the merge target of an accepted candidate must be exempt"
+
+
+def test_430_c2_candidate_under_review_merged_away_protects_its_merge_target(tmp_path):
+    """#430 C2: same merge, the candidate still under review (auto_pending): the target is exempt."""
+    from brain.ingest.soul_queue import queue_soul_candidate
+    from brain.ingest.types import ExtractedItem
+
+    cand_id, target_id, control_id = _merge_a_candidate_into_a_target(tmp_path)
+    queue_soul_candidate(
+        tmp_path,
+        memory_id=cand_id,
+        item=ExtractedItem(text="Bob likes tea with honey", label="observation", importance=8),
+        session_id="monologue",
+    )
+    assert [r["status"] for r in _candidate_records(tmp_path)] == ["auto_pending"]
+
+    run_pass(tmp_path, event_bus=MagicMock())
+
+    assert _state_of(tmp_path, control_id) == "fading"
+    assert _state_of(tmp_path, target_id) == "active", "the merge target of a candidate under review must be exempt"
+
+
+def test_430_c3_revoked_crystallisation_does_not_protect_the_merge_target(tmp_path):
+    """#430 C3 (#362 ruling): accepted, merged, then revoked -> the target is forgettable like the control."""
+    from brain.soul.revoke import revoke_crystallization
+    from brain.soul.store import SoulStore
+
+    cand_id, target_id, control_id = _merge_a_candidate_into_a_target(tmp_path)
+    crystallization_id = _accept_candidate_for_real(tmp_path, cand_id)
+    assert [(r["memory_id"], r["status"]) for r in _candidate_records(tmp_path)] == [(cand_id, "accepted")]
+    soul = SoulStore(str(tmp_path / "crystallizations.db"))
+    try:
+        assert revoke_crystallization(soul, crystallization_id, "no longer true") is not None
+    finally:
+        soul.close()
+
+    run_pass(tmp_path, event_bus=MagicMock())
+
+    assert _state_of(tmp_path, control_id) == "fading"
+    assert _state_of(tmp_path, target_id) == "fading", "a revoked crystallisation must not protect its merge target"
+
+
+def test_430_c4a_unreadable_merge_archive_fails_closed(tmp_path, caplog):
+    """#430 C4a (#392 semantics): a directory at the archive path is a real OSError. The loader raises
+    naming the merge-target leg, and run_pass changes no memory."""
+    import logging
+
+    from brain.engines.consolidation import _ARCHIVE_FILENAME
+    from brain.forgetting import SoulExemptionsUnavailableError, _load_soul_linked_ids
+
+    memory_id = _old_low_salience_memory(tmp_path)
+    (tmp_path / _ARCHIVE_FILENAME).mkdir()
+
+    with pytest.raises(SoulExemptionsUnavailableError, match="merge targets"):
+        _load_soul_linked_ids(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="brain.forgetting"):
+        summary = run_pass(tmp_path, event_bus=MagicMock())
+
+    assert summary["exemptions_unavailable"] == 1
+    assert summary["faded"] == summary["lost"] == 0
+    assert _state_of(tmp_path, memory_id) == "active"

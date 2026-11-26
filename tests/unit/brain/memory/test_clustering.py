@@ -158,7 +158,7 @@ def _align_embedding_tier(monkeypatch: pytest.MonkeyPatch, model_id: str = _TEST
     matrix's lazy-build filter (and `cluster_tag_for_memory`'s model_id
     comparison) actually match rows seeded under `model_id` — same
     convention as `test_semantic_recall.py`'s `_align_embedding_tier`."""
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, model_id)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, model_id)
 
 
 def _seed_embedded_rows(
@@ -459,6 +459,7 @@ def test_model_swap_recomputes_rather_than_serving_stale_tags(
         store.close()
 
 
+@pytest.mark.slow(reason='6.6 s of CPU in its call phase on a 4-core dev VM, 2.4 s wall (serial run for #540, J12)')
 def test_clustering_includes_rows_beyond_the_old_fixed_window_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

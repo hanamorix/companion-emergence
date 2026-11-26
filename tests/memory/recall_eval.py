@@ -3,7 +3,7 @@
 Reusable, token-free, no-dependency metrics harness for the recall-query
 salience fix (`changes/recall-query-tier1/`). Drives the REAL
 `brain.chat.prompt._build_recall_block` against a SYNTHETIC in-memory store
-(user "Bob", persona label "Canary" — never Phoebe's persona) and computes
+(user "Bob", persona label "Canary" — never a real persona) and computes
 recall@k / MRR / nDCG@k (binary gain) for a labelled trigger set, demonstrating
 buried-trigger recall reaching early-trigger parity and quantifying residual
 under-recall depth.
@@ -81,7 +81,7 @@ def seed_store(target_fraction: float, k: int = 5) -> tuple[MemoryStore, set[str
     documented incident direction (52/156 ~= 33% "treasure" occurrences).
     Also seeds a few distractors matching MSG_BURIED's filler words
     ("logger"/"memory"/"live") — what the pre-fix positional cap actually
-    retrieved. Never Phoebe data; synthetic user "Bob", persona label
+    retrieved. Never real persona data; synthetic user "Bob", persona label
     "Canary" (labels only — MemoryStore itself is persona-agnostic).
 
     Returns (store, target_ids). `k` is kept <= K (the recall@k cutoff) so
@@ -367,7 +367,7 @@ def seed_token_target_store() -> tuple[MemoryStore, dict[str, str]]:
     pairs: a short name (Roy), a genuine acronym (FBI), and a short noun
     (cat). Each target memory's distinguishing term is unique in the store
     (absent from every background memory), so recall@k == 1.0 is a
-    well-defined pass/fail for each pair. Never Phoebe data; synthetic
+    well-defined pass/fail for each pair. Never real persona data; synthetic
     content only.
 
     Returns (store, target_ids) where target_ids maps "roy" / "acronym" /

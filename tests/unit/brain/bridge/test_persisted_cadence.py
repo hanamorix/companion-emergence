@@ -47,6 +47,9 @@ def test_future_next_at_not_due_until_wall_clock_passes_it():
         state = pc.load_cadence(pd, "v.json")
         assert pc.is_due(state, now=base + timedelta(hours=1)) is False
         assert pc.is_due(state, now=base + timedelta(hours=25)) is True
+        # the exact boundary: due at the interval (a day), not a second before it
+        assert pc.is_due(state, now=base + timedelta(seconds=86399)) is False
+        assert pc.is_due(state, now=base + timedelta(seconds=86400)) is True
 
 
 def test_save_cadence_is_fail_soft_on_oserror(monkeypatch):

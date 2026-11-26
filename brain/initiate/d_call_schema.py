@@ -47,7 +47,7 @@ class DCallRow:
     retry_count: int = 0
     tick_note: str | None = None
 
-    def to_jsonl(self) -> str:
+    def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
             "d_call_id": self.d_call_id,
             "ts": self.ts,
@@ -63,11 +63,13 @@ class DCallRow:
             "retry_count": self.retry_count,
             "tick_note": self.tick_note,
         }
-        return json.dumps(d, ensure_ascii=False)
+        return d
+
+    def to_jsonl(self) -> str:
+        return json.dumps(self.to_dict(), ensure_ascii=False)
 
     @classmethod
-    def from_jsonl(cls, line: str) -> DCallRow:
-        d = json.loads(line)
+    def from_dict(cls, d: dict) -> DCallRow:
         return cls(
             d_call_id=d["d_call_id"],
             ts=d["ts"],
@@ -83,3 +85,7 @@ class DCallRow:
             retry_count=d.get("retry_count", 0),
             tick_note=d.get("tick_note"),
         )
+
+    @classmethod
+    def from_jsonl(cls, line: str) -> DCallRow:
+        return cls.from_dict(json.loads(line))

@@ -20,6 +20,8 @@ from pathlib import Path
 from typing import Any
 
 from brain.attunement.budget import consume_call as _attunement_consume_call
+from brain.attunement.budget import get_remaining as _attunement_budget_remaining
+from brain.attunement.budget import lock as _attunement_budget_lock
 from brain.attunement.crystallise import check_crystallisations
 from brain.attunement.detector import run_detector, should_run_detector
 from brain.attunement.store import (
@@ -29,15 +31,18 @@ from brain.attunement.store import (
     write_current_read,
 )
 from brain.bridge.chat import ChatMessage, ChatResponse
+from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider
 from brain.chat import pass2_queue
 from brain.chat.extractor import apply_side_effects, extract_from_thinking
 from brain.chat.reflection_gate import should_reflect
 from brain.chat.tool_recruit import tools_for_capability
+from brain.health.json_io import append_jsonl
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
 from brain.tools import NELL_TOOL_NAMES
 from brain.tools.dispatch import dispatch
+from brain.tools.naming import fill_tool_prefix, fill_tool_result, tool_prefix_of
 from brain.tools.schemas import build_schemas
 
 logger = logging.getLogger(__name__)
@@ -88,8 +93,11 @@ def run_pass2_monologue(
             monologue_blocks=(monologue_text,),
             visible_reply=visible_reply,
             recent_turn_context=recent_user_msgs,
+            persona_dir=persona_dir,
         )
         apply_side_effects(out, persona_dir=persona_dir)
+    except ThrottleDeferred:
+        raise  # #456/#473: the record stays at the queue head for a later drain
     except Exception:  # noqa: BLE001
         logger.exception("pass-2 monologue extraction failed")
 
@@ -134,16 +142,13 @@ def _attunement_now_iso() -> str:
 
 
 def _log_attunement_error(persona_dir: Path, turn_id: str, exc: BaseException) -> None:
-    path = persona_dir / "attunement_errors.jsonl"
-    path.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "ts": _attunement_now_iso(),
         "turn_id": turn_id,
         "error": str(exc),
         "traceback": traceback.format_exc(),
     }
-    with path.open("a") as f:
-        f.write(json.dumps(entry) + "\n")
+    append_jsonl(persona_dir / "attunement_errors.jsonl", entry)
 
 
 def _run_attunement_pass2(
@@ -154,8 +159,6 @@ def _run_attunement_pass2(
     buffer_slice: list[BufferTurn],
 ) -> None:
     try:
-        if not _attunement_consume_call(persona_dir, now=datetime.now(UTC)):
-            return  # budget exhausted; defer silently
         user_name = ""
         user_pronouns = None
         try:  # same fail-soft PersonaConfig read as build_system_message
@@ -166,14 +169,20 @@ def _run_attunement_pass2(
             user_pronouns = cfg.user_pronouns
         except Exception:  # noqa: BLE001
             pass
-        output = run_detector(
-            buffer_slice=buffer_slice,
-            reply_text=reply_text,
-            companion_name=persona_dir.name,
-            user_name=user_name,
-            user_pronouns=user_pronouns,
-            persona_dir=persona_dir,
-        )
+        # #473: check the daily budget now (read-only); charge it only after a detector call that was not refused
+        # (success or another failure). The budget lock makes the check-then-charge one step (review O-7).
+        with _attunement_budget_lock(persona_dir):
+            if _attunement_budget_remaining(persona_dir, now=datetime.now(UTC)) <= 0:
+                return  # budget exhausted; defer silently
+            output = run_detector(
+                buffer_slice=buffer_slice,
+                reply_text=reply_text,
+                companion_name=persona_dir.name,
+                user_name=user_name,
+                user_pronouns=user_pronouns,
+                persona_dir=persona_dir,
+            )
+            _attunement_consume_call(persona_dir, now=datetime.now(UTC))
         write_current_read(persona_dir, output.current_read)
         merge_into_learned(
             persona_dir,
@@ -183,6 +192,8 @@ def _run_attunement_pass2(
         )
         mark_addressed(persona_dir, output.addressed_pattern_ids, now_iso=_attunement_now_iso())
         check_crystallisations(persona_dir, now_iso=_attunement_now_iso())
+    except ThrottleDeferred:
+        raise  # #456/#473: no error row; the record stays at the queue head
     except Exception as exc:  # noqa: BLE001 — error isolation by design
         _log_attunement_error(persona_dir, turn_id, exc)
 
@@ -245,6 +256,7 @@ def build_tools_list(
     companion_name: str = "Nell",
     *,
     allowed: list[str] | None = None,
+    tool_prefix: str = "",
 ) -> list[dict]:
     """Build the tool schema list for provider.chat(tools=...).
 
@@ -261,7 +273,7 @@ def build_tools_list(
         names appear in *allowed* are included.  ``None`` (default) returns
         the full suite; existing callers are unaffected.
     """
-    schemas = build_schemas(companion_name)
+    schemas = build_schemas(companion_name, tool_prefix=tool_prefix)
     names: tuple[str, ...] | list[str]
     if allowed is None:
         names = NELL_TOOL_NAMES
@@ -321,14 +333,15 @@ def _maybe_recruit_and_rerun(
         ]
         if not allowed_now:
             return None
-        tools = build_tools_list(companion_name, allowed=allowed_now)
+        prefix = tool_prefix_of(provider)
+        tools = build_tools_list(companion_name, allowed=allowed_now, tool_prefix=prefix)
         # Tell the model it already reached, so it uses the real tool now instead of re-reaching.
         rerun_messages = list(messages) + [
             ChatMessage(
                 role="user",
                 content=("[The faculty you reached for is now available to you this turn. "
-                         "Call the specific tool you need now (e.g. search_memories, read_file) — "
-                         "do not call reach_for_capability again.]"),
+                         f"Call the specific tool you need now (e.g. {prefix}search_memories, "
+                         f"{prefix}read_file): do not call {prefix}reach_for_capability again.]"),
             )
         ]
         rerun = provider.chat(
@@ -510,14 +523,17 @@ def run_tool_loop(
                 "arguments": tc.arguments,
             }
             try:
-                result = dispatch(
-                    tc.name,
-                    tc.arguments,
-                    store=store,
-                    hebbian=hebbian,
-                    persona_dir=persona_dir,
-                    provider=provider,
-                    session_id=session_id,
+                result = fill_tool_result(
+                    dispatch(
+                        tc.name,
+                        tc.arguments,
+                        store=store,
+                        hebbian=hebbian,
+                        persona_dir=persona_dir,
+                        provider=provider,
+                        session_id=session_id,
+                    ),
+                    tool_prefix_of(provider),
                 )
                 record["result_summary"] = _summarize_result(result)
                 # #96: a tool that RETURNS {"error": ...} is a refusal, not a
@@ -542,10 +558,11 @@ def run_tool_loop(
                 tool_content = json.dumps(result, default=str, ensure_ascii=False)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("tool dispatch error: %s — %s", tc.name, exc)
-                record["error"] = str(exc)
-                record["result_summary"] = f"error: {exc}"
+                error = fill_tool_prefix(str(exc), tool_prefix_of(provider))
+                record["error"] = error
+                record["result_summary"] = f"error: {error}"
                 record["outcome"] = "error"
-                tool_content = json.dumps({"error": str(exc)})
+                tool_content = json.dumps({"error": error})
 
             invocations.append(record)
             messages.append(

@@ -34,17 +34,30 @@ against a real Windows session is pending validation by a Windows user.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 from brain.paths import get_log_dir, get_persona_dir
 from brain.service import UnsupportedPlatformError
 from brain.setup import validate_persona_name
+from brain.utils.atomic_write import save_with_backup_text
+
+logger = logging.getLogger(__name__)
 
 TASK_PREFIX = "CompanionEmergence"
+
+# RestartOnFailure (D26): the bridge's own runner spaces the restarts of a bridge that keeps failing (30 s up to 10 min,
+# ``brain/bridge/start_backoff.py``), so the scheduler only has to keep restarting, as soon and as often as it allows:
+# the shortest interval it accepts (1 minute) and the largest count (255); MS-TSCH gives Count as 1 to 255 and has no
+# "unlimited". After 255 failed restarts in a row it stops until the next logon or an explicit start.
+RESTART_INTERVAL = "PT1M"
+RESTART_COUNT = 255
 DEFAULT_WINDOWS_PATH = (
     "%LOCALAPPDATA%\\Programs\\claude;%USERPROFILE%\\.local\\bin;C:\\Windows\\System32;C:\\Windows"
 )
@@ -128,6 +141,20 @@ def paths_for_persona(persona: str) -> WindowsServicePaths:
     )
 
 
+_NELL_CMD_SHIM_MARKER = "companion-emergence-nell-shim"
+
+
+def _is_nell_cmd_shim(path: Path) -> bool:
+    """True for the `nell.cmd` shortcut the desktop app writes (marker in its first lines)."""
+    if path.suffix.lower() != ".cmd":
+        return False
+    try:
+        head = path.read_text(encoding="utf-8", errors="replace").splitlines()[:3]
+    except OSError:
+        return False
+    return any(_NELL_CMD_SHIM_MARKER in line for line in head)
+
+
 def resolve_nell_path(explicit: str | None = None) -> Path:
     """Mirror of launchd.resolve_nell_path / systemd.resolve_nell_path."""
     if explicit:
@@ -139,7 +166,19 @@ def resolve_nell_path(explicit: str | None = None) -> Path:
         return path
     found = shutil.which("nell.exe") or shutil.which("nell")
     if found:
-        return Path(found).resolve()
+        resolved = Path(found).resolve()
+        if _is_nell_cmd_shim(resolved):
+            # The desktop app's `nell.cmd` shortcut is on PATH. Registering it would make Task
+            # Scheduler open a console window at every logon, so use the bundled runtime's own
+            # `Scripts\nell.bat` (the shortcut runs the bundled python, so this interpreter is it).
+            bundled = Path(sys.executable).parent / "Scripts" / "nell.bat"
+            if bundled.is_file():
+                return bundled
+            raise WindowsServiceConfigError(
+                "found the Companion Emergence nell.cmd shortcut on PATH but not the bundled "
+                "nell.bat next to this Python; pass --nell-path C:\\path\\to\\nell.bat"
+            )
+        return resolved
     raise WindowsServiceConfigError(
         "could not resolve 'nell' on PATH; pass --nell-path C:\\path\\to\\nell.exe"
     )
@@ -251,9 +290,10 @@ def build_task_xml(
         principal (#260); ``user_id`` overrides the environment-derived account,
         and the node is omitted when neither resolves.
       * ``<RegistrationInfo><Author>`` — for diagnostic tracing.
-      * ``<Settings><RestartOnFailure>`` — restart on crash with a
-        2-minute interval, up to 3 times (matches launchd KeepAlive
-        + systemd Restart=on-failure).
+      * ``<Settings><RestartOnFailure>`` — restart on crash every minute,
+        up to 255 times (the scheduler's limits, ``RESTART_INTERVAL`` and
+        ``RESTART_COUNT``); the bridge itself spaces repeated start failures
+        (matches launchd KeepAlive + systemd Restart=on-failure).
       * ``<Actions><Exec>`` — supervisor entry point; for bundled Windows
         installs uses ``pythonw.exe`` (windowless) instead of ``nell.bat``
         (which would open a cmd.exe console at logon).
@@ -338,8 +378,8 @@ def build_task_xml(
         "    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n"
         "    <Priority>7</Priority>\n"
         "    <RestartOnFailure>\n"
-        "      <Interval>PT2M</Interval>\n"
-        "      <Count>3</Count>\n"
+        f"      <Interval>{RESTART_INTERVAL}</Interval>\n"
+        f"      <Count>{RESTART_COUNT}</Count>\n"
         "    </RestartOnFailure>\n"
         "  </Settings>\n"
         '  <Actions Context="Author">\n'
@@ -371,7 +411,7 @@ def write_task_xml(
     paths.xml_path.parent.mkdir(parents=True, exist_ok=True)
     paths.stdout_path.parent.mkdir(parents=True, exist_ok=True)
     # UTF-16 with BOM matches the encoding the XML declaration claims.
-    paths.xml_path.write_text(body, encoding="utf-16")
+    save_with_backup_text(paths.xml_path, body, keep_backups=False, encoding="utf-16")  # atomic (#484)
     return paths.xml_path
 
 
@@ -383,6 +423,10 @@ def run_schtasks(args: list[str]) -> subprocess.CompletedProcess[str]:
             ["schtasks", *args],
             capture_output=True,
             text=True,
+            # Windows' default subprocess codec is not UTF-8; schtasks writes in the console's
+            # OEM code page, so a strict decode could raise on a non-ASCII task name (#363).
+            encoding="utf-8",
+            errors="replace",
             timeout=15,
             check=False,
         )
@@ -391,7 +435,15 @@ def run_schtasks(args: list[str]) -> subprocess.CompletedProcess[str]:
             args=["schtasks", *args],
             returncode=127,
             stdout="",
-            stderr="schtasks not available — Windows host required",
+            stderr="schtasks not available: Windows host required",
+        )
+    except subprocess.TimeoutExpired:
+        # A hung schtasks is a failed call for every caller (the same code timeout(1) and run_systemctl use).
+        return subprocess.CompletedProcess(
+            args=["schtasks", *args],
+            returncode=124,
+            stdout="",
+            stderr="schtasks timed out",
         )
 
 
@@ -404,8 +456,13 @@ def install_service(
 ) -> Path:
     """Write the task XML, then ``schtasks /Create /XML``.
 
-    Idempotent: if the task already exists, ``/F`` overwrites it.
+    Idempotent: if the task already exists, ``/F`` overwrites it. #456: never behind a running bridge's back, and
+    any stop intent and start back-off record are cleared first
+    (``lifecycle.before_install``).
     """
+    from brain.service import lifecycle
+
+    lifecycle.before_install(persona)
     xml_path = write_task_xml(
         persona=persona,
         nell_path=nell_path,
@@ -421,11 +478,84 @@ def install_service(
     return xml_path
 
 
+_RESTART_BLOCK = re.compile(
+    r"(<RestartOnFailure>\s*<Interval>)([^<]*)(</Interval>\s*<Count>)([^<]*)(</Count>)"
+)
+
+
+def refresh_installed_task(persona: str) -> bool:
+    """Raise the restart settings of OUR already-installed task for ``persona`` (D26, the D14 pattern).
+
+    Called by ``start_service`` only: a path that runs outside any task instance (an instance replacing its own
+    definition is not something we can test or document). Reads the registered XML (``schtasks /Query /XML``) and,
+    for a task whose command is the one this module writes and whose ``RestartOnFailure`` is not ``RESTART_INTERVAL`` /
+    ``RESTART_COUNT``, changes only those two values and registers the text again with ``/Create /XML /F`` (the cached
+    XML is rewritten too).
+
+    Never from text that may have been damaged: ``run_schtasks`` decodes schtasks' console output as UTF-8 with
+    replacement, so a non-ASCII character (a profile path with an accented letter, which comes back as U+FFFD or as
+    another letter) or a NUL (UTF-16 output) would be written back wrong and break the task's command. Any non-ASCII
+    character or NUL in the queried XML skips the refresh with one WARNING: that task keeps its old settings until its
+    next ``nell service install``. One INFO line on success; idempotent; a failure is a WARNING and returns False.
+    Returns True when the task was changed."""
+    name = task_name(persona)
+    queried = run_schtasks(["/Query", "/TN", name, "/XML"])
+    if queried.returncode != 0:
+        return False
+    xml = queried.stdout or ""
+    ours = re.search(
+        rf"<Arguments>[^<]*supervisor run --persona (?:&quot;|\")?{re.escape(persona)}(?:&quot;|\")?[^<]*</Arguments>", xml
+    )
+    block = _RESTART_BLOCK.search(xml)
+    if ours is None or block is None or (block.group(2), block.group(4)) == (RESTART_INTERVAL, str(RESTART_COUNT)):
+        return False
+    if not xml.isascii() or "\x00" in xml:
+        logger.warning(
+            "task scheduler task not refreshed: its registered XML cannot be read back without loss "
+            "(non-ASCII text); it keeps its old restart settings until `nell service install` is run again"
+        )
+        return False
+    new_xml = (
+        xml[: block.start()]
+        + f"{block.group(1)}{RESTART_INTERVAL}{block.group(3)}{RESTART_COUNT}{block.group(5)}"
+        + xml[block.end() :]
+    )
+    xml_path = paths_for_persona(persona).xml_path
+    try:
+        xml_path.parent.mkdir(parents=True, exist_ok=True)
+        save_with_backup_text(xml_path, new_xml, keep_backups=False, encoding="utf-16")  # atomic (#484)
+    except OSError:
+        logger.warning("task scheduler task not refreshed: could not write %s", xml_path, exc_info=True)
+        return False
+    created = run_schtasks(["/Create", "/XML", str(xml_path), "/TN", name, "/F"])
+    if created.returncode != 0:
+        logger.warning("task scheduler task not refreshed: %s", _format_schtasks_error("/Create", created))
+        return False
+    logger.info(
+        "task scheduler task refreshed: restart every %s up to %s times (was every %s, %s times)",
+        RESTART_INTERVAL, RESTART_COUNT, block.group(2), block.group(4),
+    )
+    return True
+
+
+def start_service(*, persona: str) -> subprocess.CompletedProcess[str]:
+    """Run the installed task (#456 D20). Any stop intent and start back-off record are cleared first (D25, D26), and
+    the task's restart settings are brought up to date (``refresh_installed_task``)."""
+    from brain.service import lifecycle
+
+    lifecycle.note_explicit_start(persona)
+    try:
+        refresh_installed_task(persona)  # outside any instance; before /Run, so an instance it ends is started again
+    except Exception:  # noqa: BLE001 - best effort; the task keeps working with its old restart settings
+        logger.warning("task scheduler task refresh failed", exc_info=True)
+    return run_schtasks(["/Run", "/TN", task_name(persona)])
+
+
 def uninstall_service(*, persona: str, keep_xml: bool = False) -> Path:
     """Remove the scheduled task; optionally keep the cached XML."""
     paths = paths_for_persona(persona)
-    # /End first to stop a running instance (best-effort), then /Delete.
-    run_schtasks(["/End", "/TN", paths.task_name])
+    # #456 (C54): no /End here. The CLI stops a running bridge first through its own request and watcher; /End is only
+    # the kill path's step after an ignored hard exit (it would cut in-flight work).
     run_schtasks(["/Delete", "/TN", paths.task_name, "/F"])
     if not keep_xml and paths.xml_path.exists():
         paths.xml_path.unlink()

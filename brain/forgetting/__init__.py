@@ -1,11 +1,10 @@
 """brain.forgetting — composite salience + state machine + graveyard.
 
-Spec: docs/superpowers/specs/2026-05-18-forgetting-design.md
+Spec: the 2026-05-18 forgetting design, never committed and lost (#797).
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from collections.abc import Callable
@@ -13,12 +12,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from brain import dev_constants
 from brain.bridge import job_progress
 from brain.felt_time.lived_age import IntensityDrivers
 from brain.felt_time.state import load_or_recover as load_felt_time
 from brain.forgetting import graveyard, policy, salience, tombstone
 from brain.forgetting.policy import Transition
-from brain.health.attempt_heal import save_with_backup
+from brain.health.json_io import read_json, write_json
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore, _row_to_memory
 
@@ -30,68 +30,75 @@ FORGETTING_STATE_FILENAME = "forgetting_state.json"
 def _load_forgetting_state(persona_dir: Path) -> dict[str, int]:
     """Read consecutive_low_passes counters keyed by memory_id.
     Corrupt file → all-zero counters (defensive)."""
-    p = persona_dir / FORGETTING_STATE_FILENAME
-    if not p.exists():
-        return {}
+    data = read_json(persona_dir / FORGETTING_STATE_FILENAME, default=dict, expect=dict)
     try:
-        data = json.loads(p.read_text())
-        if not isinstance(data, dict):
-            return {}
         return {k: int(v) for k, v in data.items() if isinstance(v, (int, float))}
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+    except (TypeError, ValueError):
         return {}
 
 
 def _persist_forgetting_state(persona_dir: Path, counters: dict[str, int]) -> None:
-    """Atomic save via save_with_backup."""
-    persona_dir.mkdir(parents=True, exist_ok=True)
-    save_with_backup(persona_dir / FORGETTING_STATE_FILENAME, counters)
+    """Atomic save with .bak rotation via json_io.write_json."""
+    write_json(persona_dir / FORGETTING_STATE_FILENAME, counters, backups=3)
 
 
-def _load_soul_linked_ids(persona_dir: Path) -> tuple[set[str], set[str]]:
-    """Returns (crystallised_ids, under_review_ids).
+class SoulExemptionsUnavailableError(RuntimeError):
+    """The soul-linked memory ids could not be read (#392).
 
-    Fail-soft but loud: if the soul subsystem isn't reachable that set is
-    empty and the pass still runs (a crash would stall every forgetting and
-    narrative tick) — but memories that should have been exempt may fade or
-    be lost, so each failure logs a warning. A silent swallow here hid a
-    never-defined import for the crystallised half (#362).
+    Raised instead of returning an empty set: an empty set means "nothing is exempt", and acting on
+    that guess can hard-delete a memory the soul depends on. Callers stop before any irreversible step.
     """
+
+
+def _load_soul_linked_ids(persona_dir: Path, *, caller: str = "forgetting") -> tuple[set[str], set[str]]:
+    """Returns (crystallised_ids, under_review_ids), each extended with the consolidation merge targets
+    of its ids (#430). ``caller`` prefixes the warnings: the dedup sweep and the narrative pass pass
+    their own names.
+
+    Three legs are read: crystallised ids, under-review ids and the merge-target map. Fails CLOSED
+    (#392): if any leg cannot be read this raises ``SoulExemptionsUnavailableError`` and the caller
+    skips its pass. A failed read is not "nothing is exempt", and fading or losing memories on
+    that guess cannot be undone. All three legs are always attempted and each failure is logged with its
+    traceback, so one look at the log shows everything that failed. (Before #392 this fell back to an
+    empty set and the pass ran anyway.)
+    """
+    failed: list[str] = []
+    crystallised: set[str] = set()
+    under_review: set[str] = set()
     try:
         from brain.soul.candidates import list_crystallised_memory_ids
 
         crystallised = set(list_crystallised_memory_ids(persona_dir))
     except Exception:
-        log.warning(
-            "forgetting: could not load soul-crystallised memory ids; "
-            "crystallised memories are NOT exempt this pass",
-            exc_info=True,
-        )
-        crystallised = set()
+        log.warning("%s: could not load soul-crystallised memory ids", caller, exc_info=True)
+        failed.append("soul-crystallised memory ids")
     try:
         from brain.soul.candidates import list_under_review_memory_ids
 
         under_review = set(list_under_review_memory_ids(persona_dir))
     except Exception:
-        log.warning(
-            "forgetting: could not load under-review soul candidate ids; "
-            "under-review memories are NOT exempt this pass",
-            exc_info=True,
-        )
-        under_review = set()
+        log.warning("%s: could not load under-review soul candidate ids", caller, exc_info=True)
+        failed.append("under-review soul candidate ids")
+    merge_targets: dict[str, set[str]] = {}
+    try:
+        from brain.soul.candidates import merge_target_map
+
+        merge_targets = merge_target_map(persona_dir)
+    except Exception:
+        log.warning("%s: could not load consolidation merge targets", caller, exc_info=True)
+        failed.append("consolidation merge targets")
+    if failed:
+        raise SoulExemptionsUnavailableError("could not read " + " and ".join(failed))
+    # #430: a soul-linked id the gate merged away lives on in its merge target(s); protect those too.
+    for ids in (crystallised, under_review):
+        ids.update(*(merge_targets[i] for i in list(ids) if i in merge_targets))
     return crystallised, under_review
 
 
 def _load_migration_grace(persona_dir: Path) -> tuple[datetime | None, float]:
     """Return (migrated_at_utc, lived_age_hours_at_migration) from source-manifest.json.
     (None, 0.0) when no manifest or fields absent — i.e. no grace (back-compat)."""
-    p = persona_dir / "source-manifest.json"
-    if not p.exists():
-        return None, 0.0
-    try:
-        data = json.loads(p.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None, 0.0
+    data = read_json(persona_dir / "source-manifest.json", default=dict, expect=dict)
     raw = data.get("migrated_at_utc") or data.get("generated_at_utc")
     mig: datetime | None = None
     if isinstance(raw, str):
@@ -139,11 +146,19 @@ def run_pass(
     start = time.monotonic()
     counters = _load_forgetting_state(persona_dir)
     felt_state, _recovered = load_felt_time(persona_dir)
-    crystallised_ids, under_review_ids = _load_soul_linked_ids(persona_dir)
+    summary: dict[str, int] = {"faded": 0, "unfaded": 0, "lost": 0, "exempt": 0, "total": 0}
+    try:
+        crystallised_ids, under_review_ids = _load_soul_linked_ids(persona_dir)
+    except SoulExemptionsUnavailableError as exc:
+        # Fail closed (#392): without the exemption sets the pass cannot tell which memories the soul
+        # depends on, and losing one is irreversible. Change nothing; the next pass tries again.
+        log.warning("forgetting: %s; skipping this pass so no memory is changed on a guess", exc)
+        summary["exemptions_unavailable"] = 1
+        summary["duration_ms"] = int((time.monotonic() - start) * 1000)
+        event_bus.publish({"type": "forgetting_pass", **summary})
+        return summary
     soul_linked = crystallised_ids | under_review_ids
     migrated_at_utc, lived_at_migration = _load_migration_grace(persona_dir)
-
-    summary: dict[str, int] = {"faded": 0, "unfaded": 0, "lost": 0, "exempt": 0, "total": 0}
 
     db_path = persona_dir / "memories.db"
     if not db_path.exists():
@@ -189,6 +204,9 @@ def run_pass(
                     break
             memories = memories[resume_idx:]
 
+        # One engine for the whole pass (None for an in-memory store: stored values).
+        emotion_engine = store.emotion_engine()
+
         for memory in memories:
             memory_id = memory.id
             if policy.is_exempt(
@@ -215,10 +233,11 @@ def run_pass(
                 hebbian=hebbian,
                 felt_time_state=felt_state,
                 soul_linked_ids=soul_linked,
+                emotion_engine=emotion_engine,
             )
             prev_low = counters.get(memory_id, 0)
             # Update consecutive_low_passes for this pass.
-            if s < policy.LOST_THRESHOLD:
+            if s < dev_constants.LOST_THRESHOLD:
                 next_low = prev_low + 1
             else:
                 next_low = 0
@@ -244,6 +263,7 @@ def run_pass(
                     hebbian=hebbian,
                     felt_time_state=felt_state,
                     soul_linked_ids=soul_linked,
+                    emotion_engine=emotion_engine,
                 )
                 neighbors_at_drop = hebbian.neighbors(memory_id)
                 # Graveyard write BEFORE hard_delete (spec §4 order), now also
@@ -254,7 +274,7 @@ def run_pass(
                     salience_at_drop=s,
                     inputs=inputs,
                     lived_age_hours=felt_state.lived_age_hours,
-                    reason=f"salience<{policy.LOST_THRESHOLD} for {next_low} consecutive passes",
+                    reason=f"salience<{dev_constants.LOST_THRESHOLD} for {next_low} consecutive passes",
                     hebbian_neighbors=neighbors_at_drop,
                 )
                 store.hard_delete(memory_id)
@@ -318,4 +338,4 @@ def run_pass(
     return summary
 
 
-__all__ = ["run_pass", "graveyard", "policy", "salience", "tombstone"]
+__all__ = ["run_pass", "SoulExemptionsUnavailableError", "graveyard", "policy", "salience", "tombstone"]

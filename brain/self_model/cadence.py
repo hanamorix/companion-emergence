@@ -17,10 +17,11 @@ State file: self_model_cadence_state.json in persona_dir.
 """
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from brain.health.json_io import read_json, write_json
 
 _STATE_FILENAME = "self_model_cadence_state.json"
 
@@ -34,10 +35,12 @@ _CATCHUP_INTERVAL_S = 30 * 60.0
 # Backoff base: 30 min, then doubles (1h, 2h, …) capped at normal interval.
 _BACKOFF_BASE_S = 30 * 60.0
 
-# Throttle-deferral retry: matches run_folded's own tick_interval_s default
-# (brain/bridge/supervisor.py) - any value at or below that granularity is
+# Throttle-deferral retry: matches the supervisor's default tick, 60 s (the
+# embedding_backfill.tick_interval_seconds setting, read by run_folded in
+# brain/bridge/supervisor.py) - any value at or below that granularity is
 # equivalent, since the next real retry opportunity is gated by the
-# supervisor's own loop cadence regardless of a finer-grained number here.
+# supervisor's own loop cadence regardless of a finer-grained number here (a
+# tick set below 60 s only makes this retry coarser than the loop, never wrong).
 _DEFERRED_RETRY_INTERVAL_S = 60.0
 
 
@@ -74,12 +77,7 @@ def load(persona_dir: Path) -> SelfModelCadenceState:
 
     Fail-safe toward running, not toward silence.
     """
-    try:
-        data = json.loads(_state_path(persona_dir).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return SelfModelCadenceState(next_reflection_at=None, consecutive_failures=0)
-    if not isinstance(data, dict):
-        return SelfModelCadenceState(next_reflection_at=None, consecutive_failures=0)
+    data = read_json(_state_path(persona_dir), default=dict, expect=dict)
     cf = data.get("consecutive_failures", 0)
     if not isinstance(cf, int) or cf < 0:
         cf = 0
@@ -105,11 +103,8 @@ def load_or_init(
 
     Returns ``(state, created)``.
     """
-    try:
-        data = json.loads(_state_path(persona_dir).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        data = None
-    next_at = _parse_ts(data.get("next_reflection_at")) if isinstance(data, dict) else None
+    data = read_json(_state_path(persona_dir), default=dict, expect=dict)
+    next_at = _parse_ts(data.get("next_reflection_at"))
     if next_at is not None:
         cf = data.get("consecutive_failures", 0)
         if not isinstance(cf, int) or cf < 0:
@@ -124,8 +119,6 @@ def load_or_init(
 
 def save(persona_dir: Path, state: SelfModelCadenceState) -> None:
     """Atomically persist the cadence (temp file + rename)."""
-    path = _state_path(persona_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "next_reflection_at": (
             state.next_reflection_at.isoformat()
@@ -134,9 +127,7 @@ def save(persona_dir: Path, state: SelfModelCadenceState) -> None:
         ),
         "consecutive_failures": state.consecutive_failures,
     }
-    tmp = path.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(payload), encoding="utf-8")
-    tmp.replace(path)
+    write_json(_state_path(persona_dir), payload, indent=None, fsync=False)
 
 
 def is_due(state: SelfModelCadenceState, *, now: datetime) -> bool:

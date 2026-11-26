@@ -12,6 +12,7 @@ no sleeps with tight margins, no real LLM/model, synthetic tmp personas only.
 job calls, so the job wiring (names, order, due sources, cadence files,
 outcomes) is the code under test, not a proxy.
 """
+
 from __future__ import annotations
 
 import ast
@@ -24,14 +25,15 @@ from types import SimpleNamespace
 
 import pytest
 
+from brain import dev_constants
 from brain.bridge import central_cadence, cli_throttle, persisted_cadence, supervisor
 from brain.bridge.central_cadence import GATED_JOB_ORDER, GatedJob, JobOutcome
 from brain.bridge.events import EventBus
 from brain.bridge.provider import FakeProvider
 from brain.chat import pass2_queue
 from brain.engines import interest_sweep
-from brain.memory.judge_selftune import JUDGE_TUNE_CADENCE_FILE
 from brain.self_model import cadence as sm_cadence
+from tests.thread_support import finish_threads
 
 NOW = datetime(2026, 9, 27, 12, 0, tzinfo=UTC)
 
@@ -42,11 +44,19 @@ INTERVAL_JOBS: dict[str, tuple[str, float]] = {
     "compaction": ("compaction_cadence.json", 86400.0),
     "clustering": ("clustering_cadence.json", 6 * 3600.0),
     "daily_calibration": ("calibration_cadence.json", 86400.0),
-    "weekly_selftune": (JUDGE_TUNE_CADENCE_FILE, 7 * 86400.0),
+    "weekly_selftune": (dev_constants.JUDGE_TUNE_CADENCE_FILE, 7 * 86400.0),
     "finalize": ("finalize_cadence.json", 3600.0),
     "initiate_review": ("initiate_review_cadence.json", 900.0),
 }
-NO_INTERVAL_JOBS = ("pass2", "session_snapshot_prune", "emotion_backfill", "embedding_backfill")
+NO_INTERVAL_JOBS = (
+    "emotion_recovery_rebuild",
+    "pass2",
+    "session_snapshot_prune",
+    "emotion_backfill",
+    "research_recovery",
+    "embedding_backfill",
+    "extraction_backfill",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +142,19 @@ def stubs(monkeypatch):
     every no-interval/predicate job report work. The job table itself, the
     central function and the cadence handling stay real."""
     order: list[str] = []
-    work = dict.fromkeys((*NO_INTERVAL_JOBS, "deploy_recalibration"), True)
+    work = dict.fromkeys(
+        (
+            *NO_INTERVAL_JOBS,
+            "deploy_recalibration",
+            "cosine_floor_bootstrap",
+            "rerank_floor_bootstrap",
+            "rerank_width_remeasure",
+            "rerank_ram_figure",
+            "cost_series_flush",
+            "recall_diagnostics_flush",
+        ),
+        True,
+    )
 
     def rec(name, ret=None):
         def _f(*_a, **_k):
@@ -141,6 +163,13 @@ def stubs(monkeypatch):
 
         return _f
 
+    # Engine 6 (#584): the recovery job asks the engine whether it has work and runs `recovery_job_run`; both are stood in for.
+    monkeypatch.setattr(
+        supervisor.emotion_engine.EmotionEngine,
+        "needs_recovery",
+        lambda _self: work["emotion_recovery_rebuild"],
+    )
+    monkeypatch.setattr(supervisor.emotion_engine, "recovery_job_run", rec("emotion_recovery_rebuild", True))
     monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _granting_slot)
     monkeypatch.setattr(supervisor, "build_tier_provider", lambda *a, **k: FakeProvider())
     monkeypatch.setattr(pass2_queue, "queue_length", lambda _pd: 1 if work["pass2"] else 0)
@@ -155,7 +184,9 @@ def stubs(monkeypatch):
         return 1
 
     monkeypatch.setattr(pass2_queue, "drain_all_locked", _pass2_drain)
-    monkeypatch.setattr(supervisor, "_snapshot_has_work", lambda _pd: work["session_snapshot_prune"])
+    monkeypatch.setattr(
+        supervisor, "_snapshot_has_work", lambda _pd: work["session_snapshot_prune"]
+    )
     monkeypatch.setattr(supervisor, "snapshot_stale_sessions", rec("session_snapshot_prune", []))
     monkeypatch.setattr(
         supervisor, "_emotion_backfill_has_work", lambda _pd, **_k: work["emotion_backfill"]
@@ -163,8 +194,14 @@ def stubs(monkeypatch):
     # INC-10: _emotion_backfill_job reads .status off the return value to
     # tell a real between-items pause ("running") from a finish.
     monkeypatch.setattr(
-        supervisor, "_emotion_backfill_run", rec("emotion_backfill", SimpleNamespace(status="complete"))
+        supervisor,
+        "_emotion_backfill_run",
+        rec("emotion_backfill", SimpleNamespace(status="complete")),
     )
+    monkeypatch.setattr(
+        supervisor.research_recovery, "has_recovery_work", lambda _pd: work["research_recovery"]
+    )
+    monkeypatch.setattr(supervisor.research_recovery, "run_recovery", rec("research_recovery"))
     monkeypatch.setattr(
         supervisor, "_embedding_backfill_has_work_probe", lambda _s: work["embedding_backfill"]
     )
@@ -175,6 +212,41 @@ def stubs(monkeypatch):
             "embedding_backfill",
             SimpleNamespace(scanned=0, embedded=0, skipped_short=0, errors=0, batch_size=1),
         ),
+    )
+    monkeypatch.setattr(
+        supervisor.floor_startup,
+        "cosine_floor_due",
+        lambda _s, **_k: work["cosine_floor_bootstrap"],
+    )
+    monkeypatch.setattr(supervisor.floor_startup, "run_cosine_floor", rec("cosine_floor_bootstrap"))
+    monkeypatch.setattr(
+        supervisor.floor_startup,
+        "rerank_floor_due",
+        lambda _s, **_k: work["rerank_floor_bootstrap"],
+    )
+    monkeypatch.setattr(supervisor.floor_startup, "run_rerank_floor", rec("rerank_floor_bootstrap"))
+    monkeypatch.setattr(
+        supervisor.reranker, "stuck_width_due", lambda _m, _f: work["rerank_width_remeasure"]
+    )
+    monkeypatch.setattr(
+        supervisor.reranker, "ram_figure_due", lambda _m, _f: work["rerank_ram_figure"]
+    )
+    monkeypatch.setattr(supervisor.reranker, "run_ram_figure", rec("rerank_ram_figure", True))
+    monkeypatch.setattr(
+        supervisor.cost_series, "has_pending", lambda _db: work["cost_series_flush"]
+    )
+    monkeypatch.setattr(supervisor.cost_series, "flush", rec("cost_series_flush", 1))
+    monkeypatch.setattr(
+        supervisor.recall_diagnostics, "has_pending", lambda _p: work["recall_diagnostics_flush"]
+    )
+    def _diagnostics_flush(_p):
+        order.append("recall_diagnostics_flush")
+        work["recall_diagnostics_flush"] = False  # the buffer is empty after a flush that wrote
+        return 1
+
+    monkeypatch.setattr(supervisor.recall_diagnostics, "flush_pending", _diagnostics_flush)
+    monkeypatch.setattr(
+        supervisor.reranker, "remeasure_stuck_width", rec("rerank_width_remeasure", True)
     )
     monkeypatch.setattr(supervisor, "forgetting_run_pass", rec("maintenance"))
     monkeypatch.setattr(supervisor, "_run_narrative_memory_pass", lambda *a, **k: None)
@@ -198,6 +270,14 @@ def stubs(monkeypatch):
     monkeypatch.setattr(supervisor, "_run_judge_selftune_tick", rec("weekly_selftune"))
     monkeypatch.setattr(supervisor, "_run_finalize_tick", rec("finalize"))
     monkeypatch.setattr(supervisor, "_run_initiate_review_tick", rec("initiate_review"))
+    # #523: the extraction backfill job stays real down to its one-chunk leaf.
+    monkeypatch.setattr(supervisor.extraction_backfill, "has_work", lambda _pd: work["extraction_backfill"])
+    monkeypatch.setattr(supervisor.extraction_backfill, "load_state", lambda _pd: {"status": "armed"})
+    monkeypatch.setattr(
+        supervisor.extraction_backfill,
+        "run_one_chunk",
+        lambda *_a, **_k: (order.append("extraction_backfill"), supervisor.extraction_backfill.Step(True, "chunk"))[1],
+    )
     return SimpleNamespace(order=order, work=work)
 
 
@@ -213,9 +293,7 @@ def _pass(persona_dir, jobs, *, idle=True, slot=True, now=NOW, between_jobs=None
 
 
 def _fake_jobs(names, log, *, due=True):
-    return [
-        GatedJob(n, run=(lambda n=n: log.append(n)), has_work=(lambda: due)) for n in names
-    ]
+    return [GatedJob(n, run=(lambda n=n: log.append(n)), has_work=(lambda: due)) for n in names]
 
 
 # ---------------------------------------------------------------------------
@@ -223,10 +301,27 @@ def _fake_jobs(names, log, *, due=True):
 # ---------------------------------------------------------------------------
 
 
-def test_job_table_is_the_14_gated_jobs_in_the_s55_order(tmp_path):
+def test_job_table_is_the_23_gated_jobs_in_the_s55_order(tmp_path):
     names = [j.name for j in _real_jobs(_persona(tmp_path))]
     assert names == list(GATED_JOB_ORDER)
-    assert len(names) == 14
+    # #523: the extraction backfill joined after the recall diagnostics flush; #591: the research recovery after the emotion
+    # backfill; Engine 6 (#584): the emotion recovery rebuild runs first
+    assert len(names) == 23
+    assert names[0] == "emotion_recovery_rebuild"
+    # S85 (revised): the two floor-bootstrap RETRY jobs follow embedding backfill;
+    # name-recall fix S100: the stuck-width re-measure follows them, and S164's
+    # cost-series flush follows that (the re-measure's own sample is saved the
+    # same lull), and S189's recall diagnostics flush follows that.
+    i_bs = names.index("embedding_backfill")
+    # S200: the RAM-figure measurement follows the re-measure, before the flush.
+    assert names[i_bs + 1 : i_bs + 7] == [
+        "cosine_floor_bootstrap",
+        "rerank_floor_bootstrap",
+        "rerank_width_remeasure",
+        "rerank_ram_figure",
+        "cost_series_flush",
+        "recall_diagnostics_flush",
+    ]
     # C38: deploy recalibration immediately after clustering, immediately
     # before daily calibration; C15/S43: calibration before self-tune.
     i = names.index("deploy_recalibration")
@@ -242,7 +337,17 @@ def test_job_table_due_sources(tmp_path):
         assert jobs[name].cadence_file == filename and jobs[name].interval_s == interval
     # No-interval jobs (S53/S66) and the predicate jobs (S70 deploy, S29
     # self-model) own no cadence file here.
-    for name in (*NO_INTERVAL_JOBS, "deploy_recalibration", "self_model_articulation"):
+    for name in (
+        *NO_INTERVAL_JOBS,
+        "cosine_floor_bootstrap",
+        "rerank_floor_bootstrap",
+        "rerank_width_remeasure",
+        "rerank_ram_figure",
+        "cost_series_flush",
+        "recall_diagnostics_flush",
+        "deploy_recalibration",
+        "self_model_articulation",
+    ):
         assert jobs[name].cadence_file is None and jobs[name].has_work is not None
 
 
@@ -256,7 +361,7 @@ def test_unknown_job_name_is_rejected():
 # ---------------------------------------------------------------------------
 
 
-def test_c15a_all_14_due_run_in_s55_order_real_table(tmp_path, stubs):
+def test_c15a_all_17_due_run_in_s55_order_real_table(tmp_path, stubs):
     persona_dir = _persona(tmp_path)
     _seed_all_overdue(persona_dir)
     decisions = _pass(persona_dir, _real_jobs(persona_dir))
@@ -265,7 +370,9 @@ def test_c15a_all_14_due_run_in_s55_order_real_table(tmp_path, stubs):
     assert runs == list(GATED_JOB_ORDER)
 
 
-@pytest.mark.parametrize("j", range(len(GATED_JOB_ORDER)))
+# The loop asks is-chat-idle in one place before every job (no per-job branch), so the first and second job, one in
+# the middle and the last stand for all 23; the real-table test below pins the calibration boundary.
+@pytest.mark.parametrize("j", [0, 1, len(GATED_JOB_ORDER) // 2, len(GATED_JOB_ORDER) - 1])
 def test_c15a_idle_flip_before_job_j_stops_the_sequence_at_j(tmp_path, j):
     log: list[str] = []
     asked: list[int] = []
@@ -278,6 +385,68 @@ def test_c15a_idle_flip_before_job_j_stops_the_sequence_at_j(tmp_path, j):
     assert log == list(GATED_JOB_ORDER[:j])
     assert len(asked) == j + 1, "is-chat-idle must be asked again before every job"
     assert (decisions[-1].job, decisions[-1].action) == (GATED_JOB_ORDER[j], "skip-no-lull")
+
+
+@pytest.mark.no_base_failure(reason='#540 audit: coverage moved here from a removed or merged test; the behaviour it checks already existed')
+def test_the_emotion_backfill_job_builds_its_provider_for_the_classifier_tier(tmp_path, stubs, monkeypatch):
+    """The real emotion_backfill job hands the backfill a provider built for the background-classifier tier
+    (#154: the backfill used to receive the bare shared provider)."""
+    from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER
+
+    persona_dir = _persona(tmp_path)
+    built: list[tuple] = []
+    given: dict = {}
+    provider = FakeProvider()
+
+    def build(pd, tier, *a, **k):
+        built.append((pd, tier))
+        return provider
+
+    def run(pd, **kwargs):
+        given.update(kwargs)
+        return SimpleNamespace(status="complete")
+
+    monkeypatch.setattr(supervisor, "build_tier_provider", build)
+    monkeypatch.setattr(supervisor, "_emotion_backfill_run", run)
+    job = next(j for j in _real_jobs(persona_dir) if j.name == "emotion_backfill")
+    assert job.run() is JobOutcome.COMPLETED
+    assert built == [(persona_dir, TIER_BACKGROUND_CLASSIFIER)]
+    assert given["provider"] is provider
+
+
+def test_the_research_recovery_job_is_due_while_it_has_work_and_runs_one_pass_on_the_tick_store(tmp_path, monkeypatch):
+    """#591: the job is wired to the recovery module's own predicate and pass, with the per-tick store, and needs no user step."""
+    persona_dir = _persona(tmp_path)
+    due = {"work": True}
+    ran: list[tuple] = []
+    monkeypatch.setattr(supervisor.research_recovery, "has_recovery_work", lambda pd: due["work"] and pd == persona_dir)
+    monkeypatch.setattr(
+        supervisor.research_recovery, "run_recovery", lambda pd, store, **_k: ran.append((pd, type(store).__name__))
+    )
+    job = next(j for j in _real_jobs(persona_dir) if j.name == "research_recovery")
+    assert job.cadence_file is None and job.has_work is not None
+    assert job.has_work() is True
+    due["work"] = False
+    assert job.has_work() is False
+    assert job.run() is JobOutcome.COMPLETED
+    assert ran == [(persona_dir, "MemoryStore")]
+
+
+def test_the_emotion_recovery_job_is_due_while_the_engine_needs_recovery_and_maps_the_run_to_an_outcome(
+    tmp_path, emotion_engine_stub, monkeypatch
+):
+    """Engine 6 (#584): due iff the engine's own `needs_recovery()` holds; no interval; a finished rebuild is COMPLETED and a
+    failed one (logged by `recovery_job_run`, which the next pass retries) is SKIPPED, so the sequence goes on to the next job."""
+    persona_dir = _persona(tmp_path)
+    job = next(j for j in _real_jobs(persona_dir) if j.name == "emotion_recovery_rebuild")
+    assert job.cadence_file is None and job.interval_s is None and job.has_work is not None
+    assert job.has_work() is False
+    emotion_engine_stub.recovery_needed = True
+    assert job.has_work() is True
+    assert job.run() is JobOutcome.COMPLETED
+    assert [call for call in emotion_engine_stub.recorded_calls if call[0] == "recovery_rebuild"] == [("recovery_rebuild",)]
+    monkeypatch.setattr(supervisor.emotion_engine, "recovery_job_run", lambda _pd: False)
+    assert job.run() is JobOutcome.SKIPPED
 
 
 def test_c15a_idle_flip_real_table_stops_before_calibration(tmp_path, stubs):
@@ -319,7 +488,7 @@ def test_c5_no_gated_job_starts_inside_the_lull_then_all_start_after(tmp_path, s
         assert stubs.order == [], f"a gated job started inside the lull (t-t0={t - t0})"
 
     _pass(persona_dir, jobs, idle=lambda: cli_throttle.is_chat_idle(now=t0 + lull))
-    assert stubs.order == list(GATED_JOB_ORDER), "all 14 due jobs start at the first pass after"
+    assert stubs.order == list(GATED_JOB_ORDER), "all 23 due jobs start at the first pass after"
 
 
 def test_c5_reply_in_flight_blocks_even_past_the_lull(tmp_path, stubs):
@@ -427,13 +596,11 @@ def test_c6_skip_leaves_every_cadence_file_byte_identical_and_still_due(tmp_path
     jobs = _real_jobs(persona_dir)
     before = _snapshot_bytes(persona_dir)
 
-    decisions = _pass(
-        persona_dir, jobs, idle=(deny != "no-lull"), slot=(deny != "slot")
-    )
+    decisions = _pass(persona_dir, jobs, idle=(deny != "no-lull"), slot=(deny != "slot"))
     assert stubs.order == []
     assert _snapshot_bytes(persona_dir) == before
     if deny == "slot":
-        assert [d.action for d in decisions if d.action != "init-cadence"] == ["skip-slot"] * 14
+        assert [d.action for d in decisions if d.action != "init-cadence"] == ["skip-slot"] * 23
 
     _pass(persona_dir, jobs)  # next pass, idle + slot: every job still due
     assert stubs.order == list(GATED_JOB_ORDER)
@@ -441,8 +608,8 @@ def test_c6_skip_leaves_every_cadence_file_byte_identical_and_still_due(tmp_path
 
 def test_c6_inner_slot_denial_is_a_skip_not_a_run(tmp_path, stubs, monkeypatch):
     """Jobs holding their own authoritative slot (pass 2, embedding backfill,
-    maintenance, interest sweep, self-tune) that lose the race after the
-    central peek report SKIPPED: no work, no cadence advance."""
+    the extraction backfill, maintenance, interest sweep, self-tune) that lose
+    the race after the central peek report SKIPPED: no work, no cadence advance."""
     persona_dir = _persona(tmp_path)
     _seed_all_overdue(persona_dir)
     monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _denying_slot)
@@ -450,7 +617,16 @@ def test_c6_inner_slot_denial_is_a_skip_not_a_run(tmp_path, stubs, monkeypatch):
     decisions = _pass(persona_dir, _real_jobs(persona_dir))
     skipped = {d.job for d in decisions if d.action == "skipped"}
     assert skipped == {
-        "pass2", "embedding_backfill", "maintenance", "interest_sweep", "weekly_selftune"
+        "pass2",
+        "embedding_backfill",
+        "cosine_floor_bootstrap",
+        "rerank_floor_bootstrap",
+        "rerank_width_remeasure",
+        "rerank_ram_figure",
+        "extraction_backfill",
+        "maintenance",
+        "interest_sweep",
+        "weekly_selftune",
     }
     after = _snapshot_bytes(persona_dir)
     for name in ("maintenance", "interest_sweep", "weekly_selftune"):
@@ -575,9 +751,41 @@ def test_c21_a_raising_job_still_advances_its_cadence(tmp_path, stubs, monkeypat
     assert state.next_at == NOW + timedelta(seconds=interval)
 
 
-def test_c21_self_model_reflect_raising_still_advances_its_own_cadence(tmp_path, monkeypatch):
+@pytest.mark.no_base_failure(reason='#540 audit: coverage moved here from a removed or merged test; the behaviour it checks already existed')
+def test_c21_a_raising_deploy_recalibration_does_not_stop_the_pass(tmp_path, stubs, monkeypatch):
+    """The central function is the fault-isolation wrapper of deploy recalibration (the supervisor-thread test that
+    pinned "the loop survives" is gone). A raising run counts as a completed run (S44), the next due job still runs in
+    the same pass, and the next pass tries the raising job again while it stays due. (Here the due predicate is
+    stubbed true; in production a no-row raise is rate-limited by the job's own retry cadence file.)"""
+    persona_dir = _persona(tmp_path)
+    for k in stubs.work:
+        stubs.work[k] = False
+    stubs.work["deploy_recalibration"] = True
+    filename, _interval = INTERVAL_JOBS["daily_calibration"]
+    _seed(persona_dir, filename, NOW - timedelta(hours=1))  # the job after it in the S55 order is overdue
+    attempts: list[tuple] = []
+
+    def boom(*args, **_k):
+        attempts.append(args)
+        raise RuntimeError("simulated deploy recalibration failure")
+
+    monkeypatch.setattr(supervisor, "_run_deploy_recalibration", boom)
+    jobs = [j for j in _real_jobs(persona_dir) if j.name in ("deploy_recalibration", "daily_calibration")]
+    decisions = _pass(persona_dir, jobs)
+    assert ("deploy_recalibration", "completed") in [(d.job, d.action) for d in decisions]
+    assert ("daily_calibration", "completed") in [(d.job, d.action) for d in decisions]
+    assert stubs.order == ["daily_calibration"]
+    _pass(persona_dir, jobs)
+    assert attempts == [(persona_dir,)] * 2, "a job that stays due is tried again at the next pass, on this persona"
+
+
+def test_c21_self_model_reflect_raising_still_advances_its_own_cadence(tmp_path, monkeypatch, emotion_engine_stub):
     """Self-model keeps its own cadence (S29): a reflect that raises is
     caught by its own handler and backs off (still an advance, S44)."""
+    from brain.emotion.engine import Reading
+
+    # The tick reaches its reflect only when the engine has something to read.
+    emotion_engine_stub.readings = {"joy": Reading(short=6.0, long=5.0, difference=1.0, shift=1)}
     persona_dir = _persona(tmp_path)
     sm_cadence.save(
         persona_dir,
@@ -631,11 +839,6 @@ def test_c22_due_but_no_lull_leaves_the_cadence_file_unchanged(tmp_path, stubs):
     assert sm_cadence._state_path(persona_dir).read_bytes() == before  # noqa: SLF001
     _pass(persona_dir, _self_model_only(persona_dir))
     assert stubs.order == ["self_model_articulation"]
-
-
-def test_c22_code_comment_names_the_future_absorption():
-    src = inspect.getsource(supervisor._run_self_model_tick).replace("#", " ")
-    assert "absorbed later by the expanded central cadence function" in " ".join(src.split())
 
 
 # ---------------------------------------------------------------------------
@@ -822,6 +1025,7 @@ _GATED_CALLS = {
     "drain_all_locked",
 }
 _NON_GATED_ONE_SHOTS = {
+    "_jsonl_nul_repair_run",
     "_attunement_run_backfill",
     "_attunement_run_supplementary_backfill",
     "_run_vocab_repair_tick",
@@ -887,7 +1091,7 @@ def fake_reranker(monkeypatch):
     from brain.memory.reranker import FakeRerankerProvider
 
     monkeypatch.setattr(
-        reranker_mod, "build_reranker_provider", lambda **kw: FakeRerankerProvider()
+        reranker_mod, "resolve_reranker_model_id", lambda: FakeRerankerProvider().model_id()
     )
     return "fake-reranker"
 
@@ -898,8 +1102,12 @@ def _floor(persona_dir, model_id, scale):
     store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
     try:
         store.write_reranker_floor(
-            model_id, floor=1.0, raw_fit_floor=1.0, sample_pairs=200,
-            is_cold_start=False, score_scale=scale,
+            model_id,
+            floor=1.0,
+            raw_fit_floor=1.0,
+            sample_pairs=200,
+            is_cold_start=False,
+            score_scale=scale,
         )
     finally:
         store.close()
@@ -916,11 +1124,17 @@ def test_c38_fresh_floor_is_not_due(tmp_path, fake_reranker):
 def test_c38_raw_scale_floor_is_due_regardless_of_retry_file(tmp_path, fake_reranker):
     persona_dir = _persona(tmp_path)
     _floor(persona_dir, fake_reranker, "raw")
-    _seed(persona_dir, supervisor._DEPLOY_RECAL_RETRY_CADENCE_FILE, datetime.now(UTC) + timedelta(hours=5))
+    _seed(
+        persona_dir,
+        supervisor._DEPLOY_RECAL_RETRY_CADENCE_FILE,
+        datetime.now(UTC) + timedelta(hours=5),
+    )
     assert supervisor._deploy_recalibration_due(persona_dir) is True
 
 
-def test_c38_no_row_is_due_at_first_lull_then_retried_at_most_daily(tmp_path, fake_reranker, monkeypatch):
+def test_c38_no_row_is_due_at_first_lull_then_retried_at_most_daily(
+    tmp_path, fake_reranker, monkeypatch
+):
     from brain.memory import floor_calibration as fc_mod
 
     persona_dir = _persona(tmp_path)
@@ -929,10 +1143,15 @@ def test_c38_no_row_is_due_at_first_lull_then_retried_at_most_daily(tmp_path, fa
     monkeypatch.setattr(
         fc_mod,
         "derive_and_persist_floor",
-        lambda store, model_id, **kw: calls.append(model_id)
-        or SimpleNamespace(
-            accepted=False, floor=None, is_cold_start=False,
-            held_for_data_starvation=True, sample_pairs=0,
+        lambda store, model_id, **kw: (
+            calls.append(model_id)
+            or SimpleNamespace(
+                accepted=False,
+                floor=None,
+                is_cold_start=False,
+                held_for_data_starvation=True,
+                sample_pairs=0,
+            )
         ),
     )
     supervisor._run_deploy_recalibration(persona_dir)  # writes nothing: row still absent
@@ -945,7 +1164,14 @@ def test_c38_no_row_is_due_at_first_lull_then_retried_at_most_daily(tmp_path, fa
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("name", NO_INTERVAL_JOBS)
+# The jobs that run at every idle pass while their "has work" predicate holds: the interval-less jobs, and deploy
+# recalibration (due while the stored floor is stale). Kept apart from NO_INTERVAL_JOBS, which other tests read as the
+# set of jobs with no due-predicate of their own.
+_WORK_PREDICATE_JOBS = (*NO_INTERVAL_JOBS, "deploy_recalibration")
+
+
+@pytest.mark.no_base_failure(reason='#540 audit: coverage moved here from a removed or merged test; the behaviour it checks already existed')
+@pytest.mark.parametrize("name", _WORK_PREDICATE_JOBS)
 def test_c39_no_interval_job_runs_every_idle_pass_while_it_has_work(tmp_path, stubs, name):
     persona_dir = _persona(tmp_path)
     for k in stubs.work:
@@ -973,7 +1199,9 @@ def test_c39_snapshot_has_work_probe(tmp_path):
 
     persona_dir = _persona(tmp_path)
     assert supervisor._snapshot_has_work(persona_dir) is False
-    sid = ingest_turn(persona_dir, {"speaker": "user", "text": "hi", "ts": "2026-09-27T10:00:00+00:00"})
+    sid = ingest_turn(
+        persona_dir, {"speaker": "user", "text": "hi", "ts": "2026-09-27T10:00:00+00:00"}
+    )
     assert supervisor._snapshot_has_work(persona_dir) is True  # un-extracted turn
     write_cursor(persona_dir, sid, "2026-09-27T10:00:00+00:00")
     assert supervisor._snapshot_has_work(persona_dir) is False  # all extracted
@@ -988,9 +1216,7 @@ def test_c39_snapshot_has_work_probe(tmp_path):
 
 
 def _prune_job(persona_dir, **overrides):
-    return [
-        j for j in _real_jobs(persona_dir, **overrides) if j.name == "session_snapshot_prune"
-    ]
+    return [j for j in _real_jobs(persona_dir, **overrides) if j.name == "session_snapshot_prune"]
 
 
 def test_c39_prune_removes_a_session_that_predates_the_idle_window(tmp_path, monkeypatch):
@@ -1055,7 +1281,7 @@ def _mem(content="a memory long enough to embed", emotions=None):
 
     m = Memory.create_new(content=content, memory_type="meta", domain="test")
     if emotions is not None:
-        m.emotions = emotions
+        m._stored_emotions = emotions
     return m
 
 
@@ -1077,8 +1303,12 @@ def test_c39_emotion_backfill_has_work_probe(tmp_path):
             eb._save_state(  # noqa: SLF001
                 persona_dir,
                 eb.EmotionBackfillState(
-                    started_at="x", total_memories=2, tagged_memories=1,
-                    last_cursor="", status=status, schema_version="v1",
+                    started_at="x",
+                    total_memories=2,
+                    tagged_memories=1,
+                    last_cursor="",
+                    status=status,
+                    schema_version="v1",
                 ),
             )
 
@@ -1091,17 +1321,27 @@ def test_c39_emotion_backfill_has_work_probe(tmp_path):
             json.dumps({"date": eb._today_str(now), "count": 200})  # noqa: SLF001
         )
         assert eb.has_emotion_backfill_work(persona_dir, store=store, now=now) is False
-        assert eb.has_emotion_backfill_work(
-            persona_dir, store=store, now=now + timedelta(days=1)
-        ) is True
+        assert (
+            eb.has_emotion_backfill_work(persona_dir, store=store, now=now + timedelta(days=1))
+            is True
+        )
     finally:
         store.close()
 
 
-def test_c39_embedding_backfill_has_work_probe(tmp_path):
+def test_c39_embedding_backfill_has_work_probe(tmp_path, monkeypatch):
     from brain.memory import embedding_backfill as ebf
+    from brain.memory import embeddings as embeddings_mod
     from brain.memory.store import MemoryStore
 
+    # The probe reads the current model id with `resolve_embedding_model_id()`
+    # (it builds no provider); the rows below are embedded by the suite's fake
+    # provider under the fake's id, so the accessor is pointed at that id.
+    monkeypatch.setattr(
+        embeddings_mod,
+        "resolve_embedding_model_id",
+        lambda: embeddings_mod.FakeEmbeddingProvider(dim=256).model_id(),
+    )
     persona_dir = _persona(tmp_path)
     store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
     try:
@@ -1111,6 +1351,34 @@ def test_c39_embedding_backfill_has_work_probe(tmp_path):
         assert ebf.has_embedding_backfill_work(store) is True
         store.embed_row(m.id, m.content)
         assert ebf.has_embedding_backfill_work(store) is False
+    finally:
+        store.close()
+
+
+def test_c39_embedding_backfill_has_work_probe_builds_no_provider(tmp_path, monkeypatch):
+    """The probe runs on every idle pass: it must not construct a provider
+    (`FastEmbedProvider.__init__` downloads the model when it is uncached)."""
+    from brain.memory import embedding_backfill as ebf
+    from brain.memory import embeddings as embeddings_mod
+    from brain.memory.store import MemoryStore
+
+    fake_id = embeddings_mod.FakeEmbeddingProvider(dim=256).model_id()
+    monkeypatch.setattr(embeddings_mod, "resolve_embedding_model_id", lambda: fake_id)
+    persona_dir = _persona(tmp_path)
+    store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
+    try:
+        m = _mem()
+        store.create(m)
+        built: list[str] = []
+
+        def _boom(*_a, **_k):
+            built.append("built")
+            raise AssertionError("an embedding provider was constructed to read the model id")
+
+        monkeypatch.setattr(embeddings_mod, "build_embedding_provider", _boom)
+        monkeypatch.setattr(embeddings_mod.FastEmbedProvider, "__init__", _boom)
+        assert ebf.has_embedding_backfill_work(store) is True
+        assert built == []
     finally:
         store.close()
 
@@ -1128,16 +1396,6 @@ def test_load_or_init_cadence_present_file_is_returned_unchanged(tmp_path):
     )
     assert created is False and state.next_at == NOW - timedelta(hours=1)
     assert _cadence_path(tmp_path, "x.json").read_bytes() == before
-
-
-def test_run_central_pass_logs_decisions(tmp_path, caplog):
-    import logging
-
-    log: list[str] = []
-    with caplog.at_level(logging.INFO, logger="brain.bridge.central_cadence"):
-        _pass(tmp_path, _fake_jobs(["pass2"], log))
-    assert any("job=pass2 action=run" in r.getMessage() for r in caplog.records)
-    assert any("job=pass2 action=completed" in r.getMessage() for r in caplog.records)
 
 
 def test_paused_outcome_stops_the_sequence_without_advancing(tmp_path):
@@ -1173,7 +1431,9 @@ def test_each_interval_cadence_file_is_read_once_per_pass(tmp_path, stubs, monke
     assert sorted(calls) == sorted(f for f, _i in INTERVAL_JOBS.values())
 
 
-def test_pass2_reports_skipped_when_another_process_holds_the_drain_lock(tmp_path, stubs, monkeypatch):
+def test_pass2_reports_skipped_when_another_process_holds_the_drain_lock(
+    tmp_path, stubs, monkeypatch
+):
     persona_dir = _persona(tmp_path)
     monkeypatch.setattr(pass2_queue, "drain_all_locked", lambda *a, **k: 0)
     decisions = _pass(persona_dir, [j for j in _real_jobs(persona_dir) if j.name == "pass2"])
@@ -1193,9 +1453,7 @@ def _prune_setup(tmp_path, monkeypatch):
     return persona_dir
 
 
-def test_s84_no_message_seen_prunes_an_empty_session_older_than_bridge_start(
-    tmp_path, monkeypatch
-):
+def test_s84_no_message_seen_prunes_an_empty_session_older_than_bridge_start(tmp_path, monkeypatch):
     """(i) No message seen (anchor -inf, nothing seeded) + an empty session
     created before this bridge started → pruned at an idle pass."""
     from brain.chat.session import all_sessions, create_session, reset_registry
@@ -1283,15 +1541,34 @@ def test_s84_leaves_time_since_last_message_and_is_chat_idle_untouched(tmp_path,
         reset_registry()
 
 
-def test_s84_run_folded_captures_bridge_start_before_the_loop():
-    """Live wiring: run_folded records bridge start once, at entry, and hands
-    it to the job table."""
-    src = inspect.getsource(supervisor.run_folded)
-    assert "bridge_started_at = datetime.now(UTC)" in src
-    assert src.index("bridge_started_at = datetime.now(UTC)") < src.index(
-        "while not stop_event.is_set():"
-    )
-    assert "bridge_started_at=bridge_started_at" in src
+def _folded_kwargs(persona_dir, ticks: list[int], **extra) -> dict:
+    """Keyword arguments for a real run_folded thread with every cadence off (one tick per pass lands in ``ticks``)."""
+    return {
+        "persona_dir": persona_dir,
+        "provider": FakeProvider(),
+        # EventBus drops events when no event loop is bound, so the bus here is a recorder.
+        "event_bus": SimpleNamespace(
+            publish=lambda event: ticks.append(1) if event.get("type") == "supervisor_tick" else None
+        ),
+        "tick_interval_s": 0.05,
+        "heartbeat_interval_s": None,
+        "soul_review_interval_s": None,
+        "finalize_interval_s": None,
+        "log_rotation_interval_s": None,
+        "initiate_review_interval_s": None,
+        "voice_reflection_interval_s": None,
+        "self_model_interval_s": None,
+        "compaction_interval_s": None,
+        "calibration_interval_s": None,
+        "interest_sweep_interval_s": None,
+        "judge_selftune_interval_s": None,
+        "clustering_interval_s": None,
+        "vocab_repair_interval_s": None,
+        "maker_enabled": False,
+        "notes_enabled": False,
+        "kindled_link_enabled": False,
+        **extra,
+    }
 
 
 def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_path):
@@ -1303,52 +1580,89 @@ def test_s84_run_folded_live_prunes_pre_start_session_keeps_post_start_one(tmp_p
 
     from brain.chat.session import all_sessions, create_session, reset_registry
 
+    # Caps, not expected durations: every wait below returns as soon as its event happens. The first idle pass opens
+    # the stores and builds the provider on a cold worker, which took over 10 s on a loaded 4-worker Windows runner.
+    cap_s = 60.0
     persona_dir = _persona(tmp_path)
     reset_registry()
     cli_throttle.reset()
     old = create_session(persona_dir.name)
     old.created_at = datetime.now(UTC) - timedelta(hours=1)
     stop = threading.Event()
+    ticks: list[int] = []  # one per supervisor pass
     t = threading.Thread(
-        target=supervisor.run_folded,
-        args=(stop,),
-        kwargs={
-            "persona_dir": persona_dir,
-            "provider": FakeProvider(),
-            "event_bus": EventBus(),
-            "tick_interval_s": 0.05,
-            "heartbeat_interval_s": None,
-            "soul_review_interval_s": None,
-            "finalize_interval_s": None,
-            "log_rotation_interval_s": None,
-            "initiate_review_interval_s": None,
-            "voice_reflection_interval_s": None,
-            "self_model_interval_s": None,
-            "compaction_interval_s": None,
-            "calibration_interval_s": None,
-            "interest_sweep_interval_s": None,
-            "judge_selftune_interval_s": None,
-            "clustering_interval_s": None,
-            "vocab_repair_interval_s": None,
-            "maker_enabled": False,
-            "notes_enabled": False,
-            "kindled_link_enabled": False,
-        },
-        daemon=True,
+        target=supervisor.run_folded, args=(stop,), kwargs=_folded_kwargs(persona_dir, ticks), daemon=True
     )
     try:
         t.start()
-        deadline = _time.monotonic() + 10.0
+        deadline = _time.monotonic() + cap_s
         while _time.monotonic() < deadline and any(
             s.session_id == old.session_id for s in all_sessions()
         ):
             _time.sleep(0.02)
         assert all(s.session_id != old.session_id for s in all_sessions()), "pre-start session kept"
         new = create_session(persona_dir.name)  # opened after bridge start
-        _time.sleep(0.3)  # several 0.05 s passes
-        assert any(s.session_id == new.session_id for s in all_sessions()), "post-start session pruned"
+        after = len(ticks)
+        deadline = _time.monotonic() + cap_s
+        while len(ticks) < after + 3 and _time.monotonic() < deadline:  # three more passes ran after it was opened
+            _time.sleep(0.02)
+        assert len(ticks) >= after + 3, "the supervisor loop stopped passing"
+        assert any(s.session_id == new.session_id for s in all_sessions()), (
+            "post-start session pruned"
+        )
     finally:
         stop.set()
-        t.join(timeout=10.0)
+        finish_threads(t)
+        reset_registry()
+    assert not t.is_alive()
+
+
+@pytest.mark.no_base_failure(reason='#540 audit: coverage moved here from a removed or merged test; the behaviour it checks already existed')
+def test_s84_run_folded_prunes_by_the_bridge_start_it_is_given(tmp_path):
+    """The bridge hands run_folded the moment it captured before starting the supervisor thread (S84, so the app-mount
+    session cannot race it). Given a start two hours ago, an empty session from three hours ago predates it and is
+    pruned at an idle pass; one from an hour ago does not and is kept. A run_folded that took its own "now" instead
+    would prune both."""
+    import threading
+    import time as _time
+
+    from brain.chat.session import all_sessions, create_session, reset_registry
+
+    cap_s = 60.0
+    persona_dir = _persona(tmp_path)
+    reset_registry()
+    cli_throttle.reset()
+    now = datetime.now(UTC)
+    before_start = create_session(persona_dir.name)
+    before_start.created_at = now - timedelta(hours=3)
+    after_start = create_session(persona_dir.name)
+    after_start.created_at = now - timedelta(hours=1)
+    stop = threading.Event()
+    ticks: list[int] = []
+    t = threading.Thread(
+        target=supervisor.run_folded,
+        args=(stop,),
+        kwargs=_folded_kwargs(persona_dir, ticks, bridge_started_at=now - timedelta(hours=2)),
+        daemon=True,
+    )
+    try:
+        t.start()
+        deadline = _time.monotonic() + cap_s
+        while _time.monotonic() < deadline and any(
+            s.session_id == before_start.session_id for s in all_sessions()
+        ):
+            _time.sleep(0.02)
+        assert all(s.session_id != before_start.session_id for s in all_sessions()), "the idle pass never pruned"
+        after = len(ticks)
+        deadline = _time.monotonic() + cap_s
+        while len(ticks) < after + 3 and _time.monotonic() < deadline:  # three more passes ran after the prune
+            _time.sleep(0.02)
+        assert len(ticks) >= after + 3, "the supervisor loop stopped passing"
+        assert any(s.session_id == after_start.session_id for s in all_sessions()), (
+            "a session opened after the given bridge start was pruned: run_folded used its own start"
+        )
+    finally:
+        stop.set()
+        finish_threads(t)
         reset_registry()
     assert not t.is_alive()

@@ -105,13 +105,13 @@ def test_run_tick_persists_when_overdue_dream_is_deferred(tmp_path: Path, monkey
     provider = _no_real_tier_providers["provider"]
     eng, store, hm = _engine(tmp_path, provider)
     seen: list[float] = []
-    real = eng._apply_emotion_decay
+    real = eng._apply_hebbian_decay_and_gc
 
-    def spy(elapsed_seconds, *, tick_at, state, dry_run):
+    def spy(config, elapsed_seconds, *, dry_run):
         seen.append(elapsed_seconds)
-        return real(elapsed_seconds, tick_at=tick_at, state=state, dry_run=dry_run)
+        return real(config, elapsed_seconds, dry_run=dry_run)
 
-    monkeypatch.setattr(eng, "_apply_emotion_decay", spy)
+    monkeypatch.setattr(eng, "_apply_hebbian_decay_and_gc", spy)
     try:
         eng.run_tick(trigger="manual", dry_run=False)
         s1 = HeartbeatState.load(tmp_path / "heartbeat_state.json")
@@ -193,7 +193,7 @@ def test_voice_reflection_deferral_is_quiet(tmp_path: Path, caplog) -> None:
     from brain.initiate.voice_reflection import run_voice_reflection_tick
 
     with caplog.at_level(logging.INFO, logger="brain.initiate.voice_reflection"):
-        run_voice_reflection_tick(tmp_path, provider=_DeferringProvider(), crystallizations=[], dreams=[])
+        run_voice_reflection_tick(tmp_path, provider=_DeferringProvider(), crystallizations=[], dreams=[], companion_name="Nell")
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 

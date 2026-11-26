@@ -67,7 +67,7 @@ def test_peer_modules_reference_no_tool_path():
 _BRAIN_IMPORT_ALLOWLIST = {
     "brain.kindled_link.gate",       # gate protocol types only — no tool surface
     "brain.kindled_link.peer_prompt",  # peer prompt builder — no tool surface
-    "brain.kindled_link.limits",     # shared caps and budget constants — no tool surface
+    "brain.dev_constants",           # shared caps and budget constants — no tool surface; imports only __future__, so it adds nothing to the peer modules' reachable set
     "brain.kindled_link.privacy_gate",  # privacy reflection gate — no tool surface
     "brain.kindled_link.store",      # persistence layer — no tool surface (session_engine imports)
     "brain.kindled_link.relationship",  # relationship state + maturation — no tool surface (session_engine imports)
@@ -84,8 +84,13 @@ _BRAIN_IMPORT_ALLOWLIST = {
     "brain.kindled_link.audit",         # transport audit log — no tool surface
     "brain.kindled_link.identity",      # Ed25519 identity — no tool surface
     "brain.kindled_link.codec",         # canonical JSON — no tool surface
+    "brain.health.json_io",             # the one JSON/JSONL file reader/writer (#438) — no tool surface; the same file-I/O boundary peers had through jsonl_reader
     "brain.health.jsonl_reader",        # streaming JSONL reader — no tool surface (feed_source.py reads transport.jsonl for feed entries)
     "brain.state_compat",               # tolerant dataclass construction — no tool surface (relationship.py Evidence rollback tolerance)
+    "brain.utils.time",                 # #485 pure stdlib timestamp readers (lenient_utc/hours_since), no tool surface, no I/O (session_engine pacing)
+    "brain.health.parse_failures",      # #364 parse-failure evidence log — no tool surface (stdlib + jsonl_reader + log_rotation only; relationship.py and privacy_gate.py keep a malformed verdict)
+    "brain.emotion.engine",             # emotion rework B1 PR 3: relationship.py reads the switch (engine_for(...).is_live()) — no tool surface; importing it after brain.chat.extractor and brain.memory.store loads no new brain module, so it adds nothing to the reachable set
+    "brain.emotion.write_scale",        # emotion rework B1 PR 7: relationship.py picks the peer values' scale (writes_engine_scale) — no tool surface; it reads the state file and memories.db's x10 progress only, and after brain.emotion.engine and brain.memory.store it loads no new brain module (checked 2026-11-16), so it adds nothing to the reachable set
 }
 
 

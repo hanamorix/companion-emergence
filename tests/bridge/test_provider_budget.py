@@ -1,8 +1,10 @@
 """Per-reply --max-budget-usd catastrophe backstop (Task 6 / A).
 
-Spike-verified frame: an over-budget run returns (exit 0) a result JSON with
-``"subtype": "error_max_budget_usd"``, ``"is_error": true``,
-``"errors": ["Reached maximum budget ($X)"]``.
+Frame shape (2026-06 spike): a result JSON with ``"subtype": "error_max_budget_usd"``,
+``"is_error": true``, ``"errors": ["Reached maximum budget ($X)"]``. The 2026-06 spike saw it
+at exit 0; claude 2.1.295 / 2.1.300 exit **1** (#399; ledger row "Over-budget stop"), which
+``test_provider_budget_exit.py`` replays with the real frame (the blocking branches accept an
+exit-1 frame by its subtype). The stubs below keep exit 0, which the graceful path also takes.
 
 Tests added one at a time per the tdd-guard rule.
 """
@@ -11,6 +13,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+
+import pytest
 
 from brain.bridge.chat import ChatMessage
 from brain.bridge.provider import _MAX_TURN_BUDGET_USD, ClaudeCliProvider
@@ -38,7 +42,7 @@ def test_mcp_tools_path_budget_flag_and_graceful(tmp_path, monkeypatch):
 
     persona = tmp_path / "persona"
     persona.mkdir()
-    p = ClaudeCliProvider(model="claude-sonnet-4-6")
+    p = ClaudeCliProvider(probe_model="claude-sonnet-4-6")
     resp = p.chat(
         [ChatMessage(role="user", content="hi")],
         tools=[{"name": "noop"}],
@@ -50,8 +54,11 @@ def test_mcp_tools_path_budget_flag_and_graceful(tmp_path, monkeypatch):
     assert "limit" in resp.content.lower() or "continue" in resp.content.lower()
 
 
-def test_chat_with_images_path_budget_flag_and_graceful(tmp_path, monkeypatch):
-    """_chat_with_images: flag present + over-budget frame handled gracefully."""
+@pytest.mark.no_base_failure(reason='#540 rewrite of an existing test (new id from a rename or a new parameter) asserting what its predecessor asserted; the old code passes it')
+def test_chat_with_a_persona_dir_and_an_image_message_budget_flag_and_graceful(tmp_path, monkeypatch):
+    """The text path with a persona dir (stream-json output, no tools), for a message that carries an image: the
+    image transport is gone, the image is flattened into the text, and the flag is present with the over-budget
+    frame handled gracefully."""
     import hashlib
 
     from brain.bridge.chat import ImageBlock
@@ -73,7 +80,7 @@ def test_chat_with_images_path_budget_flag_and_graceful(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setitem(__import__("sys").modules, "mcp", __import__("types").ModuleType("mcp"))
 
-    # Build a fake image so _chat_with_images can be reached
+    # Build a fake image so the message carries an image block
     persona = tmp_path / "persona"
     images_dir = persona / "images"
     images_dir.mkdir(parents=True)
@@ -90,7 +97,7 @@ def test_chat_with_images_path_budget_flag_and_graceful(tmp_path, monkeypatch):
             ImageBlock(image_sha=sha, media_type="image/png"),
         ),
     )
-    p = ClaudeCliProvider(model="claude-sonnet-4-6")
+    p = ClaudeCliProvider(probe_model="claude-sonnet-4-6")
     resp = p.chat(
         [msg],
         tools=None,
@@ -110,7 +117,7 @@ def test_streaming_path_budget_flag_and_graceful_over_budget(monkeypatch):
     from brain.bridge.chat import StreamDone
     from brain.bridge.provider import ClaudeCliProvider
 
-    provider = ClaudeCliProvider(model="claude-sonnet-4-6", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="claude-sonnet-4-6", timeout_seconds=60)
 
     # Two partial text deltas then an over-budget result frame.
     partial_lines = [
@@ -172,7 +179,7 @@ def test_generate_path_does_not_get_budget_flag(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(payload), stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    p = ClaudeCliProvider(model="claude-sonnet-4-6")
+    p = ClaudeCliProvider(probe_model="claude-sonnet-4-6")
     p.generate("hello world")
     assert "--max-budget-usd" not in captured["cmd"]
 
@@ -202,7 +209,7 @@ def test_budget_flag_present_and_error_frame_is_graceful(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(frame), stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
-    p = ClaudeCliProvider(model="claude-sonnet-4-6")
+    p = ClaudeCliProvider(probe_model="claude-sonnet-4-6")
     resp = p.chat([ChatMessage(role="user", content="hi")])
     assert "--max-budget-usd" in captured["cmd"]
     # graceful, non-empty, signals the cut-off — not a crash, not empty

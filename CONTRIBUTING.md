@@ -101,6 +101,18 @@ Sometimes one piece of work needs another that isn't merged yet, so you base the
 
 **The rule: a PR only ever merges into main.** Merge the bottom of the stack first. When PR A merges, GitHub deletes its branch (the repo has "automatically delete head branches" turned on) and **retargets PR B to main by itself**. Then B is merged, then C, one at a time, bottom-up. Never merge a PR into another PR's branch.
 
+### After the PR below is squash-merged: rebase the next one
+
+This repo squash-merges, so main gets PR A as one new commit, while PR B's branch still carries A's original commits. Wherever B changed lines that A also changed, B now conflicts with main, even though nothing is actually wrong. Replay only B's own commits onto main:
+
+```bash
+git fetch origin
+git rebase --onto origin/main <A's last head commit> <B's branch>
+git push --force-with-lease origin <B's branch>
+```
+
+`<A's last head commit>` is the commit A's branch pointed at when it merged: `gh pr view <A> --json headRefOid -q .headRefOid` prints it, and the merged PR's page shows it too. The rebase drops everything up to that commit (A's work, already on main as the squash commit) and replays B's commits on top of main. The result has the same content as the old stack. Do this before marking B ready for review. (Found on the #402 → #406 stack, #407.)
+
 ### What helps you follow it
 
 - **The `stack-guard` check** is red on any PR whose base isn't main. Its message says what to do: "merge #N first" while the PR below is open, or "retarget this PR to main" if the PR below has already merged. Once the PR targets main it goes green. A base change re-runs it, and the check reads the PR's current base, so re-running it by hand also works.
@@ -126,6 +138,51 @@ A stack of three PRs (#271 at the bottom, then #274, then #277 on top) was merge
 GitHub showed all three as "merged", but #274 and #277 never reached main. That branch sat 23 commits ahead and had to be recovered by hand with #281. Auto-delete has been on since 25 September. With it on, #271's branch would have been deleted and #274 retargeted to main within about two seconds.
 
 The rule is "base must be main" rather than "the PR below has merged", because the second rule would have been **green** for #274: the PR below it (#271) *had* merged.
+
+## New tests must be able to fail
+
+A test that cannot fail proves nothing. The `new tests must fail on the old code` check (the `new-tests-fail-on-base` job in `test.yml`, pull requests only) runs the tests a PR adds against the code the PR started from and goes red for every one that passes there.
+
+**What counts as a new test.** A test id (`path::Class::name[param]`) that the PR's head collects in a test file the PR adds, modifies or renames (a file under `tests/` named `test_*.py` or `*_test.py`) and that the commit the PR branched from does not collect. So these are new: a test added to an old file, a new parameter value of an old test, a test function you rename, and a test you move to another file by hand. These are not new: a test whose body you changed but whose id is the same, a test file you move with `git mv` (git's rename detection, 30% similarity, maps the old ids to the new path), and anything in `conftest.py` or a helper module.
+
+**What the check runs against.** The PR's own tests, fixtures and `pyproject.toml`, with every other top-level path (`brain/`, `scripts/`, `app/`, `docs/`, ...) replaced by its state at the commit the PR branched from. A new test *bites* if it fails there, errors there (setup included), or cannot be collected there (it imports a module or an id the old code does not have). A test that passes or is skipped there does not bite. Before judging, the check runs one unchanged unit test file against the swapped tree; if that fails, the old code cannot run the new conftest and the check says so instead of reporting every test as biting.
+
+**When a test cannot fail on the old code by design** (a refactor guard, a snapshot of what already exists, test-suite machinery, a rewrite of an existing test under a new id), mark it:
+
+```python
+@pytest.mark.no_base_failure(reason="guards what the refactor must not change")
+def test_the_refactor_keeps_the_behaviour(): ...
+```
+
+The reason is mandatory (a mark without one stops the suite at collection). Mark the function, not the module, so tests added to that file later are still checked. The check counts the marked new tests and lists them, so the escape hatch is visible in the job log. A test that skips on Linux can never bite there; a Windows-only or macOS-only new test needs the mark with a reason that says so.
+
+**Run it locally** (needs `pytest-xdist` for `--workers`, otherwise `--workers 0`; it works in its own temporary git worktrees and leaves your checkout alone, but it checks committed work, so commit first):
+
+```bash
+python scripts/new_tests_fail_on_base.py --base origin/main --workers 0
+```
+
+`--only <text>` limits a local run to changed test files whose path contains the text; `--mark-expr "<expr>"` adds a `-m` expression to every pytest call.
+
+## One value, one place: the shared-settings guard
+
+A user tunable (`tunables.register`, read through `tunables.get_tunable`) and a developer constant (`brain/dev_constants.py`) are meant to live in one place, so changing the setting changes it everywhere. `tests/unit/test_shared_settings_guard.py` fails when code in `brain/` writes to a setting from outside its owner (an attribute store, `setattr`, a rebinding of an imported name, or `set_values` outside the sanctioned writers), defines a constant with the same name, repeats its value (a number or a string distinctive enough to be recognised, a list of the same strings, or a value bound to a name that carries the setting's words), passes a literal as the default of `get_tunable`, keeps a `get_tunable` result somewhere that outlives the call (module or class level, a default argument, an attribute, a cache), or makes a second name for a developer constant (a module-level alias, or a default argument that is a developer constant). In the app's TypeScript and Rust it only looks for a number or a string that mirrors a setting, and for model names. The model-choice rules of the old model guard are one case of it. Read a setting where you use it (`tunables.get_tunable(key, _DEFAULT)` or `dev_constants.NAME` inside the function), and do not copy it.
+
+The guard cannot see purpose, only names and values, so it will sometimes flag a different thing that happens to share them; it also cannot see a round value under an unrelated name, a computed copy, or a value converted to another unit. Its limits are listed in the docstring of `tests/shared_settings.py`. The violations that existed when the guard started are the `ALLOW` list in the test file: each entry has a reason, the list is meant to shrink, and `ALLOW_SIZE` pins its length. When you remove a copy, delete its entry and lower `ALLOW_SIZE`; the test tells you both. A new finding is not fixed by adding an entry: remove the copy. The one case where it may grow is a finding that is a different thing with an equal value: say why in the entry's reason and raise `ALLOW_SIZE` in the same diff, so the reviewer sees the second edit. The model rules (the model literals, `--model` values, constructor bypass, model keys, model names in the app, and a copy of a model accessor's result) are never put in `ALLOW`.
+
+## The suite runs in parallel, in random order, with a time budget
+
+CI runs `uv run pytest -n auto --dist loadgroup -p no:tdd-guard` on all three operating systems (one worker per CPU; `--dist loadgroup` keeps the tests of one `xdist_group` on one worker). On Windows the suite is split across runners (#746): each `python windows-latest (i/N)` job adds `--shard=i/N` (`tests/shard.py`: every test in exactly one shard, each `xdist_group` whole, the split independent of the random order), and the one `python windows-latest` check passes only when every shard did. To reproduce a red shard, run its printed seed with the same `--shard=i/N`. The split is balanced by `tests/shard_durations.json`; when shards drift apart, refresh it from a green run's Windows reports: `gh run download <run> -p 'pytest-junit-windows-latest-*'` then `uv run python scripts/refresh_shard_durations.py pytest-junit-windows-latest-*/pytest-junit.xml`. A test that shares a real resource with others (the Hugging Face cache, the systemd user manager, a network install, a fixed port, a fixed file name) must carry `@pytest.mark.xdist_group("<name>")`; `tests/unit/test_xdist_groups.py` checks the known ones. To run one test on one operating system in CI, serially: `gh workflow run test.yml --ref <branch> -f tests="tests/x.py::test_y" -f os=windows-latest` (`workers` defaults to `1`; `2`, `4` and `auto` run it in parallel; `seed` reruns a given random order).
+
+The order is random (`pytest-randomly`): the seed is printed in the header and again at the end of the run (`pytest-randomly seed: N`). A test that only passes in file order has an order dependence; fix the test, do not pin the order. To reproduce a red order, run serially with `--randomly-seed=N` (a parallel run with the same seed can still distribute tests differently); `-p no:randomly` switches the shuffling off while you debug. The judge release-RSS workflow (real model, three OSes) takes the same `tests` and `seed` inputs when run by hand.
+
+**The slow-test budget.** In the CI python job on **ubuntu** (`KINDLED_SLOW_BUDGET=1`; set it locally to try; macOS and Windows log the CPU time but do not enforce) a test whose call phase uses more than 2 s of CPU time (all threads of its process; not wall-clock time, which on the contended parallel runners would fail innocent tests at random) fails unless it carries `@pytest.mark.slow(reason="...")` on the test function, with a reason a reviewer can weigh. Setup and teardown are not budgeted (do the heavy work in a fixture), and tests marked `requires_network`, `requires_models`, `requires_claude_cli` or `live` are exempt. The number of slow marks is pinned in `tests/unit/test_slow_test_budget.py` and can only go down: when you make a slow test fast and remove its mark, lower the pin to the count that test's failure message shows; a new slow test needs the pin raised there, which shows in the diff. Waiting (sleeps, subprocess waits) is not CPU time and is not gated; the weekly run (`timing.yml`) uploads a wall-clock timing report per operating system, and every CI run uploads `slow-budget-cpu-<os>` (on Windows one per shard, `slow-budget-cpu-windows-latest-<i>-of-<N>`; the CPU time of every test over 0.5 s) to re-calibrate the marks from all three systems.
+
+## Tests must not start a real `claude` in CI
+
+The product starts the claude CLI by its bare name. CI has no `claude`, so a test that reaches that spawn unpatched can only fail the spawn, and a test that tolerates the failure passes without testing what it claims (on a machine that has `claude`, it would spend tokens). When `GITHUB_ACTIONS` is set (or `KINDLED_GUARD_CLAUDE=1` locally, to try it), `tests/claude_spawn_guard.py` fails any test without the `requires_claude_cli` marker that starts a `claude` by bare name through `subprocess` (so `run`, `Popen`, `check_output` and asyncio subprocesses), even if the test catches the error. The message says where the spawn came from. Ways out: patch the spawn (a patched `subprocess.Popen` or provider helper is never seen by the guard); put a fake `claude` script under `tmp_path` and spawn it by explicit path, or put its directory first on the `PATH` you pass; or mark the test `@pytest.mark.requires_claude_cli`. Spawns by explicit path are never blocked. Not seen: spawns made by a child process of the test, by module- or session-scoped fixtures, or by a thread that was already running when the test began, and `shell=True`, `os.system` or `os.posix_spawn` spawns.
+
+A plain `pytest` leaves out tests marked `live` or `requires_claude_cli`, because on a machine with `claude` they spend subscription usage. To run them on purpose, pass your own `-m`, which replaces the default: `uv run pytest -m requires_claude_cli <path>`.
 
 ## What Discord is for
 
@@ -158,3 +215,4 @@ If it's a decision that affects the code or the plan, it belongs in an issue or 
 | Claim an issue | Assign yourself in the right sidebar of the issue |
 | Close an issue with a PR | One `Closes #N` line per issue, in the PR description (squash-merge ignores commit-message keywords) |
 | Merge a stack of PRs | Bottom-up, one at a time, each into main; GitHub retargets the next one (the `stack-guard` check flags a PR that isn't targeting main) |
+| Re-run one test on one OS (e.g. a Windows-only failure) | `gh workflow run test.yml --ref <branch> -f tests="tests/x.py::test_y" -f os=windows-latest` (`os`: `all` by default; `tests`: space-separated paths or node ids, no options; runs only the Python test job) |

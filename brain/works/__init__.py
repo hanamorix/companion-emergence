@@ -7,9 +7,10 @@ Public API:
 
 Storage and indexing live in submodules:
     brain.works.storage — markdown file I/O at persona/<name>/data/works/<id>.md
-    brain.works.store   — SQLite index at persona/<name>/data/works.db
+    brain.works.store   — SQLite index at persona/<name>/works.db
+    brain.works.location — works_db_path, the one resolver every opener uses (#606)
 
-See docs/superpowers/specs/2026-05-04-nell-works-design.md.
+Its design (the 2026-05-04 works design) was never committed and is lost (#797).
 """
 
 from __future__ import annotations

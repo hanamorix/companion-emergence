@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
+import subprocess
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -105,7 +107,7 @@ def _process_one_candidate(
     voice_template: str,
     now: datetime,
     user_name: str = "my user",
-    companion_name: str = "Nell",
+    companion_name: str,
     user_presence: UserPresence | None = None,
 ) -> None:
     """Run the three-prompt pipeline on a single candidate, write audit, remove.
@@ -167,6 +169,7 @@ def _process_one_candidate(
                 recent_voice_evolutions=recent_evolutions,
                 current_local_time=now,
                 companion_name=companion_name,
+                persona_dir=persona_dir,
             )
         else:
             # Hydrate semantic memory IDs into content excerpts. The compose
@@ -218,6 +221,7 @@ def _process_one_candidate(
                 current_local_time=now,
                 voice_edit_acceptance_rate=None,
                 companion_name=companion_name,
+                persona_dir=persona_dir,
             )
     except Exception as exc:
         logger.exception("initiate composition failed for candidate %s", candidate.candidate_id)
@@ -320,10 +324,14 @@ def _process_one_candidate(
             except Exception:  # noqa: BLE001
                 _pron = _resolve_pronouns(None)
 
+            from brain.dev_constants import NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE
+            from brain.emotion.write_scale import writes_engine_scale
             from brain.initiate.reach_emotion import reach_emotions_for
 
             store = MemoryStore(persona_dir / "memories.db")
             try:
+                # The reach-out's row goes straight to memories.db: the x10 fix's rows step (cut 1) rescales it (B1 PR 7).
+                engine_scale = writes_engine_scale(persona_dir, store, cut=NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE)
                 write_initiate_memory(
                     store,
                     audit_id=audit_id,
@@ -333,7 +341,7 @@ def _process_one_candidate(
                     ts=now.isoformat(),
                     user_name=user_name,
                     pronouns=_pron,
-                    reach_emotions=reach_emotions_for(candidate.source),
+                    reach_emotions=reach_emotions_for(candidate.source, engine_scale=engine_scale),
                 )
             finally:
                 store.close()
@@ -390,7 +398,11 @@ def run_initiate_review_tick(
     except Exception:
         user_name = "you"
 
-    outbound_block = build_outbound_recall_block(persona_dir, now=now) or "(no recent outbound)"
+    try:
+        outbound_block = build_outbound_recall_block(persona_dir, now=now) or "(no recent outbound)"
+    except Exception:  # noqa: BLE001 — a block that cannot be built must never abort the review tick (#480)
+        logger.warning("initiate review: could not build the outbound recall block", exc_info=True)
+        outbound_block = "(no recent outbound)"
     voice_template_path = persona_dir / "voice.md"
     if voice_template_path.exists():
         voice_template = voice_template_path.read_text(encoding="utf-8")
@@ -415,9 +427,19 @@ def run_initiate_review_tick(
         sonnet_call=_make_sonnet_call(gate_provider),
         now=now,
         tick_id=tick_id,
+        persona_dir=persona_dir,
     )
 
-    result, dcall = reflection_run(candidates, deps=deps)
+    from brain.bridge.cli_throttle import ThrottleDeferred
+
+    try:
+        result, dcall = reflection_run(candidates, deps=deps)
+    except ThrottleDeferred as exc:
+        # e.g. the provider's login is expired (ProviderAuthDeferred): a quiet defer,
+        # not a failure. Nothing is recorded and every candidate stays queued, so the
+        # 3-failure promote-all below is not reached; the cadence retries next tick.
+        logger.info("initiate review: D-reflection deferred: %s", exc)
+        return
     append_d_call_row(persona_dir, dcall)
 
     if not result.decisions and dcall.failure_type is not None:
@@ -565,6 +587,32 @@ def _emit_supervisor_event(event: dict) -> None:
         logger.warning("supervisor_event %s", json.dumps(event, ensure_ascii=False))
 
 
+# A rate limit is recognised by the structured status the provider formats
+# (`api_error_status=429`), a 429 named as an API/HTTP error, or the CLI's own
+# limit wording ("You've hit your session limit", "You're out of extra usage",
+# "5-hour limit reached"). A bare "429" / "rate" substring also matched "generate",
+# "separate" and any number containing 429, and a rate-limit result demotes the
+# whole queue to draft space (see run_initiate_review_tick), so every match is
+# phrase-bound. `rate_limit_event` is excluded: it is the name of a routine
+# stream frame that `_stdout_shape` lists in unrelated parse-failure details.
+_RATE_LIMIT_RE = re.compile(
+    r"api_error_status\s*[=:]\s*429\b"
+    r"|\bapi error\b[^\n]{0,40}?\b429\b"
+    r"|\bhttp[ /]*429\b"
+    r"|\bstatus[ =:]+429\b"
+    r"|\btoo many requests\b"
+    r"|\brate[ _-]?limit(?!_event)(?:ed|s|ing)?(?![a-z])"
+    r"|\b(?:session|usage|weekly|daily|monthly|opus|sonnet|haiku|\d+-(?:hour|day)) limit\b"
+    r"|\b(?:hit|reached) your (?:(?:session|usage|weekly|daily|monthly|opus|sonnet) )?limit\b"
+    r"|\bout of (?:extra )?usage\b"
+)
+
+
+def _is_rate_limit_text(msg: str) -> bool:
+    """True if a (lower-cased) provider error message reports a rate / usage limit."""
+    return _RATE_LIMIT_RE.search(msg) is not None
+
+
 def _make_haiku_call(provider: Any):
     """Return an LLMCall wrapper around `provider` using the Haiku model tier.
 
@@ -576,20 +624,28 @@ def _make_haiku_call(provider: Any):
 
     Exception mapping per spec §E:
       subprocess.TimeoutExpired / TimeoutError  → DTimeoutError
-      text contains "429" / "rate"              → DRateLimitError
+      rate-limit text (_is_rate_limit_text)     → DRateLimitError
+      ThrottleDeferred (incl. auth deferral)    → re-raised unchanged: a quiet
+                                                  defer, not a failure (#246)
       any other exception                        → DProviderError
     """
+    # local import: avoids a circular dependency on brain.bridge
+    from brain.bridge.cli_throttle import ThrottleDeferred
 
     def _call(*, system: str, user: str) -> tuple[str, int, int, int]:
         start = time.monotonic()
         try:
             text = provider.generate(user, system=system)
-        except (TimeoutError, TimeoutError.__class__) as exc:
+        except (TimeoutError, subprocess.TimeoutExpired) as exc:
             # Catch both Python TimeoutError and subprocess.TimeoutExpired.
             raise DTimeoutError(str(exc)) from exc
+        except ThrottleDeferred:
+            # Includes ProviderAuthDeferred (expired login): not a provider failure.
+            # run_initiate_review_tick turns it into a quiet no-op, so it is never
+            # recorded as a dcall failure and never counts toward the 3-failure promote-all.
+            raise
         except Exception as exc:
-            msg = str(exc).lower()
-            if "429" in msg or "rate" in msg:
+            if _is_rate_limit_text(str(exc).lower()):
                 raise DRateLimitError(str(exc)) from exc
             raise DProviderError(str(exc)) from exc
         latency_ms = int((time.monotonic() - start) * 1000)

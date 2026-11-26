@@ -228,12 +228,12 @@ def test_c6_archive_failure_leaves_buffer_untouched(tmp_path: Path, monkeypatch)
     write_cursor(tmp_path, sid, tss[-1])
     before = Path(tmp_path / "active_conversations" / f"{sid}.jsonl").read_bytes()
 
-    import brain.chat.compaction as comp
+    import brain.ingest.buffer as buffer_mod
 
     def _boom(*a, **k):
         raise OSError("disk full")
 
-    monkeypatch.setattr(comp, "append_archive", _boom)
+    monkeypatch.setattr(buffer_mod, "append_archive", _boom)
     res = compact_conversation(tmp_path, sid, older_than=timedelta(hours=1),
                                fold_existing_summary=True, provider=_StubProvider())
     assert res.compacted is False
@@ -339,7 +339,7 @@ def test_c1a_over_cap_backstop_fires_once_not_per_turn(tmp_path: Path, monkeypat
                                "text": "x" * 4000, "ts": ts})
     write_cursor(tmp_path, sid, tss[-1])  # all extracted
     provider = _StubProvider("SUM")
-    # The backstop builds its own COMPACTION_MODEL provider; pin it to our stub so
+    # The backstop builds its own compaction-job provider; pin it to our stub so
     # the fire-once count is observable (and no real CLI is shelled in the test).
     monkeypatch.setattr(
         "brain.chat.compaction.build_compaction_provider", lambda pd: provider

@@ -24,12 +24,13 @@ tool would trade the one thing that makes it useful — a low false-positive rat
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
+
+from brain.health.json_io import append_jsonl
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +98,6 @@ def check_turn(
             "tools_called": [i.get("name") for i in (invocations or ())],
         }
         path = Path(persona_dir) / SAY_VS_DO_LOG
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        append_jsonl(path, record, on_error="log", nonfinite="null")
     except Exception:  # noqa: BLE001 — telemetry must never cost a reply
         logger.debug("say_vs_do check failed", exc_info=True)

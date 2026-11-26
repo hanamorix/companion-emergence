@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
+from brain.health.json_io import read_json, write_json
 from brain.utils.file_lock import file_lock
+from brain.utils.log_throttle import warn_throttled
+from brain.utils.time import lenient_utc
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +42,8 @@ def _new_id(resolved_path: str, content: str, now: datetime) -> str:
 
 def is_expired(rec: dict, now: datetime) -> bool:
     """True if a pending record is older than the TTL (whether or not the sweep has run yet)."""
-    try:
-        return now - datetime.fromisoformat(rec["proposed_at"]) > timedelta(hours=_TTL_HOURS)
-    except (ValueError, KeyError, TypeError):
-        return False
+    proposed = lenient_utc(rec.get("proposed_at"))  # a naive stamp is read as UTC, as commit.py does (#485)
+    return proposed is not None and lenient_utc(now) - proposed > timedelta(hours=_TTL_HOURS)
 
 
 def count_pending(persona_dir: Path, *, now: datetime) -> int:
@@ -56,30 +56,36 @@ def create(persona_dir: Path, *, op: str, resolved_path: str, content: str,
     rec = {"id": rid, "op": op, "resolved_path": resolved_path, "content": content,
            "content_sha": hashlib.sha256(content.encode()).hexdigest(),
            "proposed_at": now.isoformat(), "status": "pending", "making_id": making_id}
-    p = _dir(persona_dir) / f"{rid}.json"
-    tmp = p.with_suffix(".tmp")
     with _lock(persona_dir):
-        tmp.write_text(json.dumps(rec), encoding="utf-8")
-        tmp.replace(p)
+        write_json(_dir(persona_dir) / f"{rid}.json", rec, indent=None, fsync=False)
     return rid
 
 
+def _read(p: Path) -> dict | None:
+    """One record, or None. A missing record is normal; an unreadable or non-record one is reported once
+    per interval by brain.health.json_io (#367), since it drops out of every listing. Writers replace the
+    file atomically, so a reader never sees a half-written record; on Windows the module retries a transient
+    PermissionError while a replace runs before it reports."""
+    return read_json(p, default=lambda: None, expect=dict)
+
+
 def get(persona_dir: Path, rid: str) -> dict | None:
-    p = _dir(persona_dir) / f"{rid}.json"
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+    return _read(_dir(persona_dir) / f"{rid}.json")
 
 
 def _all(persona_dir: Path) -> list[dict]:
-    out = []
-    for f in _dir(persona_dir).glob("*.json"):
-        try:
-            out.append(json.loads(f.read_text(encoding="utf-8")))
-        except (OSError, ValueError):
-            continue
-    return out
+    return [r for f in _dir(persona_dir).glob("*.json") if (r := _read(f)) is not None]
+
+
+def _age(r: dict, now: datetime) -> timedelta | None:
+    """How old a record is, or None. A record without a usable ``proposed_at``
+    drops out of every listing and is never expired, so it is reported (#429)."""
+    proposed = lenient_utc(r.get("proposed_at"))  # a naive stamp is read as UTC, as commit.py does (#485)
+    if proposed is None:
+        warn_throttled(logger, f"pending:{r.get('id')}", "pending write %s has no usable proposed_at; skipped",
+                       r.get("id"), exc_info=False)
+        return None
+    return lenient_utc(now) - proposed
 
 
 def list_pending(persona_dir: Path, *, now: datetime) -> list[dict]:
@@ -87,9 +93,7 @@ def list_pending(persona_dir: Path, *, now: datetime) -> list[dict]:
     for r in _all(persona_dir):
         if r.get("status") != "pending":
             continue
-        try:
-            age = now - datetime.fromisoformat(r["proposed_at"])
-        except (ValueError, KeyError):
+        if (age := _age(r, now)) is None:
             continue
         if age <= timedelta(hours=_TTL_HOURS):
             fresh.append(r)
@@ -146,10 +150,7 @@ def mark(persona_dir: Path, rid: str, *, status: str, expect: str | None = None,
             return False
         rec["status"] = status
         rec.update(extra)
-        p = _dir(persona_dir) / f"{rid}.json"
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps(rec), encoding="utf-8")
-        tmp.replace(p)
+        write_json(_dir(persona_dir) / f"{rid}.json", rec, indent=None, fsync=False)
         return True
 
 
@@ -158,9 +159,7 @@ def sweep_expired(persona_dir: Path, *, now: datetime) -> int:
     for r in _all(persona_dir):
         if r.get("status") != "pending":
             continue
-        try:
-            age = now - datetime.fromisoformat(r["proposed_at"])
-        except (ValueError, KeyError):
+        if (age := _age(r, now)) is None:
             continue
         if age > timedelta(hours=_TTL_HOURS):
             # expect='pending': a card claimed since the read above is live, not expired (#344).

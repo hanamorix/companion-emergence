@@ -14,6 +14,7 @@ from pathlib import Path
 
 from brain import prompt_strings
 from brain.engines._interests import InterestSet, spawn_interest
+from brain.health.parse_failures import record_parse_failure
 from brain.utils.llm_output import extract_json_object
 from brain.utils.memory import list_conversation_memories
 
@@ -69,7 +70,13 @@ def run_sweep_tick(
         seg = _SWEEP_PROMPT_SEGMENTS
         prompt = seg[0] + listing + seg[1] + _lived_sample(store) + seg[2]
         raw = provider.generate(prompt, system=_SYSTEM)
-        data = json.loads(extract_json_object(raw))
+        try:
+            data = json.loads(extract_json_object(raw))
+            if not isinstance(data, dict):
+                raise ValueError(f"expected a JSON object, got {type(data).__name__}")
+        except ValueError as exc:
+            record_parse_failure(interests_path.parent, site="interest_sweep", raw=raw, error=str(exc))
+            raise
 
         for item in list(data.get("new", []))[:_CAP]:
             topic = str(item.get("topic", "")).strip()
@@ -99,6 +106,10 @@ def run_sweep_tick(
         if result["spawned"] or result["retired"]:
             interests.save(interests_path)
     except Exception as exc:  # noqa: BLE001
+        from brain.bridge.cli_throttle import ThrottleDeferred
+
+        if isinstance(exc, ThrottleDeferred):
+            raise  # #456/#473: "not now": the central pass skips the job without advancing its cadence
         logger.warning("interest sweep failed: %s", exc)
         result["error"] = f"{type(exc).__name__}: {exc}"
     return result

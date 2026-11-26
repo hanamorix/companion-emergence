@@ -20,7 +20,6 @@ from pathlib import Path
 import pytest
 
 from tests.harness import (
-    DEFAULT_MODELS,
     PERSONA_NAME,
     SYNTHETIC_USER,
     PersonaSpec,
@@ -39,7 +38,6 @@ _DEFAULT_CONFIG_KEYS = frozenset(
         "searcher",
         "mcp_audit_log_level",
         "user_name",
-        "model",
         "last_opened_at",
         "user_pronouns",
         "notes_enabled",
@@ -87,7 +85,6 @@ def test_default_config_byte_identical(
         "searcher": "ddgs",
         "mcp_audit_log_level": "redacted",
         "user_name": SYNTHETIC_USER,
-        "model": DEFAULT_MODELS.canary,
         "last_opened_at": None,
         "user_pronouns": None,
         "notes_enabled": False,
@@ -207,3 +204,23 @@ def test_notes_enabled_round_trips_and_preserves_other_keys(
     assert set(notes_cfg) == _DEFAULT_CONFIG_KEYS == set(default_cfg)
     for key in _DEFAULT_CONFIG_KEYS - {"notes_enabled", "notes_folder"}:
         assert notes_cfg[key] == default_cfg[key], f"override branch perturbed untouched key {key!r}"
+
+
+def test_build_persona_outside_its_sandbox_home_writes_nothing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The chat model is an install-wide line written to the CURRENT process's home. A caller whose handle does not
+    match that home must stop before any write, never touch a real install's tunables."""
+    from tests.harness.sandbox import SandboxHandle
+
+    other_home = tmp_path / "some-other-install"
+    other_home.mkdir()
+    monkeypatch.setenv("KINDLED_HOME", str(other_home))
+    handle = SandboxHandle(
+        root=tmp_path / "sandbox-root",
+        env={},
+        claude_config_dir=tmp_path / "claude-config",
+        auth_source="unauthenticated",
+    )
+    with pytest.raises(RuntimeError, match="sandbox"):
+        build_persona(PersonaSpec(model="opus"), handle)
+    assert list(other_home.iterdir()) == []
+    assert not handle.root.exists()

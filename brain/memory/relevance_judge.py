@@ -49,7 +49,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from brain import prompt_strings, tunables
+from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider
+from brain.health.json_io import read_json
 
 # F2a inc7 (#250 §7): TYPE_CHECKING-gated, not a runtime top-level import.
 # `MemoryStore` is used here ONLY as a type hint (`from __future__ import
@@ -74,7 +76,7 @@ logger = logging.getLogger(__name__)
 _HAIKU_TIEBREAK_PROMPT = prompt_strings.register("memory.relevance_judge.haiku_tiebreak_prompt")
 
 # ---------------------------------------------------------------------------
-# Tunables (I7/I3) — derived defaults, operator-overridable via tunables.json.
+# Tunables (I7/I3) — derived defaults, operator-changeable in tunables.toml.
 # ---------------------------------------------------------------------------
 
 # How many calibration_log ROWS the daily tick judges (not every logged row —
@@ -82,24 +84,27 @@ _HAIKU_TIEBREAK_PROMPT = prompt_strings.register("memory.relevance_judge.haiku_t
 # shape as store.py's CALIBRATION_LOG_RETENTION_WINDOW_DAYS:
 #   (i) LOWER bound — the spec cites the cutoff-fit's research basis as
 #       "robust at hundreds of pairs" (Section 7). Each sampled row yields
-#       one judged PAIR per candidate in that row's rerank pool (the
-#       auto-scaled width `reranker.get_rerank_width` chose that turn,
-#       bounded above by `relevance.CANDIDATE_POOL`=50 and below by its own
-#       floor of 1 on a maximally latency-starved potato host). 100 rows is
-#       chosen so that even a persistently narrow, single-candidate pool
-#       (the auto-scaler's worst case) still clears "hundreds of pairs" by
-#       inc7's floor-fit time (the fit itself draws from accumulated
-#       labeled rows across the retention window, not one day in
-#       isolation) — a genuinely narrow-pool host is rare in practice
-#       (get_rerank_width only bottoms out at 1 under a very tight budget +
-#       slow per-doc cost), so ordinary hosts clear it in a single day.
+#       one judged PAIR per candidate in that row's candidate list: a
+#       reranked row carries every real candidate of its per-message rerank
+#       width (at least `RERANK_MIN_REAL_CANDIDATES` = 5, S5, at most
+#       `relevance.CANDIDATE_POOL`=50); a cosine-scale row (name-recall fix
+#       R2, S60) carries up to 9. 100 rows therefore yield at least 500
+#       pairs from reranked rows, comfortably past "hundreds of pairs" by
+#       inc7's floor-fit time even at the minimum width. The two scales are
+#       sampled separately (S25: `label_calibration_sample`), so each gets
+#       up to this many rows and neither dilutes the other's fit.
 #   (ii) UPPER bound — bounding the local judge's daily compute on the
-#       no-AVX2 potato baseline (spec Section 7): 100 forward passes/day
-#       through a cross-encoder is a bounded, once-daily idle cost, not the
-#       thousands of raw per-turn rows actually logged.
+#       no-AVX2 potato baseline (spec Section 7): 100 rows a day per scale
+#       (at most 200 across the reranked and cosine scales, whose rows
+#       carry at most 50 and 9 candidates) through a cross-encoder is a
+#       bounded, once-daily idle cost, not the thousands of raw per-turn
+#       rows actually logged.
 # Operator-tunable (`calibration.judge_sample_rows`) for a box where either
 # side of this balance needs shifting.
-CALIBRATION_SAMPLE_ROWS: int = tunables.register("calibration.judge_sample_rows", 100)
+CALIBRATION_SAMPLE_ROWS: int = tunables.register(
+    "calibration.judge_sample_rows", 100,
+    description="How many recent recalls the memory judge re-checks each day.",
+)
 
 # Half-width of the self-contained AMBIGUOUS BAND around the judge's own
 # sigmoid decision boundary (p=0.5 — where a sigmoid's classification
@@ -112,7 +117,8 @@ CALIBRATION_SAMPLE_ROWS: int = tunables.register("calibration.judge_sample_rows"
 # region where the judge's own confidence is genuinely lowest.
 # Operator-tunable (`calibration.judge_ambiguous_band_half_width`).
 AMBIGUOUS_BAND_HALF_WIDTH: float = tunables.register(
-    "calibration.judge_ambiguous_band_half_width", 0.05
+    "calibration.judge_ambiguous_band_half_width", 0.05,
+    description="How close to undecided a memory-judge score must be to get a second opinion from Claude.",
 )
 
 
@@ -316,10 +322,9 @@ def _snapshot_complete(snapshot_dir: Path) -> bool:
     revision = snapshot_dir.name
     repo_root = snapshot_dir.parent.parent
     tree_path = repo_root / "trees" / f"{revision}.json"
-    try:
-        manifest = json.loads(tree_path.read_text())
-        files: dict[str, dict[str, Any]] = manifest["files"]
-    except (OSError, ValueError, KeyError):
+    manifest = read_json(tree_path, default=dict, expect=dict)
+    files: dict[str, dict[str, Any]] | None = manifest.get("files")
+    if files is None:  # missing or unreadable manifest (the module warns), or one without a "files" map
         logger.warning(
             "no readable trees/%s.json manifest under %s -- cannot size-verify this "
             "snapshot's completeness, falling back to trusting it (pre-round-3 behavior)",
@@ -345,6 +350,12 @@ def offline_load_kwargs(model_id_or_path: str, cache_dir: str | Path | None) -> 
     """The kwargs to splat into a `CrossEncoder(...)` construction at a judge
     load site (S2/S19, inc5) so a cached model makes ZERO Hugging Face
     requests — not merely "no full download", but no HEAD/GET at all (C3a).
+    (The kwargs alone do not cover one more request: huggingface_hub 1.30.0
+    builds an agent-detecting user agent for every request header set, which
+    does `GET /api/agent-harnesses` when its cached copy is missing or a day
+    old, offline load or not. `brain/__init__.py` switches that off for the
+    whole process by setting `HF_HUB_DISABLE_TELEMETRY` before the library
+    is imported, #554.)
 
     A LOCAL checkpoint directory (a persona's own tuned judge,
     `judge_full_ft.load_full_scorer` / `judge_full_ft.build_full_ft_retrain_
@@ -598,6 +609,13 @@ def _reset_judge_provider_cache() -> None:
         _provider_cache.clear()
 
 
+def _platform() -> str:
+    """Seam for tests: patching ``sys.platform`` globally reaches the stdlib and process-wide caches (#662, #710)."""
+    import sys
+
+    return sys.platform
+
+
 def release_judge() -> None:
     """Release the judge's RAM after a calibration or self-tune job FINISHES
     (S11/S27, inc5; the PAUSE arm is INC-10). Called in the `finally` of
@@ -637,21 +655,21 @@ def release_judge() -> None:
     RSS drops less promptly, not that anything is wrong).
     """
     import gc
-    import sys
 
     with _provider_cache_lock:
         _provider_cache.clear()
 
     gc.collect()
 
-    if sys.platform.startswith("linux"):
+    platform = _platform()
+    if platform.startswith("linux"):
         try:
             import ctypes
 
             ctypes.CDLL("libc.so.6").malloc_trim(0)
         except (OSError, AttributeError):
             logger.warning("release_judge: malloc_trim(0) unavailable on this libc — RSS may drop later")
-    elif sys.platform == "darwin":
+    elif platform == "darwin":
         # macOS analogue of the Linux malloc_trim(0) above: libSystem's
         # malloc zones keep freed pages resident after free(), so after the
         # judge's tensors are dropped RSS can sit well above the pre-load
@@ -710,6 +728,8 @@ def _make_haiku_tiebreak(provider: LLMProvider) -> Callable[[str, str], str | No
             if label not in ("relevant", "irrelevant"):
                 return None
             return label
+        except ThrottleDeferred:
+            raise  # #456/#473: "not now": the calibration job is skipped, the row stays unlabeled
         except Exception:  # noqa: BLE001
             logger.warning("calibration judge: Haiku tie-break failed; keeping local judge's label")
             return None
@@ -797,7 +817,15 @@ def label_calibration_sample(
     if sample_rows is None:
         sample_rows = tunables.get_tunable("calibration.judge_sample_rows", CALIBRATION_SAMPLE_ROWS)
 
-    rows = store.sample_unlabeled_calibration_rows(limit=int(sample_rows))
+    # Name-recall fix R2 (S25): the two score scales are labeled separately,
+    # each with its own `sample_rows` budget, so a busy reranked scale never
+    # starves the cosine scale's daily sample (or the reverse): the cosine
+    # floor is fit from cosine-scale rows only. (Labels themselves are scale-
+    # independent: the judge scores query x document text, not the logged
+    # score.) Rows of any non-cosine scale, legacy 'raw' included, stay in the
+    # first sample exactly as before.
+    rows = store.sample_unlabeled_calibration_rows(limit=int(sample_rows), cosine=False)
+    rows += store.sample_unlabeled_calibration_rows(limit=int(sample_rows), cosine=True)
     if not rows:
         return 0
 
@@ -864,6 +892,8 @@ def label_calibration_sample(
                         haiku_labels.append(haiku_tiebreak(query, mem.content))
                     else:
                         haiku_labels.append(None)
+                except ThrottleDeferred:
+                    raise
                 except Exception:  # noqa: BLE001 — one candidate must not sink the row
                     logger.exception(
                         "calibration judge: candidate %r in row id=%s failed; marking error",
@@ -876,6 +906,8 @@ def label_calibration_sample(
                 row["id"], local_labels, haiku_labels, local_judge_raw_score=raw_scores
             )
             labeled += 1
+        except ThrottleDeferred:
+            raise  # the row is written only once all its candidates are labeled, so it stays unlabeled
         except Exception:  # noqa: BLE001 — one row must not sink the whole pass
             logger.exception(
                 "calibration judge: row id=%s failed; leaving unlabeled for a later tick",

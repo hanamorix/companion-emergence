@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, ubuntu-22.04, windows-2022]  # the release.yml build runners
+        os: [macos-15, ubuntu-22.04, windows-2022]  # the release.yml build runners
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout

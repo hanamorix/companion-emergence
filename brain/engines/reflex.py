@@ -1,23 +1,25 @@
 """Reflex — autonomous emotional-threshold creative expression.
 
-See docs/superpowers/specs/2026-04-24-week-4-reflex-engine-design.md.
+Its design (the 2026-04-24 week-4 reflex design) was never committed and is lost (#797).
 This module ships the types, loaders, and engine scaffold. run_tick
 evaluation + firing logic lands in Task 2.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-from collections import defaultdict
-from collections.abc import Mapping
+import string
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from brain.bridge.provider import LLMProvider
-from brain.emotion.aggregate import aggregate_state
+from brain.emotion import engine
+from brain.emotion.vocabulary import canonical_name, pool_by_canonical_name
+from brain.emotion.vocabulary import get as registered_emotion
+from brain.health.json_io import Recovery, read_json, read_json_result, write_json
 from brain.memory.store import Memory, MemoryStore
 from brain.utils.emotion import format_emotion_summary
 from brain.utils.memory import days_since_human
@@ -29,6 +31,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _ALLOWED_CREATED_BY = ("og_migration", "brain_emergence", "user_authored")
+
+# How many of the newest active memories an arc prompt's `memory_summary` prints. The tick loads exactly this many
+# rows, and `_format_memory_summary` keeps exactly this many.
+_MEMORY_SUMMARY_COUNT = 3
 
 
 # ---------- Types ----------
@@ -69,7 +75,10 @@ class ReflexArc:
         trigger_raw = data["trigger"]
         if not isinstance(trigger_raw, dict) or not trigger_raw:
             raise ValueError(f"ReflexArc {data.get('name')!r}: trigger must be non-empty dict")
-        trigger = {str(k): float(v) for k, v in trigger_raw.items()}
+        # Keys are canonical emotion names, the key space of the engine's read. Two spellings of one
+        # emotion keep the higher threshold: every threshold must be met, so "above both" is "above the higher".
+        # Only this in-memory arc is canonical; the file it was read from is not rewritten.
+        trigger = pool_by_canonical_name({str(k): float(v) for k, v in trigger_raw.items()})
 
         created_by = data.get("created_by", "og_migration")
         if created_by not in _ALLOWED_CREATED_BY:
@@ -145,7 +154,9 @@ class ArcSkipped:
     """Record of one arc evaluated-but-not-fired."""
 
     arc_name: str
-    reason: str  # trigger_not_met | days_since_human_too_low | cooldown_active | single_fire_cap | no_arcs_defined
+    # trigger_not_met | days_since_human_too_low | cooldown_active | single_fire_cap | no_arcs_defined
+    # | template_emotion_absent (the prompt template names an emotion with no value)
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -180,10 +191,9 @@ class ReflexArcSet:
             reset to default_path content.
           - Per-arc validation failures skip that arc, log warning, keep others.
         """
-        from brain.health.attempt_heal import attempt_heal
-
         def _default_factory() -> dict:
-            return json.loads(default_path.read_text(encoding="utf-8"))
+            # The bundled default: an absent or corrupt package file is an install bug, so it raises.
+            return read_json(default_path, recover=Recovery.RAISE)
 
         def _schema_validator(data: object) -> None:
             if (
@@ -201,7 +211,10 @@ class ReflexArcSet:
             data = _default_factory()
             anomaly = None
         else:
-            data, anomaly = attempt_heal(path, _default_factory, schema_validator=_schema_validator)
+            _res = read_json_result(
+                path, default=_default_factory, recover=Recovery.HEAL, validate=_schema_validator
+            )
+            data, anomaly = _res.data, _res.anomaly
 
         arcs: list[ReflexArc] = []
         for raw in data.get("arcs", []):
@@ -232,7 +245,7 @@ class ReflexLog:
 
     Stored as a single JSON object ``{"version": 1, "fires": [...]}`` —
     atomic-rewrite, not append-only JSONL.  Corruption recovery delegates
-    to ``attempt_heal`` + ``.bak`` rotation; ``save_with_backup`` keeps up
+    to ``read_json_result`` (HEAL) + ``.bak`` rotation; ``write_json`` keeps up
     to three rolling backups for the adaptive-treatment layer.
     """
 
@@ -241,8 +254,6 @@ class ReflexLog:
     @classmethod
     def load(cls, path: Path) -> ReflexLog:
         """Load the log; heal from .bak rotation if corrupt, log WARNING."""
-        from brain.health.attempt_heal import attempt_heal
-
         def _default_factory() -> dict:
             return {"version": 1, "fires": []}
 
@@ -250,7 +261,8 @@ class ReflexLog:
             if not isinstance(data, dict) or not isinstance(data.get("fires"), list):
                 raise ValueError("reflex log schema invalid: missing 'fires' list")
 
-        data, anomaly = attempt_heal(path, _default_factory, schema_validator=_schema_validator)
+        _res = read_json_result(path, default=_default_factory, recover=Recovery.HEAL, validate=_schema_validator)
+        data, anomaly = _res.data, _res.anomaly
         if anomaly is not None:
             logger.warning(
                 "ReflexLog anomaly detected: %s action=%s file=%s",
@@ -263,16 +275,14 @@ class ReflexLog:
         return cls(fires=fires)
 
     def save(self, path: Path) -> None:
-        """Atomic save via .bak rotation (save_with_backup)."""
+        """Atomic save via .bak rotation (write_json)."""
         from brain.health.adaptive import compute_treatment
-        from brain.health.attempt_heal import save_with_backup
-
         payload = {
             "version": 1,
             "fires": [f.to_dict() for f in self.fires],
         }
         treatment = compute_treatment(path.parent, path.name)
-        save_with_backup(path, payload, backup_count=treatment.backup_count)
+        write_json(path, payload, backups=treatment.backup_count)
 
     def last_fire_for_arc(self, arc_name: str) -> datetime | None:
         """Return the most recent fired_at for the given arc, or None."""
@@ -320,15 +330,24 @@ class ReflexEngine:
                 evaluated_at=now,
             )
 
-        all_mems = self.store.list_active(limit=None)
-        state = aggregate_state(all_mems)
+        live_engine = engine.engine_for(self.log_path.parent)
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+        # pending or retrying, read() returns nothing and no arc fires.
+        emotions = engine.short_values(live_engine.read())
         # log_path lives at the persona dir root, so its parent IS the
         # persona dir — same pattern used at line 450 below for prompt
-        # composition. Passing it lets days_since_human see active
-        # session JSONL buffers (the freshest user-contact signal).
-        days_since = days_since_human(self.store, now, persona_dir=self.log_path.parent)
+        # composition. days_since_human reads the user's last turn from the
+        # conversation files under it (the later of the active buffers and the archive).
+        days_since = days_since_human(now, persona_dir=self.log_path.parent)
 
-        eligible, skipped = self._evaluate(arc_set.arcs, state.emotions, days_since, log, now)
+        eligible, skipped = self._evaluate(
+            arc_set.arcs,
+            emotions,
+            days_since,
+            log,
+            now,
+            feels_high=live_engine.feels_high,
+        )
 
         if not eligible:
             return ReflexResult(
@@ -339,7 +358,7 @@ class ReflexEngine:
                 evaluated_at=now,
             )
 
-        winner = self._rank(eligible, state.emotions, log, now)
+        winner = self._rank(eligible, emotions, log, now)
         losers = [a for a in eligible if a.name != winner.name]
         skipped.extend(ArcSkipped(arc_name=a.name, reason="single_fire_cap") for a in losers)
 
@@ -366,7 +385,9 @@ class ReflexEngine:
                     evaluated_at=now,
                 )
 
-            fire = self._fire(winner, state.emotions, days_since, all_mems, now)
+            # Only the rows the prompt prints, and only now that a prompt is about to be rendered.
+            recent_memories = self.store.list_active(limit=_MEMORY_SUMMARY_COUNT)
+            fire = self._fire(winner, emotions, days_since, recent_memories, now)
             new_log = log.appended(fire)
             new_log.save(self.log_path)
 
@@ -385,13 +406,24 @@ class ReflexEngine:
         days_since_human: float,
         log: ReflexLog,
         now: datetime,
+        *,
+        feels_high: Callable[[str], bool],
     ) -> tuple[list[ReflexArc], list[ArcSkipped]]:
         eligible: list[ReflexArc] = []
         skipped: list[ArcSkipped] = []
 
         for arc in arcs:
-            if not _trigger_met(arc, emotions):
+            if not _trigger_met(arc, emotions, feels_high=feels_high):
                 skipped.append(ArcSkipped(arc_name=arc.name, reason="trigger_not_met"))
+                continue
+            absent = _template_emotions_absent(arc, emotions)
+            if absent:
+                logger.debug(
+                    "reflex arc %s does not fire: its template names emotions with no value: %s",
+                    arc.name,
+                    ", ".join(absent),
+                )
+                skipped.append(ArcSkipped(arc_name=arc.name, reason="template_emotion_absent"))
                 continue
             if days_since_human < arc.days_since_human_min:
                 skipped.append(ArcSkipped(arc_name=arc.name, reason="days_since_human_too_low"))
@@ -413,10 +445,15 @@ class ReflexEngine:
         log: ReflexLog,
         now: datetime,
     ) -> ReflexArc:
-        """Highest aggregate threshold-excess wins; ties broken by longest-since-fire."""
+        """Highest aggregate threshold-excess wins; ties broken by longest-since-fire.
+
+        The sum of each trigger emotion's value minus the arc's own threshold. The thresholds are used only to order
+        eligible arcs; what makes an arc eligible is `engine.feels_high`, and every trigger emotion of an eligible
+        arc is present in `emotions`.
+        """
 
         def key(arc: ReflexArc) -> tuple[float, float]:
-            excess = sum(emotions.get(e, 0.0) - t for e, t in arc.trigger.items())
+            excess = sum(emotions[e] - t for e, t in arc.trigger.items())
             last = log.last_fire_for_arc(arc.name)
             seconds_since = (now - last).total_seconds() if last is not None else float("inf")
             return (excess, seconds_since)
@@ -428,24 +465,22 @@ class ReflexEngine:
         arc: ReflexArc,
         emotions: Mapping[str, float],
         days_since_human: float,
-        all_mems: list,
+        recent_memories: list,
         now: datetime,
         *,
         dry_run: bool = False,
     ) -> ArcFire:
         """Render prompt → call LLM → write memory → return ArcFire."""
-        context: dict = defaultdict(lambda: "0")
+        context = _PromptContext(emotions)
         context["persona_name"] = self.persona_name
         context["days_since_human"] = f"{days_since_human:.1f}"
         context["emotion_summary"] = format_emotion_summary(emotions)
-        context["memory_summary"] = _format_memory_summary(all_mems)
-        for name, value in emotions.items():
-            context[name] = f"{value:.1f}"
+        context["memory_summary"] = _format_memory_summary(recent_memories)
 
         prompt = arc.prompt_template.format_map(context)
         raw = self.provider.generate(prompt, system=self.persona_system_prompt)
 
-        trigger_state = {e: emotions.get(e, 0.0) for e in arc.trigger}
+        trigger_state = {e: emotions[e] for e in arc.trigger}
 
         # P3 retention rework, Change 1: reflex arc output is reflexive
         # self-behavior with moderate retention value, not the ~0.0 the
@@ -513,15 +548,65 @@ class ReflexEngine:
         )
 
 
-def _trigger_met(arc: ReflexArc, emotions: Mapping[str, float]) -> bool:
-    for name, threshold in arc.trigger.items():
-        if emotions.get(name, 0.0) < threshold:
+class _PromptContext(dict):
+    """Format context for an arc's prompt template.
+
+    A placeholder naming an emotion resolves by canonical name, so ``{comfort-seeking}`` reads the
+    ``comfort_seeking`` channel of the engine's read; any other missing placeholder renders "0".
+    """
+
+    def __init__(self, emotions: Mapping[str, float]) -> None:
+        super().__init__()
+        self._emotion_text = {
+            name: f"{value:.1f}" for name, value in pool_by_canonical_name(emotions).items()
+        }
+
+    def __missing__(self, key: str) -> str:
+        return self._emotion_text.get(canonical_name(key), "0")
+
+
+def _trigger_met(
+    arc: ReflexArc,
+    emotions: Mapping[str, float],
+    *,
+    feels_high: Callable[[str], bool],
+) -> bool:
+    """Whether every emotion the arc's trigger names is present in `emotions` and high by `feels_high`
+    (`engine.feels_high`); the arc's threshold numbers are not compared."""
+    for name in arc.trigger:
+        # Accepted edge: a hand-edited arc with a threshold of 0 or below used to fire on a missing emotion because
+        # a missing value read as 0.0. A missing emotion fails the trigger, so such an arc waits
+        # until the emotion has a value and is high. The crystallizer refuses thresholds below 5.0, so only
+        # hand-edited arc files are affected.
+        if name not in emotions or not feels_high(name):
             return False
     return True
 
 
+def _template_emotions_absent(arc: ReflexArc, emotions: Mapping[str, float]) -> list[str]:
+    """The emotions the arc's prompt template names that have no value in `emotions`.
+
+    A placeholder names an emotion when its canonical name is in the vocabulary registry, the test `read()` applies.
+    It has a value when the pooled emotions hold that canonical name, which is the lookup `_PromptContext` renders by,
+    so `{Love}` while `love` is present has a value. Other placeholders are not looked at: they render "0".
+    A template that does not parse names no emotion here; it fails where it fails today, at `format_map`.
+    """
+    try:
+        fields = [f for _, f, _, _ in string.Formatter().parse(arc.prompt_template) if f]
+    except ValueError:
+        return []
+    pooled = pool_by_canonical_name(emotions)
+    absent: list[str] = []
+    for placeholder in fields:
+        name = placeholder.split(".")[0].split("[")[0]
+        canonical = canonical_name(name)
+        if registered_emotion(canonical) is not None and canonical not in pooled:
+            absent.append(canonical)
+    return absent
+
+
 def _format_memory_summary(memories: list) -> str:
-    top = list(memories)[:3]
+    top = list(memories)[:_MEMORY_SUMMARY_COUNT]
     return "\n".join(f"- {m.content[:140]}" for m in top)
 
 

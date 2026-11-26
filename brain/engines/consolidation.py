@@ -25,32 +25,64 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 
 from brain import prompt_strings
+from brain.bridge.cli_throttle import ThrottleDeferred
+from brain.dev_constants import MONOLOGUE_MERGE_TYPES
+from brain.emotion import engine
+from brain.emotion.vocabulary import canonical_name
+from brain.health.json_io import append_jsonl
 from brain.memory import embeddings as embeddings_mod
 from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
 from brain.memory.hebbian import HebbianMatrix
-from brain.memory.pending import SALIENCE_ELIGIBLE_TYPES, PendingQueue
+from brain.memory.known_names import (
+    admit_names,
+    listed_display_forms,
+    load_known_names,
+    match_known_names,
+    normalize_name,
+    remove_names,
+)
+from brain.memory.pending import SALIENCE_ELIGIBLE_TYPES, ClaimedBatch, PendingQueue
 from brain.memory.semantic_recall import build_semantic_candidate_pool
 from brain.memory.store import Memory, MemoryStore, clamp_importance
+from brain.utils.failure_scope import ServiceCallFailed, settle_scope
 from brain.utils.file_lock import file_lock
+from brain.utils.llm_output import find_json_object_block
 
 logger = logging.getLogger(__name__)
 
 # Text externalized to prompt_strings.toml [engines.consolidation] (issue #129 stage 2c).
 _REAPPRAISER_PROMPT = prompt_strings.register("engines.consolidation.reappraiser_prompt")
 _CLASSIFIER_PROMPT = prompt_strings.register("engines.consolidation.classifier_prompt")
+# The user-message templates (name-recall fix, names increment: S106 fences, S107,
+# S136 one <existing> fence per EXISTING memory). Filled with str.format; memory
+# text is an argument, so braces inside it are inert.
+_CLASSIFIER_USER_TEMPLATE = prompt_strings.register(
+    "engines.consolidation.classifier_user_template"
+)
+_CLASSIFIER_EXISTING_ITEM_TEMPLATE = prompt_strings.register(
+    "engines.consolidation.classifier_existing_item_template"
+)
+_REAPPRAISER_USER_TEMPLATE = prompt_strings.register(
+    "engines.consolidation.reappraiser_user_template"
+)
 
 _GATE_LOCK_FILENAME = "consolidation_gate"  # file_lock adds the .lock sidecar
+# Never rotate or truncate the archive: the forgetting exemption (brain/soul/candidates.py::merge_target_map) reads it
+# to protect merge targets (#430). Canary: test_supervisor.py::test_consolidation_archive_is_never_rotated.
 _ARCHIVE_FILENAME = "consolidation_archive.jsonl"
+_QUARANTINE_FILENAME = "consolidation_quarantine.jsonl"
 
 ASSOC_WEIGHT = 5.0  # hebbian edge weight for corrections/continuations (tune via L-B)
 
@@ -68,20 +100,58 @@ class Decision:
     merged_content: for a merge, the classifier's surgical-edit result; when
         absent the gate applies a conservative loss-free fold (append the new
         fact) so both facts survive.
+    names: names / proper nouns the judge found in the CANDIDATE text (spec §5,
+        "Names are added three ways", item 1). Written to the known-names list by
+        `_dispatch` for every verdict except "duplicate" (on "merge" too, from the
+        candidate text). Empty when the judge returned none or its `names` field
+        was absent or malformed (a malformed VALUE never costs the verdict). A reply with
+        no usable verdict at all (not JSON, no object, a verdict that is missing or outside
+        `VERDICTS`) never reaches a Decision: the gate quarantines the candidate
+        (`UnusableClassifierReply`) and promotes nothing unclassified.
     """
 
     verdict: str
     target_id: str | None = None
     merged_content: str | None = None
+    names: tuple[str, ...] = ()
 
 
 Classifier = Callable[[Memory, list[Memory]], Decision]
 
+
+class UnusableClassifierReply(Exception):  # noqa: N818 — a classification of a failure, not an error name
+    """The classifier ANSWERED but gave no usable verdict (empty, no JSON object, malformed or non-object JSON, a verdict
+    outside the allowed set or missing).
+
+    That depends on this candidate's exchange, not on the store or the service, so it is an ITEM failure: the gate
+    quarantines the candidate with ``reply`` as evidence (the raw reply, kept out of the log) and never promotes it
+    unclassified. ``failure_scope`` reads it as "item" because it is an unknown type.
+    """
+
+    def __init__(self, reason: str, reply: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.reply = reply
+
+
+class Reappraisal(NamedTuple):
+    """What a Reappraiser returns for one memory: a fresh importance, the names /
+    proper nouns it found in the memory's text (spec §5, item 2), and the listed
+    names it was shown (KNOWN NAMES) that it judges are not names (``not_names``,
+    S105, S107)."""
+
+    importance: float
+    names: tuple[str, ...] = ()
+    not_names: tuple[str, ...] = ()
+
+
 # P3 retention rework, Change 3: importance re-rating on recall, via the
-# pending queue. A Reappraiser judges a fresh importance for an EXISTING
-# memory (not a Pass-2 candidate decision) — same injectable-seam shape as
-# Classifier, so tests pass a fake returning a known value.
-Reappraiser = Callable[[Memory], float]
+# pending queue. A Reappraiser judges a fresh importance (and finds names) for
+# an EXISTING memory (not a Pass-2 candidate decision) — same injectable-seam
+# shape as Classifier, so tests pass a fake returning a known value. Since the
+# name-recall fix it returns `Reappraisal(importance, names)`, no longer a bare
+# number.
+Reappraiser = Callable[[Memory], Reappraisal]
 
 
 @dataclass
@@ -97,6 +167,8 @@ class ConsolidationResult:
     continuations: int = 0
     deferred: int = 0
     reappraised: int = 0
+    failed: int = 0  # items whose work raised (requeued, quarantined or already saved), #459
+    quarantined: int = 0  # of those, the ones set aside in the quarantine file
 
     def as_log(self) -> dict:
         return {
@@ -111,12 +183,31 @@ class ConsolidationResult:
             "deferred": self.deferred,
             "reappraised": self.reappraised,
             "skipped": self.skipped,
+            "failed": self.failed,
+            "quarantined": self.quarantined,
         }
 
 
 def _normalize(text: str) -> str:
     """Whitespace-collapse + casefold — the exact-repeat equivalence key."""
     return re.sub(r"\s+", " ", text or "").strip().casefold()
+
+
+def merge_type(memory_type: str) -> str:
+    """The type a memory counts as when deciding whether two memories may merge (#619): its own ``memory_type``, except that
+    the three monologue types (``MONOLOGUE_MERGE_TYPES``) are one type. The label returned for them is ``"monologue"``."""
+    return "monologue" if memory_type in MONOLOGUE_MERGE_TYPES else memory_type
+
+
+def matchable_types(memory_type: str) -> frozenset[str]:
+    """The ``memory_type`` values of the existing rows a candidate of ``memory_type`` may match, merge into or be dropped as
+    an exact duplicate of: its own merge type (all three monologue types for a monologue one), and for an ``observation``
+    also ``fact`` (an observation can become a fact, never the reverse; owner S9)."""
+    if memory_type in MONOLOGUE_MERGE_TYPES:
+        return MONOLOGUE_MERGE_TYPES
+    if memory_type == "observation":
+        return frozenset({"observation", "fact"})
+    return frozenset({memory_type})
 
 
 def _promote_all_classifier(_cand: Memory, _context: list[Memory]) -> Decision:
@@ -143,7 +234,16 @@ def run_consolidation(
     """Drain the pending queue and consolidate, under a non-blocking gate lock.
 
     Returns a ConsolidationResult; ``skipped=True`` when a concurrent gate holds
-    the lock. Does not raise on a bad candidate (skips it).
+    the lock. Does not raise on a bad candidate: the batch is CLAIMED (kept in a
+    processing file until each item is settled), and an item whose work raises is
+    requeued (the failure depends on the store or filesystem; the pass then ends and
+    the rest wait for the next run), quarantined in ``consolidation_quarantine.jsonl``
+    (it would fail the same way again), or left alone (already saved). A deferred
+    Claude call (expired login) means "not now": nothing is promoted unclassified, the
+    item and the rest stay for the next run. A run killed midway is recovered by the
+    next one. A classifier reply with no usable verdict quarantines the candidate (with
+    the raw reply as evidence) instead of promoting it. ``result.failed`` /
+    ``result.quarantined`` count them.
 
     reappraiser: Change 3's injectable importance re-appraiser. None (default)
         builds the Haiku-backed default when `provider` is given, else
@@ -167,7 +267,11 @@ def run_consolidation(
                 )
                 classifier = _promote_all_classifier
         if reappraiser is None:
-            reappraiser = _make_haiku_reappraiser(provider) if provider is not None else _noop_reappraiser
+            reappraiser = (
+                _make_haiku_reappraiser(provider, persona_dir)
+                if provider is not None
+                else _noop_reappraiser
+            )
         result = _run_locked(store, persona_dir, classifier, hebbian, salience_floor, reappraiser)
     logger.info("consolidation gate run: %s", json.dumps(result.as_log()))
     return result
@@ -186,7 +290,10 @@ def _run_locked(
     reappraiser: Reappraiser | None = None,
 ) -> ConsolidationResult:
     pending = PendingQueue(persona_dir)
-    batch = pending.drain()
+    # Claimed, not drained: the batch stays in a processing file until each item is settled, so an exception or a kill
+    # during the slow per-item work below cannot lose it (#459).
+    claim = pending.claim()
+    batch = claim.entries
 
     # Change 3: split out existing-memory re-appraise items BEFORE the normal
     # Pass-1/Pass-2 candidate pipeline — they are not candidates (no dedup,
@@ -197,59 +304,237 @@ def _run_locked(
     candidate_entries = [e for e in batch if not _is_reappraise_item(e)]
 
     result = ConsolidationResult(batch=len(candidate_entries))
-    if reappraise_entries:
-        _handle_reappraisals(store, reappraise_entries, reappraiser or _noop_reappraiser, result)
+    if reappraise_entries and _handle_reappraisals(
+        store, persona_dir, pending, claim, reappraise_entries, reappraiser or _noop_reappraiser, result
+    ):
+        claim.close()
+        return result
     if not candidate_entries:
+        claim.close()
         return result
 
-    candidates: list[Memory] = []
+    candidates: list[tuple[dict, Memory]] = []
     for entry in candidate_entries:
         try:
-            candidates.append(Memory.from_dict(entry))
+            candidates.append((entry, Memory.from_dict(entry)))
         except (KeyError, ValueError, TypeError):
             logger.warning("consolidation gate: dropping unparseable candidate")
+            claim.settle(entry)  # a deliberate drop (#432), not a failure
 
     # --- Pass 1: exact-dup + (scoped) salience; cluster is implicit per-candidate.
-    survivors: list[Memory] = []
-    seen_norm: set[str] = set()
-    for cand in candidates:
-        norm = _normalize(cand.content)
-        if norm and norm in seen_norm:  # within-batch exact repeat
-            result.exact_dropped += 1
-            continue
-        if norm and _has_exact_existing(store, cand.content, norm):
-            result.exact_dropped += 1
-            seen_norm.add(norm)
-            continue
-        if (
-            salience_floor is not None
-            and cand.memory_type in SALIENCE_ELIGIBLE_TYPES
-            and float(cand.importance) < salience_floor
-        ):
-            result.salience_dropped += 1
-            continue
-        if norm:
-            seen_norm.add(norm)
-        survivors.append(cand)
+    survivors: list[tuple[dict, Memory]] = []
+    # Seen texts, keyed by normalized text and merge type: a repeat is a repeat only of a memory this candidate may match (#619).
+    seen_norm: set[tuple[str, str]] = set()
+    ended = False
+    for entry, cand in candidates:
+        try:
+            norm = _normalize(cand.content)
+            may_match = matchable_types(cand.memory_type)
+            own_key = (norm, merge_type(cand.memory_type))
+            if norm and any((norm, merge_type(t)) in seen_norm for t in may_match):  # within-batch exact repeat
+                result.exact_dropped += 1
+                claim.settle(entry)
+                continue
+            if norm and _has_exact_existing(store, cand.content, norm, memory_types=may_match):
+                result.exact_dropped += 1
+                seen_norm.add(own_key)
+                claim.settle(entry)
+                continue
+            if (
+                salience_floor is not None
+                and cand.memory_type in SALIENCE_ELIGIBLE_TYPES
+                and float(cand.importance) < salience_floor
+            ):
+                result.salience_dropped += 1
+                claim.settle(entry)
+                continue
+            if norm:
+                seen_norm.add(own_key)
+            survivors.append((entry, cand))
+        except Exception as exc:  # noqa: BLE001 — settled per item; never ends the loop with items undone
+            if _settle_failed_item(store, pending, persona_dir, claim, entry, cand, "pass1", exc, result):
+                ended = True
+                break
 
     # --- Pass 2: per-candidate decision against related existing memories.
-    for cand in survivors:
-        # F1 #259 F3: embed the candidate ONCE, here, before the judge runs
-        # (one step earlier than the old "embed at promotion" timing) — the
-        # vector feeds the cosine `_related_existing` retrieval below AND is
-        # reused (never recomputed) at promotion in `_dispatch`. None on a
-        # provider failure (fail-soft): `_related_existing` degrades to its
-        # lexical fallback and `_dispatch` degrades to its own `embed_row`
-        # compute, exactly matching pre-F3 behavior for that one candidate.
-        embedded = _embed_candidate(cand.content)
-        context = _related_existing(store, cand, embedded)
+    for entry, cand in [] if ended else survivors:
+        decision: Decision | None = None
         try:
-            decision = classifier(cand, context)
-        except Exception:  # noqa: BLE001 — a classifier fault must not lose the batch
-            logger.exception("consolidation gate: classifier raised; promoting candidate")
-            decision = Decision("new")
-        _dispatch(store, pending, hebbian, persona_dir, cand, decision, result, embedded)
+            # F1 #259 F3: embed the candidate ONCE, here, before the judge runs
+            # (one step earlier than the old "embed at promotion" timing) — the
+            # vector feeds the cosine `_related_existing` retrieval below AND is
+            # reused (never recomputed) at promotion in `_dispatch`. None on a
+            # provider failure (fail-soft): `_related_existing` degrades to its
+            # lexical fallback and `_dispatch` degrades to its own `embed_row`
+            # compute, exactly matching pre-F3 behavior for that one candidate.
+            embedded = _embed_candidate(cand.content)
+            context = _related_existing(store, cand, embedded)
+            try:
+                decision = classifier(cand, context)
+            except ThrottleDeferred:
+                raise  # "not now" (expired login, shutdown): never promote an unclassified candidate (#473)
+            except UnusableClassifierReply:
+                raise  # it answered, with nothing usable: an ITEM failure, quarantined by the settle path
+            except Exception as call_exc:
+                # The classifier call failed for ANY reason (the one call let through during an expired login, a CLI error, a
+                # timeout): the candidate was not classified, so it is NOT promoted. It is kept for a later run and the pass
+                # ends (one call per tick). A reply that arrives but gives no usable verdict never gets here: it is
+                # `UnusableClassifierReply`, re-raised above, and the candidate is quarantined.
+                raise ServiceCallFailed(f"classifier call failed: {type(call_exc).__name__}: {call_exc}") from call_exc
+            decision = _clean_decision(decision)
+            _dispatch(store, pending, hebbian, persona_dir, cand, decision, result, embedded)
+            claim.settle(entry)
+        except Exception as exc:  # noqa: BLE001 — settled per item; never ends the loop with items undone
+            # The decision's target is named in the log so a link lost to a failed post-save step can be rebuilt.
+            target = f" target_id={decision.target_id}" if decision is not None and decision.target_id else ""
+            if _settle_failed_item(store, pending, persona_dir, claim, entry, cand, "pass2", exc, result, target):
+                break
+    claim.close()
     return result
+
+
+def _clean_decision(decision: Decision) -> Decision:
+    """The Decision with its model-derived ids and text checked before they reach SQLite.
+
+    ``target_id`` and ``merged_content`` come from arbitrary model JSON (the Haiku classifier reads them with ``data.get``). A
+    list or dict ``target_id``, or a non-string ``merged_content``, would be bound as an SQL parameter and raise, and one
+    stochastic reply would then put a good candidate in quarantine. ``None`` already means "defer" (no target) or "fold"
+    (no merged text), so a bad value becomes ``None``.
+    """
+    target = decision.target_id if isinstance(decision.target_id, str) and decision.target_id else None
+    merged = decision.merged_content if isinstance(decision.merged_content, str) else None
+    if target == decision.target_id and merged == decision.merged_content:
+        return decision
+    return replace(decision, target_id=target, merged_content=merged)
+
+
+def _saved_state(store: MemoryStore, cand: Memory) -> tuple[str, Memory] | None:
+    """Is ``cand`` already a row? ``("saved", row)``, ``("conflict", row)`` or None (no row, or the probe itself failed).
+
+    Candidate ids are uuid4, so a row with the same id is a prior save of this candidate. It is SAVED when the row's
+    normalized content equals the candidate's, equals the row's ``content_snapshot`` (a faded row keeps the original
+    there) or contains it (a merged row, the ``_fold`` rule). A same-id row matching none of those is a CONFLICT.
+    """
+    try:
+        row = store.get(cand.id, bump=False)
+    except Exception as exc:  # noqa: BLE001 — a failing probe means "not saved"; the classification goes on
+        logger.warning(
+            "consolidation gate: could not check whether candidate id=%s was saved (%s: %s); treating it as not saved",
+            cand.id, type(exc).__name__, exc,
+        )
+        return None
+    if row is None:
+        return None
+    cand_norm = _normalize(cand.content)
+    row_norm = _normalize(row.content)
+    snapshot_norm = _normalize(row.content_snapshot or "")
+    if cand_norm == row_norm or (snapshot_norm and cand_norm == snapshot_norm) or (cand_norm and cand_norm in row_norm):
+        return "saved", row
+    return "conflict", row
+
+
+def _quarantine(
+    persona_dir: Path, entry: dict, stage: str, exc: BaseException, existing: Memory | None = None
+) -> None:
+    """Append ``entry`` to the quarantine file with the error as evidence. Raises if the append fails."""
+    record: dict = {
+        "quarantined_at": datetime.now(UTC).isoformat(),
+        "stage": stage,
+        "error": f"{type(exc).__name__}: {str(exc)[:500]}",
+        "entry": {k: v for k, v in entry.items() if k != "_claim_id"},
+    }
+    if existing is not None:
+        record["existing_content"] = existing.content
+    reply = getattr(exc, "reply", None)
+    if isinstance(reply, str):
+        record["reply"] = reply  # the classifier's raw reply, as evidence (an unusable reply)
+    append_jsonl(persona_dir / _QUARANTINE_FILENAME, record, nonfinite="null")
+
+
+def _item_label(entry: dict, cand: Memory | None) -> str:
+    return f"id={cand.id} type={cand.memory_type}" if cand is not None else f"memory_id={entry.get('memory_id')}"
+
+
+def _settle_failed_item(
+    store: MemoryStore,
+    pending: PendingQueue,
+    persona_dir: Path,
+    claim: ClaimedBatch,
+    entry: dict,
+    cand: Memory | None,
+    stage: str,
+    exc: Exception,
+    result: ConsolidationResult,
+    detail: str = "",
+) -> bool:
+    """Decide what happens to an item whose work raised. Returns True to END the pass. Total: never raises.
+
+    If settling itself fails (the quarantine file cannot be written, the requeue fails, anything), the entry is left
+    UNSETTLED, so it stays in the processing file and the next run retries it; one ERROR says so, and the pass ends.
+    """
+    try:
+        return _settle_failed_item_inner(store, pending, persona_dir, claim, entry, cand, stage, exc, result, detail)
+    except Exception:  # noqa: BLE001 — total by design: the loop must never end with items undone
+        logger.exception(
+            "consolidation gate: could not settle a failed item (%s) after %s: %s; leaving it for the next run",
+            _item_label(entry, cand), type(exc).__name__, str(exc)[:200],
+        )
+        return True
+
+
+def _settle_failed_item_inner(
+    store: MemoryStore,
+    pending: PendingQueue,
+    persona_dir: Path,
+    claim: ClaimedBatch,
+    entry: dict,
+    cand: Memory | None,
+    stage: str,
+    exc: Exception,
+    result: ConsolidationResult,
+    detail: str = "",
+) -> bool:
+    label = _item_label(entry, cand) + detail
+    if isinstance(exc, ThrottleDeferred):
+        # "not now": not a failure. The item and the rest of the batch stay in the processing file; the next run retries.
+        logger.info("consolidation gate: Claude call deferred (%s); leaving %s and the rest for the next run", exc, label)
+        return True
+    result.failed += 1
+    existing: Memory | None = None
+    if cand is not None:
+        probe = _saved_state(store, cand)
+        if probe is not None and probe[0] == "saved":
+            # A step AFTER the save failed (an edge weight, say): the candidate is a row, nothing is requeued or quarantined.
+            logger.warning(
+                "consolidation gate: %s was saved but a later step failed (%s: %s); not requeued", label, type(exc).__name__, exc
+            )
+            claim.settle(entry)
+            return False
+        if probe is not None:
+            existing = probe[1]
+    scope = "item" if existing is not None else settle_scope(exc, store)
+    if scope == "item":
+        _quarantine(persona_dir, entry, stage, exc, existing)
+        logger.error(
+            "consolidation gate: %s quarantined (%s: %s)", label, type(exc).__name__, str(exc)[:200], exc_info=exc
+        )
+        result.quarantined += 1
+        claim.settle(entry)
+        return False
+    # environment: keep it for later and end the pass (the rest stay in the processing file).
+    source = entry.get("_source") or "gate-retry"
+    if cand is not None:
+        # Rebuilt from the ORIGINAL entry, not `cand`: `_dispatch` may already have changed the in-memory candidate (a
+        # `correction_of` set before the failed `store.create`), and the next run must judge it afresh (#470 review).
+        pending.enqueue(Memory.from_dict(entry), source=source)
+    else:
+        pending.enqueue_reappraisal(str(entry.get("memory_id")), source=source)
+    logger.warning(
+        "consolidation gate: %s requeued after an environment failure (%s: %s); ending this pass",
+        label, type(exc).__name__, str(exc)[:200],
+    )
+    claim.settle(entry)
+    return True
 
 
 def _embed_candidate(content: str) -> tuple[np.ndarray, str] | None:
@@ -281,17 +566,18 @@ def _embed_candidate(content: str) -> tuple[np.ndarray, str] | None:
         return None
 
 
-def _has_exact_existing(store: MemoryStore, content: str, norm: str) -> bool:
-    """True if a memories.db row is exact-identical (normalized) to `content`.
+def _has_exact_existing(store: MemoryStore, content: str, norm: str, *, memory_types: frozenset[str]) -> bool:
+    """True if a memories.db row of one of `memory_types` is exact-identical (normalized) to `content`.
 
     Non-recall-bumping (``bump=False``). Uses a content snippet as the LIKE
-    probe, then confirms full normalized equality.
+    probe, then confirms full normalized equality. Only rows of the types the
+    candidate may match are searched, so another type's row never counts (#619).
     """
     snippet = content.strip()[:200]
     if not snippet:
         return False
     try:
-        hits = store.search_text(snippet, active_only=True, limit=20, bump=False)
+        hits = store.search_text(snippet, active_only=True, limit=20, bump=False, memory_types=memory_types)
     except ValueError:
         return False
     return any(_normalize(h.content) == norm for h in hits)
@@ -322,13 +608,19 @@ def _related_existing(
     (`embedded is None`), the warm matrix is cold / holds no active
     embedded rows yet (empty candidate pool — same "graceful warm-up"
     degrade `build_semantic_candidate_pool`'s other callers already have),
-    or the cosine retrieval itself raises. Read-only, non-bumping — Pass-2
+    the pool holds no row of a type the candidate may match, or the cosine
+    retrieval itself raises. Read-only, non-bumping — Pass-2
     context, not recall.
+
+    Only existing memories of the types the candidate may match
+    (`matchable_types`) are returned, on both paths, filtered before the
+    `limit` cut: the judge is never shown a row it may not merge into (#619).
     """
+    may_match = matchable_types(cand.memory_type)
     if embedded is not None:
         cand_vec, _model_id = embedded
         try:
-            hits = _related_existing_cosine(store, cand_vec, limit=limit)
+            hits = _related_existing_cosine(store, cand_vec, limit=limit, memory_types=may_match)
             if hits:
                 return hits
         except Exception:  # noqa: BLE001 — degrade to lexical, never lose Pass-2 context
@@ -337,31 +629,38 @@ def _related_existing(
                 "falling back to lexical token-overlap",
                 exc_info=True,
             )
-    return _related_existing_lexical(store, cand, limit=limit)
+    return _related_existing_lexical(store, cand, limit=limit, memory_types=may_match)
 
 
 def _related_existing_cosine(
-    store: MemoryStore, cand_vec: np.ndarray, *, limit: int
+    store: MemoryStore, cand_vec: np.ndarray, *, limit: int, memory_types: frozenset[str]
 ) -> list[Memory]:
     """Top-`limit` most cosine-similar active, embedded, committed memories
-    to `cand_vec` — the same matrix-read + score-sort-slice shape
-    `run_semantic_recall` uses (reusing `build_semantic_candidate_pool` for
-    the matrix half, not reinventing it). Empty list when the matrix has no
-    comparison vectors yet (cold-start / pre-backfill)."""
+    of one of `memory_types` to `cand_vec` — the same matrix-read +
+    score-sort-slice shape `run_semantic_recall` uses (reusing
+    `build_semantic_candidate_pool` for the matrix half, not reinventing it).
+    The pool is filtered by type before scoring and slicing. Empty list when
+    the matrix has no comparison vectors yet (cold-start / pre-backfill) or
+    none of a wanted type."""
     matrix = build_embedding_matrix(store.db_path)
     pool = build_semantic_candidate_pool(store, matrix)
-    if not pool:
+    scored = [
+        (mem, cosine_similarity(cand_vec, vec)) for mem, vec in pool.values() if mem.memory_type in memory_types
+    ]
+    if not scored:
         return []
-    scored = [(mem, cosine_similarity(cand_vec, vec)) for mem, vec in pool.values()]
     scored.sort(key=lambda pair: -pair[1])
     return [mem for mem, _score in scored[:limit]]
 
 
-def _related_existing_lexical(store: MemoryStore, cand: Memory, *, limit: int = 8) -> list[Memory]:
-    """Gather existing memories sharing salient tokens with the candidate.
+def _related_existing_lexical(
+    store: MemoryStore, cand: Memory, *, limit: int = 8, memory_types: frozenset[str]
+) -> list[Memory]:
+    """Gather existing memories of one of `memory_types` sharing salient tokens with the candidate.
 
     The PRE-F3 cosine-free probe, kept as `_related_existing`'s fallback
     for a cold matrix / a failed candidate embed (F1 #259 F3, spec §4b).
+    The type filter runs inside `store.search_text`, before its per-token limit.
     Read-only, non-bumping — Pass-2 context, not recall.
     """
     tokens = [w for w in re.findall(r"\w+", cand.content or "") if len(w) > 3][:6]
@@ -369,7 +668,7 @@ def _related_existing_lexical(store: MemoryStore, cand: Memory, *, limit: int = 
     out: list[Memory] = []
     for tok in tokens:
         try:
-            hits = store.search_text(tok, active_only=True, limit=3, bump=False)
+            hits = store.search_text(tok, active_only=True, limit=3, bump=False, memory_types=memory_types)
         except ValueError:
             continue
         for h in hits:
@@ -381,91 +680,341 @@ def _related_existing_lexical(store: MemoryStore, cand: Memory, *, limit: int = 
     return out
 
 
-def _noop_reappraiser(memory: Memory) -> float:
+def _noop_reappraiser(memory: Memory) -> Reappraisal:
     """No-provider fallback (Change 3 default when no provider is configured):
-    importance unchanged. There is NO mechanism-driven monotone climb — this
-    is what dissolves the recall-frequency-ratchet risk at the root (STAGE-3
+    importance unchanged, no names. There is NO mechanism-driven monotone climb —
+    this is what dissolves the recall-frequency-ratchet risk at the root (STAGE-3
     CORRECTION finding #2)."""
-    return memory.importance
+    return Reappraisal(memory.importance)
 
 
-def _make_haiku_reappraiser(provider) -> Reappraiser:
+def _parse_names(value: object, *, source: str) -> tuple[str, ...]:
+    """Fail-soft reading of a model's `names` field: a list of strings.
+
+    Absent (None) is normal and silent. Anything else that is not a list, and any
+    list element that is not a non-blank string, is dropped with a log line;
+    nothing here raises, so a malformed `names` can never cost the caller its
+    verdict or its score. Order is kept; duplicates are the admission function's
+    business.
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        logger.warning(
+            "consolidation %s: ignoring a non-list 'names' field (%s)", source, type(value).__name__
+        )
+        return ()
+    kept: list[str] = []
+    dropped = 0
+    for item in value:
+        if isinstance(item, str) and item.strip():
+            kept.append(item.strip())
+        else:
+            dropped += 1
+    if dropped:
+        logger.warning(
+            "consolidation %s: dropped %d malformed entries from 'names'", source, dropped
+        )
+    return tuple(kept)
+
+
+def _escape_tag(text: str, tag: str) -> str:
+    """Escape every tag of the fence's name inside memory text (S106): opening,
+    closing, self-closing, with attributes, any case, whitespace inside the
+    brackets, terminated or not (``<`` becomes ``&lt;``), so memory text can
+    neither close its fence nor open another. ``<memo>`` and ``<memoryx>`` are
+    left alone. Look-alike characters (a zero-width space inside the tag, a
+    fullwidth ``<``) are not tags and are not escaped: a stated limit."""
+    # One whitespace run before the optional slash and one after it (never two
+    # adjacent \s* runs: linear, not quadratic, on a long run of spaces).
+    return re.sub(
+        r"<(?=\s*(?:/\s*)?" + re.escape(tag) + r"\b)", "&lt;", text, flags=re.IGNORECASE
+    )
+
+
+def _escape_tags(text: str, tags: tuple[str, ...]) -> str:
+    for tag in tags:
+        text = _escape_tag(text, tag)
+    return text
+
+
+# Both of the judge's fence tags are escaped in the candidate AND in every
+# EXISTING memory (S136), so a candidate cannot forge an EXISTING block and an
+# existing memory cannot close its own fence or open a candidate.
+_JUDGE_TAGS: tuple[str, ...] = ("candidate", "existing")
+
+
+def _classifier_user_message(cand: Memory, context: list[Memory]) -> str:
+    """The judge's user message: the whole candidate in its <candidate> fence, then
+    each EXISTING memory (the base's first 200 characters) in its own <existing>
+    fence after an ``- id=<id>:`` line (S136), or ``(none)``."""
+    items = [
+        _CLASSIFIER_EXISTING_ITEM_TEMPLATE.format(
+            id=m.id, content=_escape_tags(m.content[:200], _JUDGE_TAGS)
+        )
+        for m in context
+    ]
+    return _CLASSIFIER_USER_TEMPLATE.format(
+        candidate=_escape_tags(cand.content, _JUDGE_TAGS),
+        existing="\n".join(items) or "(none)",
+    )
+
+
+def _reappraiser_user_message(memory: Memory, offered: list[str]) -> str:
+    """The re-appraiser's user message: KNOWN NAMES (the listed names that occur in
+    the memory, display forms, a JSON array) then the whole memory in its
+    <memory> fence (S105, S106, S107)."""
+    known = json.dumps([_escape_tag(d, "memory") for d in offered], ensure_ascii=False)
+    return _REAPPRAISER_USER_TEMPLATE.format(
+        known_names=known, memory=_escape_tag(memory.content, "memory")
+    )
+
+
+def _admit_extracted_names(
+    persona_dir: Path, names: object, *, list_source: str, label: str
+) -> None:
+    """Write model-extracted names to the known-names list through the one
+    admission function (S144, S152, S153: admitted as given, up to the length limit; the
+    rejects list still refuses a removed name, S135). Fail-soft: a
+    failure is logged and never propagates, so a names write can never lose the
+    candidate or the importance update it rides on (P-17, P-18)."""
+    try:
+        cleaned = _parse_names(names, source=label)
+        if cleaned:
+            admit_names(persona_dir, cleaned, list_source)
+    except Exception:  # noqa: BLE001 — names are a side channel, never a reason to lose the work
+        logger.warning("consolidation %s: known-names write failed", label, exc_info=True)
+
+
+_NUMBER_RE = re.compile(r"-?\d+(\.\d+)?")  # today's first-number regex, unchanged
+_KEYED_IMPORTANCE_RE = re.compile(r'"importance"\s*:\s*"?(-?\d+(?:\.\d+)?)"?')
+
+
+def _coerce_score(value: object) -> float | None:
+    """A finite number from a JSON value (a number, or a plain decimal string), else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        if not _NUMBER_RE.fullmatch(value.strip()):
+            return None
+    elif not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _parse_reappraisal(raw: str, current: float) -> Reappraisal:
+    """Read a re-appraiser reply: a JSON object with `importance` and `names`.
+
+    JSON first (P-18). A reply with no `{` at all falls back to today's
+    first-number regex with no names (the old "reply with ONLY the number" shape
+    still works). A reply that has a `{` but is not parseable JSON (a comma too
+    many, a second object, a cut-off reply) is read only through the keyed
+    `"importance": <number>` pattern: the first-number regex would read a digit
+    out of a name ("Apollo 13"). A JSON object whose `importance` is missing or
+    not a number leaves the importance unchanged, for the same reason. Malformed
+    `names` never change the score.
+    """
+    if "{" not in raw:
+        match = _NUMBER_RE.search(raw)
+        return Reappraisal(float(match.group(0)) if match else current)
+    data: object = None
+    if re.search(r"\{.*\}", raw, re.DOTALL):
+        try:
+            data = json.loads(_extract_json(raw))
+        except ValueError:
+            data = None
+    if isinstance(data, dict):
+        score = _coerce_score(data.get("importance"))
+        names = _parse_names(data.get("names"), source="reappraiser")
+        not_names = _parse_names(data.get("not_names"), source="reappraiser not_names")
+        return Reappraisal(current if score is None else score, names, not_names)
+    keyed = _KEYED_IMPORTANCE_RE.search(raw)
+    return Reappraisal(float(keyed.group(1)) if keyed else current)
+
+
+def _make_haiku_reappraiser(provider, persona_dir: Path | None = None) -> Reappraiser:
     """Build the Haiku-backed default importance re-appraiser (Change 3).
 
     Judges importance fresh from the memory's content in the moment it is
     re-appraised, not from how often it has been recalled: a still-relevant
     journal entry keeps or raises its importance, a past-due appointment
-    (Roy's jury-duty case) drops. Output is clamped [0, 10] by the caller
-    (`_handle_reappraisals`) via the shared `clamp_importance`. On any parse/
-    provider failure the fallback is the memory's CURRENT importance (a
-    no-op) — never a crash, never a ratchet."""
+    (Roy's jury-duty case) drops. It reads the WHOLE memory (the old
+    first-400-character cut is gone, spec §5) and also returns the names found in
+    it. Output is clamped [0, 10] by the caller (`_handle_reappraisals`) via the
+    shared `clamp_importance`. On any parse/provider failure the fallback is the
+    memory's CURRENT importance with no names (a no-op) — never a crash, never a
+    ratchet.
+
+    The memory goes in its <memory> fence after a KNOWN NAMES line: the display
+    forms of the persona's listed names that occur in it (``[]`` without a persona
+    directory or on any failure), so it can name any that is not a name in
+    ``not_names`` (S105, S107)."""
     prompt = _REAPPRAISER_PROMPT
 
-    def _reappraise(memory: Memory) -> float:
+    def _reappraise(memory: Memory) -> Reappraisal:
         try:
-            raw = provider.generate(memory.content[:400], system=prompt)
-            match = re.search(r"-?\d+(\.\d+)?", raw)
-            if not match:
-                return memory.importance
-            return float(match.group(0))
+            offered = listed_display_forms(persona_dir, memory.content)
+            raw = provider.generate(_reappraiser_user_message(memory, offered), system=prompt)
+            return _parse_reappraisal(raw, memory.importance)
+        except ThrottleDeferred:
+            raise  # "not now" (expired login, shutdown): the item is retried, not consumed unchanged (#473)
         except Exception:  # noqa: BLE001 — a provider fault must not lose the row
             logger.warning("consolidation Haiku reappraise failed; importance unchanged")
-            return memory.importance
+            return Reappraisal(memory.importance)
 
     return _reappraise
 
 
 def _handle_reappraisals(
     store: MemoryStore,
+    persona_dir: Path,
+    pending: PendingQueue,
+    claim: ClaimedBatch,
     entries: list[dict],
     reappraiser: Reappraiser,
     result: ConsolidationResult,
-) -> None:
+) -> bool:
     """Process Change-3 existing-memory re-appraise items: load the target
-    row, compute a new importance via the injectable `reappraiser`, and
-    UPDATE it in place (never an INSERT — C3.1).
+    row, compute a new importance (and names) via the injectable `reappraiser`,
+    and UPDATE it in place (never an INSERT — C3.1).
 
     A row missing at the read (already gone before this tick) or hard-deleted
     between the read and the write (a concurrent forgetting LOSE, or a delete
     triggered mid-appraisal) is skipped: no resurrection, no crash (C3.2).
     The `store.update` call is wrapped in `try/except KeyError`, mirroring
     the merge-dispatch idiom above (`_dispatch`'s `verdict == "merge"` branch).
+
+    The names the reappraiser found are written to the known-names list only
+    after the importance update succeeded (P-18), fail-soft. Before that, its
+    ``not_names`` remove listed names (S105): only a name that is listed, occurs
+    in this memory's text (the matcher, entry-side rules), and is not also in its
+    ``names``; the write itself never removes a name the kindled added, and puts
+    each removed name on the rejects list (S135).
+
+    Once the emotion engine is live, a re-appraised row also has its emotions rewritten at their faded values and its
+    ``created_at`` set to now (`_write_back_faded_emotions`): remembering a memory restarts its fading. The date it had before
+    the reset goes to the start of its text first, unless it is already there.
+
+    Each item runs in its own try (#459): a failure is settled by `_settle_failed_item`, and True is returned when the pass
+    must end (an environment failure or a deferred call); the unsettled items stay in the processing file.
     """
     for entry in entries:
-        memory_id = entry.get("memory_id")
-        if not memory_id or not isinstance(memory_id, str):
-            logger.warning("consolidation gate: dropping unparseable reappraise item")
-            continue
-        memory = store.get(memory_id, bump=False)
-        if memory is None:
-            continue  # already gone — no resurrection
         try:
-            new_importance = reappraiser(memory)
-        except Exception:  # noqa: BLE001 — a reappraiser fault must not lose the batch
-            logger.exception("consolidation gate: reappraiser raised; skipping")
-            continue
-        try:
-            store.update(memory_id, importance=clamp_importance(new_importance))
-        except KeyError:
-            # Deleted between the read above and this write — absorbed, not
-            # raised (finding #3).
-            continue
-        result.reappraised += 1
+            memory_id = entry.get("memory_id")
+            if not memory_id or not isinstance(memory_id, str):
+                logger.warning("consolidation gate: dropping unparseable reappraise item")
+                claim.settle(entry)
+                continue
+            memory = store.get(memory_id, bump=False)
+            if memory is None:
+                claim.settle(entry)
+                continue  # already gone — no resurrection
+            try:
+                appraisal = reappraiser(memory)
+                # Attribute access inside the same try: a reappraiser that returns a
+                # bare number is skipped with a log line, as before.
+                new_importance = appraisal.importance
+                names = appraisal.names
+                not_names = getattr(appraisal, "not_names", ())
+            except ThrottleDeferred:
+                raise  # "not now": the item is not consumed (#473)
+            except Exception:  # noqa: BLE001 — a reappraiser fault must not lose the batch
+                logger.exception("consolidation gate: reappraiser raised; skipping")
+                claim.settle(entry)
+                continue
+            try:
+                store.update(memory_id, importance=clamp_importance(new_importance))
+            except KeyError:
+                # Deleted between the read above and this write — absorbed, not
+                # raised (finding #3).
+                claim.settle(entry)
+                continue
+            result.reappraised += 1
+            _write_back_faded_emotions(store, persona_dir, memory)
+            _remove_not_names(persona_dir, memory, names, not_names)
+            _admit_extracted_names(persona_dir, names, list_source="reappraiser", label="reappraiser")
+            claim.settle(entry)
+        except Exception as exc:  # noqa: BLE001 — settled per item
+            if _settle_failed_item(store, pending, persona_dir, claim, entry, None, "reappraise", exc, result):
+                return True
+    return False
 
 
-def _archive_preimage(persona_dir: Path, target: Memory, source_id: str) -> None:
+def _write_back_faded_emotions(store: MemoryStore, persona_dir: Path, memory: Memory) -> None:
+    """The temp-gate write-back, once the engine is live: the row's emotions become their faded values and its ``created_at``
+    becomes now, in one store write (`refresh_faded_emotions`, no hook), which also puts the date the row had before the reset at
+    the start of its text when it is not there yet. Every memory type and state, a row without emotions included (its
+    ``created_at`` is still reset). Runs after the importance update committed.
+
+    The row is read again here, because ``memory`` was loaded before the re-appraiser's model call and the emotion backfill may
+    have written emotions onto the row since; the faded values come from that fresh row, with the importance the memory had
+    BEFORE this re-appraisal (it faded under that one until now). A failure is logged and the row is left as it was: the item is
+    neither requeued nor settled as failed, so the outer per-item handler never sees it. A row whose stored emotion the read leaves
+    out is skipped the same way (logged, left as it was), because the write replaces the row's whole map.
+    """
+    try:
+        live_engine = engine.engine_for(persona_dir)
+        if not live_engine.is_live():
+            return
+        fresh = store.get(memory.id, bump=False)  # a maintenance read, not an access
+        if fresh is None:
+            return  # hard-deleted since the importance update: nothing to write
+        row = replace(fresh, importance=memory.importance)
+        # The engine's one read: faded, held to 0-10, canonical names. `refresh_faded_emotions` replaces the row's whole map, so a
+        # stored name the read leaves out (a value that is not a finite number, or a fade that failed, with a warning from the
+        # read) would be deleted: that row is skipped and its stored values stay, as when a fade failed before. Two spellings of
+        # one name that the read pools into one are not missing. A skipped row keeps its unfaded values with the importance
+        # committed above, so they fade later under that new importance from the row's old `created_at`.
+        faded = dict(live_engine.memory_feelings(row).feelings)
+        if any(canonical_name(name) not in faded for name in store.stored_emotion_names(row)):
+            logger.warning(
+                "consolidation gate: temp-gate write-back skipped for memory %s; the read left a stored emotion out", memory.id
+            )
+            return
+        store.refresh_faded_emotions(memory.id, faded, datetime.now(UTC))
+    except Exception:  # noqa: BLE001
+        # A lost write-back costs one refresh; the importance update has already committed.
+        logger.error(
+            "consolidation gate: temp-gate write-back failed for memory %s; row left as it was", memory.id, exc_info=True
+        )
+
+
+def _remove_not_names(persona_dir: Path, memory: Memory, names: object, not_names: object) -> None:
+    """The re-appraiser's removals (S105), fail-soft: listed names that occur in
+    this memory and that the reply put under ``not_names`` but not under
+    ``names``. ``remove_names`` refuses a name the kindled added."""
+    try:
+        wanted = {normalize_name(n) for n in _parse_names(not_names, source="reappraiser not_names")}
+        kept = {normalize_name(n) for n in _parse_names(names, source="reappraiser")}
+        wanted = {n for n in wanted - kept if n}
+        if not wanted:
+            return
+        present = set(match_known_names(memory.content or "", load_known_names(persona_dir)))
+        targets = sorted(wanted & present)
+        if targets:
+            remove_names(persona_dir, targets, "reappraiser")
+    except Exception:  # noqa: BLE001 — a names write never costs the importance update
+        logger.warning("consolidation reappraiser: known-names removal failed", exc_info=True)
+
+
+def _archive_preimage(persona_dir: Path, target: Memory, source_id: str, candidate_type: str) -> None:
     """Append the pre-merge memory to the plain consolidation archive (lossless
-    before lossy — NOT the grief graveyard)."""
+    before lossy — NOT the grief graveyard), with the merged-in candidate's id
+    and memory type. A line written before the type was recorded has no
+    ``merged_from_candidate_type``: a reader treats the key as optional (#619)."""
     rec = {
         "archived_at": datetime.now(UTC).isoformat(),
         "reason": "consolidation_merge",
         "target": target.to_dict(),
         "merged_from_candidate": source_id,
+        "merged_from_candidate_type": candidate_type,
     }
     path = persona_dir / _ARCHIVE_FILENAME
-    with file_lock(path):
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    append_jsonl(path, rec, nonfinite="null")
 
 
 def _dispatch(
@@ -484,20 +1033,49 @@ def _dispatch(
         result.duplicates += 1  # discard: candidate was already removed by drain()
         return
 
+    # Names the judge found in the candidate text: every verdict except
+    # "duplicate", a deferred merge included (P-17; `INSERT OR IGNORE` makes the
+    # repeat on the re-judged tick harmless). Fail-soft, before the verdict acts.
+    _admit_extracted_names(persona_dir, decision.names, list_source="gate", label="gate judge")
+
     if verdict == "merge":
-        target = store.get(decision.target_id) if decision.target_id else None
+        # A merge verdict's read of its target is a maintenance read, not an access: bump=False, like every other internal read here.
+        target = store.get(decision.target_id, bump=False) if decision.target_id else None
         if target is None or target.state == "fading":
             # Target missing or mid-fade: defer — re-enqueue for the next tick
             # rather than lose the candidate or clobber a concurrent fade.
             pending.enqueue(cand, source="gate-deferred")
             result.deferred += 1
             return
-        _archive_preimage(persona_dir, target, cand.id)
+        if target.memory_type not in matchable_types(cand.memory_type):
+            # The judge is shown only rows the candidate may match, so this is an id it was not given. A memory never merges
+            # into a memory of another type (#619): store the candidate as its own row through the promote path below, with
+            # its own content, and write no archive line (nothing is merged).
+            logger.info(
+                "consolidation gate: merge verdict named a %s target for a %s candidate; storing it as a new row",
+                target.memory_type,
+                cand.memory_type,
+            )
+            verdict = "new"
+
+    if verdict == "merge":
+        _archive_preimage(persona_dir, target, cand.id, cand.memory_type)
         merged = decision.merged_content
         if not merged:
             merged = _fold(target.content, cand.content)
+        # One answer to "is the engine live" gates both the emotions write and the mood event below, so they never disagree.
+        live = engine.engine_for(persona_dir).is_live()
         try:
-            store.update(target.id, content=merged)
+            # Once the engine is live the merge combines both memories' emotions (`merge_into`, `store._merge_emotions`), in the
+            # one update that writes the content. fold=False: the target's own update fires no hook (not even "assigned" when
+            # its emotions were empty); the incoming memory's mood move is sent below.
+            #
+            # Only memories of one merge type reach this write (#619), so no memory's feelings pass into a memory of another
+            # type. Two memories of ONE merge type can still differ in whether the engine counts them; they merge with no
+            # extra check and the incoming memory's own commit event counts it if its type is counted. That same-type case
+            # of the counted/uncounted requirement is deferred to Phase 5 with the "newer memory keeps the feelings" rule
+            # (owner S13, S14).
+            store.merge_into(target, cand, merged, engine_live=live)
         except KeyError:
             # Target hard-deleted between the read and the write (a concurrent
             # forgetting LOSE). Defer the candidate; the archive record is
@@ -505,6 +1083,23 @@ def _dispatch(
             pending.enqueue(cand, source="gate-deferred")
             result.deferred += 1
             return
+        if live:
+            # The incoming emotions also move her mood, once, when the merge writes them: the existing commit event, for the
+            # incoming memory `cand`, which is never created as a row (so `create` never sends it). It follows the successful
+            # write, so a deferred merge (above) sends nothing and the tick that finally writes the merge sends it once. The
+            # event follows the commit kind's counting and climax rules, so a merged memory with climax 7 or more triggers the
+            # climax reset like any commit. No try here: the engine's hooks never raise into their caller.
+            #
+            # The merge keeps this hook: design 3.1 ("The merge keeps the hook for the incoming memory's mood move") in
+            # docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md, decided by the maintainer on #629
+            # (issue #580). Two edges are accepted there, in design section 6:
+            # - If the update above commits and the item is retried before claim.settle (the process dies, or an error follows
+            #   the commit), the candidate is merged again: the emotions are averaged with it a second time (the content is
+            #   protected by `_fold`'s "contains it" rule, the averages are not), and the event is sent again and counts at the
+            #   repeat factor 1/2.
+            # - A rebuild or a catch-up counts the merged target row's current emotions once and does not restore this separate
+            #   mood move (the merged memory has no row and the merge writes no change-log line): a lost event, one merge's worth.
+            engine.engine_for(persona_dir).on_memory_committed(cand)
         result.merged += 1
         return
 
@@ -560,28 +1155,46 @@ def _make_haiku_classifier(provider) -> Classifier:
     """Build a Haiku-backed Pass-2 classifier from a generation provider.
 
     Decision QUALITY is advisory (C16, live-only) — the gate mechanism is what
-    the gating criteria verify. On any parse/provider failure the candidate is
-    promoted (fail-open toward keeping content).
+    the gating criteria verify. A failed CALL propagates (the candidate is kept for a
+    later run); a reply that arrives with no usable verdict raises
+    ``UnusableClassifierReply`` (the candidate is quarantined with the reply as evidence).
+    Nothing is promoted unclassified (#473).
     """
     prompt = _CLASSIFIER_PROMPT
 
     def _classify(cand: Memory, context: list[Memory]) -> Decision:
-        ctx = "\n".join(f"- id={m.id}: {m.content[:200]}" for m in context) or "(none)"
-        user = f"CANDIDATE: {cand.content[:400]}\nEXISTING:\n{ctx}"
+        # The WHOLE candidate: the verdict and the names are both read from all of
+        # it (the first-400-character cut is gone, spec §5 item 1, S51), in its
+        # fence; each EXISTING memory in its own fence (S106, S136).
+        user = _classifier_user_message(cand, context)
+        # The CALL is outside any try: a call that fails (a deferral, a CLI error, a timeout) means the candidate was not
+        # classified, so the exception goes to the gate, which keeps the candidate for a later run (#473).
+        raw = provider.generate(user, system=prompt)
+        reply = raw if isinstance(raw, str) else ""
+        if not reply.strip():
+            raise UnusableClassifierReply("empty reply", reply)
+        # The shared string-aware scan, not a greedy `\{.*\}`: a brace in the prose around a valid verdict must not turn it
+        # into "not valid JSON", because an unusable reply is quarantined for good (#470 review).
+        block = find_json_object_block(reply, prefer_key="verdict")
+        if block is None:
+            raise UnusableClassifierReply("no JSON object in the reply", reply)
         try:
-            raw = provider.generate(user, system=prompt)
-            data = json.loads(_extract_json(raw))
-            verdict = str(data.get("verdict", "new"))
-            if verdict not in VERDICTS:
-                verdict = "new"
-            return Decision(
-                verdict=verdict,
-                target_id=data.get("target_id") or None,
-                merged_content=data.get("merged_content") or None,
-            )
-        except Exception:  # noqa: BLE001
-            logger.warning("consolidation Haiku classify failed; promoting candidate")
-            return Decision("new")
+            data = json.loads(block)
+        except (ValueError, RecursionError) as exc:
+            raise UnusableClassifierReply("the reply is not valid JSON", reply) from exc
+        if not isinstance(data, dict):
+            raise UnusableClassifierReply("the reply JSON is not an object", reply)
+        verdict = data.get("verdict")
+        if isinstance(verdict, str):
+            verdict = verdict.strip().lower()  # "New" / "NEW" are the same verdict
+        if not isinstance(verdict, str) or verdict not in VERDICTS:
+            raise UnusableClassifierReply(f"no usable verdict (got {str(data.get('verdict'))[:60]!r})", reply)
+        return Decision(
+            verdict=verdict,
+            target_id=data.get("target_id") or None,
+            merged_content=data.get("merged_content") or None,
+            names=_parse_names(data.get("names"), source="gate judge"),
+        )
 
     return _classify
 

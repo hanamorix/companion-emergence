@@ -267,7 +267,6 @@ _EVENT_SOURCES = {
     "dream": ("dreams.log.jsonl", "summary"),
     "growth": ("growth.log.jsonl", "title"),
     "soul": ("soul.log.jsonl", "moment_label"),
-    "weather_shift": ("weather_shifts.log.jsonl", "label"),
 }
 _T0 = "2026-10-01T10:00:00+00:00"  # last tick of the saved state
 
@@ -333,7 +332,7 @@ def test_lived_age_survives_dream_logged_between_ticks(tmp_path):
     assert ft2.get_state().lived_age_hours > 1.25
 
 
-@pytest.mark.parametrize("kind", ["dream", "growth", "soul", "weather_shift"])
+@pytest.mark.parametrize("kind", ["dream", "growth", "soul"])
 def test_saved_state_preserved_across_anchor_event(tmp_path, kind):
     saved = _rich_saved_state(tmp_path, saved_only=_saved_only_for(kind))
     _append_event(tmp_path, kind, "new event", "2026-10-01T10:05:00+00:00")
@@ -362,7 +361,7 @@ def test_saved_state_preserved_across_arc_event_control(tmp_path):
     assert loaded.anchors == saved.anchors
 
 
-@pytest.mark.parametrize("kind", ["dream", "growth", "soul", "weather_shift"])
+@pytest.mark.parametrize("kind", ["dream", "growth", "soul"])
 def test_tick_folds_newer_anchor_into_preserved_state(tmp_path, kind):
     saved_only = _saved_only_for(kind)
     saved = _rich_saved_state(tmp_path, saved_only=saved_only)

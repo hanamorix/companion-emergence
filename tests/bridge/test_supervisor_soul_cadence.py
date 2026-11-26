@@ -177,3 +177,49 @@ def test_draft_cursor_advanced_after_successful_review(
     assert cursor_path.exists(), "cursor file must be written after a review pass"
     data = _json.loads(cursor_path.read_text())
     assert "last_seen" in data, "cursor must contain a last_seen timestamp"
+
+
+def test_a_deferred_soul_review_keeps_the_failure_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of #458 (finding 6): a "not now" refusal (lost slot, expired login) is neither a failure nor a clean
+    pass, so it must not reset the 429 back-off count; the next 429 would otherwise back off at the shortest step."""
+    from brain.bridge import cli_throttle
+
+    persona_dir = tmp_path / "persona"
+    persona_dir.mkdir()
+    (_cadence_dir(persona_dir) / "soul_review_state.json").write_text(
+        json.dumps(
+            {
+                "next_review_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat(),
+                "consecutive_failures": 3,
+            }
+        )
+    )
+    _neutralise_other_ticks(monkeypatch)
+    monkeypatch.setattr("brain.soul.review.count_eligible_pending", lambda _pd: 2)
+    stop = threading.Event()
+    calls = [0]
+
+    def _deferred(*a, **k):
+        # The stop comes later, from a timer: set here, it would take the "the bridge is stopping" branch instead.
+        calls[0] += 1
+        threading.Timer(0.3, stop.set).start()
+        raise cli_throttle.ThrottleDeferred("throttle slot unavailable")
+
+    monkeypatch.setattr("brain.bridge.supervisor._run_soul_review_tick", _deferred)
+    run_folded(
+        stop,
+        persona_dir=persona_dir,
+        provider=MagicMock(),
+        event_bus=MagicMock(),
+        tick_interval_s=0.05,
+        heartbeat_interval_s=None,
+        soul_review_interval_s=6 * 3600.0,
+        finalize_interval_s=None,
+        interest_sweep_interval_s=None,
+    )
+    assert calls[0] == 1
+    state = json.loads((_cadence_dir(persona_dir) / "soul_review_state.json").read_text())
+    assert datetime.fromisoformat(state["next_review_at"]) > datetime.now(UTC)  # the tick ran and was re-paced
+    assert state["consecutive_failures"] == 3

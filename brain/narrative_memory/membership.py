@@ -14,13 +14,9 @@ from typing import Protocol
 
 import numpy as np
 
+from brain import dev_constants
 from brain.memory.embeddings import cosine_similarity
 from brain.narrative_memory.arc import Arc
-
-# Module-top tunables (spec §4 + §2 policy.py — duplicated here for fast read
-# at the membership.py call site without importing policy).
-MEMBER_HEBBIAN_THRESHOLD: float = 3.0
-MEMBER_EMBEDDING_THRESHOLD: float = 0.6
 
 
 class HebbianView(Protocol):
@@ -50,7 +46,7 @@ def is_candidate(
     """
     # Hebbian path
     for member in arc.members:
-        if hebbian.weight(memory.id, member.memory_id) >= MEMBER_HEBBIAN_THRESHOLD:
+        if hebbian.weight(memory.id, member.memory_id) >= dev_constants.MEMBER_HEBBIAN_THRESHOLD:
             return True, "hebbian"
 
     # Embedding path
@@ -60,7 +56,7 @@ def is_candidate(
     vec = embeddings.get(memory.id)
     if vec is None:
         return False, None
-    if cosine_similarity(vec, centroid) >= MEMBER_EMBEDDING_THRESHOLD:
+    if cosine_similarity(vec, centroid) >= dev_constants.MEMBER_EMBEDDING_THRESHOLD:
         return True, "embedding"
     return False, None
 

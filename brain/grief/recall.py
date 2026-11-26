@@ -5,7 +5,7 @@ handle_recall_touch is wired into:
   - tools.dispatch._dispatch_recall_forgotten (Nell's own tool calls)
   - narrative_memory.__init__ membership refresh (internal arc touch)
 
-Spec: docs/superpowers/specs/2026-05-19-grief-design.md §3 + §6
+Spec: the 2026-05-19 grief design (§3 + §6), never committed and lost (#797).
 """
 
 from __future__ import annotations
@@ -137,12 +137,9 @@ def handle_recall_touch(
         )
         if intensity < policy.THRESHOLD:
             continue
-        if store.exists_recent_grief_touch(memory_id, hours=policy.DEBOUNCE_HOURS):
-            continue
 
         residue = _dominant_lost_emotion(entry)
-        breadcrumb.write_breadcrumb(
-            store=store,
+        memory = breadcrumb.build_breadcrumb(
             intensity=intensity,
             subtype="recall_touch",
             referent_type="memory",
@@ -151,3 +148,6 @@ def handle_recall_touch(
             residue_emotion=residue,
             triggering_arc_id=triggering_arc_id,
         )
+        # The debounce check and the insert are one store call: two turns touching the same forgotten memory at once
+        # write one breadcrumb (#342). A touch inside the window returns None and writes nothing.
+        store.create_grief_touch_unless_recent(memory, hours=policy.DEBOUNCE_HOURS)

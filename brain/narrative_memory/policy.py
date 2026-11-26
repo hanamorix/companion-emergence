@@ -1,18 +1,13 @@
-"""Arc open/close gates + module-top tunable constants.
+"""Arc open/close gates.
 
-Spec §2 §4 §5. Constants here are intentionally duplicated from
-membership.py for grep-ability — the membership thresholds are
-clustered with the per-call function, the lifecycle thresholds with
-the per-pass decisions.
+Spec §2 §4 §5. The lifecycle thresholds (ARC_STALE_LIVED_HOURS, MAX_ARC_MEMBERS) and
+the membership thresholds live in `brain.dev_constants`.
 """
 
 from __future__ import annotations
 
+from brain import dev_constants
 from brain.narrative_memory.arc import Arc
-
-# Spec §2 module-top constants
-ARC_STALE_LIVED_HOURS: float = 72.0
-MAX_ARC_MEMBERS: int = 50
 
 
 def should_close(
@@ -34,7 +29,7 @@ def should_close(
     """
     if lived_age_now is None:
         return False
-    return (lived_age_now - last_extended_lived_age) >= ARC_STALE_LIVED_HOURS
+    return (lived_age_now - last_extended_lived_age) >= dev_constants.ARC_STALE_LIVED_HOURS
 
 
 def should_open(

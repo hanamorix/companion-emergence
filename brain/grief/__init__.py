@@ -15,7 +15,7 @@ call sites:
         Called by chat.prompt._build_recall_block, tools.dispatch (after
         recall_forgotten resolves), and narrative_memory membership refresh.
 
-Spec: docs/superpowers/specs/2026-05-19-grief-design.md
+Spec: the 2026-05-19 grief design, never committed and lost (#797).
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from brain.emotion import engine
 from brain.grief import breadcrumb, policy
 from brain.grief.prompt import render_grief_block
 from brain.grief.recall import handle_recall_touch
@@ -63,12 +64,15 @@ def handle_drop(
     guards only against import-time failures, not runtime errors in this function.
     """
     try:
-        emotion_max = max(memory.emotions.values()) / 10.0 if memory.emotions else 0.0
+        # The memory's feelings through the engine's one read: faded values once the persona is live, the stored values held
+        # to 0-10 otherwise (the row is already deleted; the read needs no store).
+        feelings = engine.engine_for(persona_dir).memory_feelings(memory).feelings
+        emotion_max = max(feelings.values()) / 10.0 if feelings else 0.0
         emotion_max = max(0.0, min(1.0, emotion_max))
         intensity = breadcrumb.compute_drop_intensity(emotion_at_ingest_max=emotion_max)
         if intensity < policy.THRESHOLD:
             return
-        residue = _dominant_non_grief_emotion(dict(memory.emotions or {}))
+        residue = _dominant_non_grief_emotion(dict(feelings))
         breadcrumb.write_breadcrumb(
             store=store,
             intensity=intensity,

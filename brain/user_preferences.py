@@ -18,12 +18,12 @@ cadence field, user_preferences.json wins — the GUI is authoritative.
 
 from __future__ import annotations
 
-import json
 import logging
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from brain.health.json_io import Recovery, read_json, read_json_result, write_json
 
 if TYPE_CHECKING:
     from brain.health.anomaly import BrainAnomaly
@@ -66,10 +66,8 @@ class UserPreferences:
         Returns (instance, anomaly_or_None). Missing file → defaults, no anomaly.
         Corrupt file → quarantine + restore from .bak1/.bak2/.bak3 or reset.
         """
-        from brain.health.attempt_heal import attempt_heal
-
-        data, anomaly = attempt_heal(path, _default_user_preferences_dict)
-        return cls._parse_data(data), anomaly
+        res = read_json_result(path, default=_default_user_preferences_dict, recover=Recovery.HEAL)
+        return cls._parse_data(res.data), res.anomaly
 
     @classmethod
     def load(cls, path: Path) -> UserPreferences:
@@ -84,29 +82,12 @@ class UserPreferences:
         return instance
 
     def save(self, path: Path) -> None:
-        """Atomic save via .bak rotation (save_with_backup)."""
+        """Atomic save via .bak rotation (write_json)."""
         from brain.health.adaptive import compute_treatment
-        from brain.health.attempt_heal import save_with_backup
 
         payload = {"dream_every_hours": self.dream_every_hours}
         treatment = compute_treatment(path.parent, path.name)
-        save_with_backup(path, payload, backup_count=treatment.backup_count)
-        if treatment.verify_after_write:
-            self._verify_after_write(path)
-
-    def _verify_after_write(self, path: Path) -> None:
-        """Re-read the written file; if corrupt, restore from .bak1."""
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("non-dict payload after write")
-        except (json.JSONDecodeError, ValueError, OSError):
-            logger.error(
-                "UserPreferences verify_after_write failed for %s; restoring from .bak1", path
-            )
-            bak1 = path.with_name(path.name + ".bak1")
-            if bak1.exists():
-                shutil.copy2(bak1, path)
+        write_json(path, payload, backups=treatment.backup_count, verify=treatment.verify_after_write)
 
 
 def read_raw_keys(path: Path) -> set[str]:
@@ -114,15 +95,8 @@ def read_raw_keys(path: Path) -> set[str]:
 
     Used by HeartbeatConfig.load to distinguish "file omits this field, fall
     back to heartbeat_config.json" from "file sets this field to its default
-    value, override heartbeat_config.json". Returns empty set on any error
-    (missing file, corrupt JSON, non-object payload).
+    value, override heartbeat_config.json". Returns empty set for a missing file,
+    corrupt JSON or a non-object payload.
     """
-    if not path.exists():
-        return set()
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return set()
-    if not isinstance(data, dict):
-        return set()
-    return set(data.keys())
+    # CONTENT: a missing, corrupt or non-object file is the empty set; an unreadable one still raises.
+    return set(read_json(path, default=dict, recover=Recovery.CONTENT, expect=dict).keys())

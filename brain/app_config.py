@@ -6,8 +6,7 @@ keeps the file in sync for users who set up via `nell init` rather than the wiza
 """
 from __future__ import annotations
 
-import json
-
+from brain.health.json_io import write_json
 from brain.paths import get_home
 
 
@@ -22,15 +21,13 @@ def write_if_missing(persona: str) -> None:
     are left untouched. The Tauri boot path handles the "exists but null" case
     via list_personas autodetect.
     """
-    target = _path()
-    if target.exists():
-        return
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(
-        json.dumps({
+    write_json(
+        _path(),
+        {
             "selected_persona": persona,
             "always_on_top": False,
             "reduced_motion": False,
-        }, indent=2) + "\n",
-        encoding="utf-8",
+        },
+        if_missing=True,
+        fsync=False,
     )

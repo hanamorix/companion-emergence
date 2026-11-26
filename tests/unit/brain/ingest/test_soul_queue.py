@@ -60,3 +60,24 @@ def test_list_soul_candidates_returns_empty_when_no_file(tmp_path: Path) -> None
     """list_soul_candidates returns [] when the file doesn't exist yet."""
     result = list_soul_candidates(tmp_path)
     assert result == []
+
+
+def test_a_candidate_is_found_by_session_and_text_not_by_memory_id(tmp_path: Path) -> None:
+    """The retry of an extraction mints a new memory id, so the lookup that tells a repeat apart is (session id, text)."""
+    from brain.ingest.soul_queue import is_soul_candidate_queued
+
+    item = ExtractedItem(text="Bob keeps the last quorble button in the blue tin", label="fact", importance=9)
+    assert not is_soul_candidate_queued(tmp_path, session_id="sess_a", text=item.text)  # no file yet
+    queue_soul_candidate(tmp_path, memory_id="mem_old", item=item, session_id="sess_a")
+    assert is_soul_candidate_queued(tmp_path, session_id="sess_a", text=item.text)
+    assert not is_soul_candidate_queued(tmp_path, session_id="sess_b", text=item.text)
+    assert not is_soul_candidate_queued(tmp_path, session_id="sess_a", text="another text")
+
+
+def test_the_lookup_survives_a_malformed_line(tmp_path: Path) -> None:
+    from brain.ingest.soul_queue import is_soul_candidate_queued
+
+    (tmp_path / "soul_candidates.jsonl").write_text(
+        'NOT_VALID_JSON\n{"memory_id": "m", "text": "kept", "session_id": "sess_a", "status": "auto_pending"}\n'
+    )
+    assert is_soul_candidate_queued(tmp_path, session_id="sess_a", text="kept")

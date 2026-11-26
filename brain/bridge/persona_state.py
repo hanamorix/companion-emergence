@@ -2,8 +2,8 @@
 
 The app's left panels (Inner Weather, Body, Recent Interior, Soul,
 Connection) all consume real-time persona state. The data already
-exists across many subsystems — emotions in the memory store,
-body in compute_body_state, interior in daemon_state.json, soul in
+exists across many subsystems — emotions in the emotion engine,
+body projected from them by body_state_from_short, interior in daemon_state.json, soul in
 SoulStore, mode in BridgeState. This module composes them behind a
 single dict so the bridge can serve them at one endpoint.
 
@@ -37,25 +37,44 @@ from brain.body.session_hours import (
 # function moved to brain.body.session_hours so brain.tools.dispatch can
 # import it without crossing into the bridge layer. See the new module's
 # docstring for the migration context.
-from brain.bridge import background_jobs, provider_auth
+from brain.bridge import background_jobs, model_error, provider_auth
+from brain.health.json_io import read_json, read_json_result
+from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
+
+def _flag_failed(what: str) -> bool:
+    """#367: the recovery-banner flags fail soft (False), but say why. They run
+    on every /persona/state poll, so the warning is throttled."""
+    warn_throttled(logger, f"persona_state:{what}", "recovery flag %s failed; reporting False", what)
+    return False
 
 
 def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> dict[str, Any]:
     """Aggregate persona state for the NellFace panels.
 
     Returns a dict with keys:
-      - emotions: dict[str, float] — non-zero emotions sorted desc by intensity
-      - body: dict | None — body state from compute_body_state
+      - emotions: dict[str, float] — the emotion engine's short averages, sorted desc by intensity
+      - feels_high: list[str] | None — the names (from the engine's read) that `engine.feels_high` answers True for,
+        sorted by name, computed here so the app holds no fixed level of its own; None when the engine cannot be asked
+      - body: dict | None — body state projected from the engine's short averages
       - interior: dict — last_dream / last_research / last_heartbeat themes
-      - soul_highlight: dict | None — one crystallization (highest resonance,
-        most recent on tie)
+      - soul_highlight: dict | None — the newest crystallization (the stronger
+        one of a tie), #637
+      - soul_strongest: dict | None — the highest-resonance crystallization (the
+        most recent of a tie), or None when it is soul_highlight itself
       - mode: "live" | "offline" — derived from data availability
       - persona: str — persona name (from persona_dir.name)
       - background_jobs: list[{"name": str, "running_for_seconds": float}] —
         currently-running gated job/heartbeat names (ram-spike-fix INC-11),
         ordered LONGEST-RUNNING FIRST; [] when none are running
+      - rebuild_notice: {"reason", "log_path"} | None, why the persona's
+        switch-over did not complete and the bridge started on the state
+        saved before, while the persona is not switched over (Hana's point 5
+        on #633); `log_path` is the runtime log holding the error
+      - tunables_notice: {"kind", "line", "column", "reason"} | None — a
+        tunables.toml that could not be read and was left as it is, until the
+        user fixes it (#462)
 
     Never raises. Each subsystem failure contributes None / {} rather
     than propagating.
@@ -63,19 +82,38 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
     if now is None:
         now = datetime.now(UTC)
     persona_name = persona_dir.name
+    connection = _build_connection(persona_dir)
+    soul_highlight, soul_strongest = _build_soul(persona_dir)
+    from brain import tunables
 
     return {
         "persona": persona_name,
         "emotions": _build_emotions(persona_dir),
+        # The feeling names the engine calls high, for the app's expressions; None when the engine cannot be asked.
+        "feels_high": _build_feels_high(persona_dir),
         "body": _build_body(persona_dir, now=now),
         "interior": _build_interior(persona_dir),
-        "soul_highlight": _build_soul_highlight(persona_dir),
+        "soul_highlight": soul_highlight,
+        "soul_strongest": soul_strongest,
         "pending_writes": _build_pending_writes(persona_dir),
-        "connection": _build_connection(persona_dir),
+        "connection": connection,
         "mode": "live",
         "recovering": _is_recovering(persona_dir),
         # #246: True while the brain's CLI login is expired (bridge-process state).
         "provider_auth_expired": provider_auth.state()["status"] == "expired",
+        # #440: models the Claude CLI rejected (unknown, or not available to this account), limited to the ids the
+        # jobs are CONFIGURED with (not the ids they run now) so a rejected id stays in the notice while its job runs
+        # the shipped default instead. [] when none.
+        "model_rejections": _model_rejections(),
+        # Jobs now running their shipped default because the id they are configured with was rejected:
+        # [{"job", "configured", "using"}], [] when none.
+        "model_fallbacks": _model_fallbacks(),
+        # #440: the chat model (as configured) when it was saved without the save-time check being able to confirm
+        # it and no clean reply has arrived for it since. [] otherwise.
+        "model_unconfirmed": _model_unconfirmed(),
+        # #446: the model setting in tunables.toml that is not a usable model (the shipped default runs instead),
+        # shown display-safe, else None. Only for a claude-cli persona.
+        "model_unsupported": _model_unsupported(connection),
         "felt_time_recovered": _felt_time_recovered(persona_dir),
         "narrative_memory_recovered": _narrative_memory_replayed(persona_dir),
         # ram-spike-fix INC-11 (spec §6, S15/S23/S38): gated jobs and/or the
@@ -86,7 +124,80 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
             {"name": name, "running_for_seconds": round(elapsed, 3)}
             for name, elapsed in background_jobs.snapshot_with_elapsed()
         ],
+        # Hana's point 5 on #633: a switch-over that did not complete, persisted in the persona folder (`rebuild_notice.json`) by
+        # whichever process found it, so the window shows it until the persona is switched over: {"reason": <one line>,
+        # "log_path": <the runtime log holding the error>}, else None. A pure read; the notice is cleared by its writer, never here.
+        "rebuild_notice": _build_rebuild_notice(persona_dir),
+        # #462: a tunables.toml that could not be read, left as it is and persisted beside the file so EVERY bridge reports
+        # it until the user fixes it: {"kind": "unreadable", "line": <int | None>, "column": <int | None>, "reason": <text>}, else None.
+        "tunables_notice": tunables.current_notice(),
     }
+
+
+def _build_rebuild_notice(persona_dir: Path) -> dict[str, str | None] | None:
+    """The rebuild notice (`engine_files.read_rebuild_notice`) as `{"reason", "log_path"}`, or None when there is none.
+
+    `log_path` is the runtime log every start-process and engine line about the failure went to (`paths.runtime_log_path`); it is
+    None only if that path cannot be worked out (a failure of the home or log-folder lookup), and the reason is still sent, because a
+    reason without a path says more than nothing (HRF red-team G1). The notice's writer identity (`pid`, `pid_token`) stays in the file (only the start process's writer reads it).
+    Never raises: a failed read is None, with a warning.
+    """
+    try:
+        from brain.emotion import engine_files
+
+        notice = engine_files.read_rebuild_notice(persona_dir)
+        if notice is None:
+            return None
+        try:
+            from brain import paths
+
+            log_path: str | None = str(paths.runtime_log_path(persona_dir.name))
+        except Exception:  # noqa: BLE001
+            logger.warning("persona_state: runtime log path unavailable for the rebuild notice", exc_info=True)
+            log_path = None
+        return {"reason": notice["reason"], "log_path": log_path}
+    except Exception:  # noqa: BLE001
+        logger.warning("persona_state: rebuild notice read failed", exc_info=True)
+        return None
+
+
+def _model_rejections() -> list[dict]:
+    from brain.bridge.model_tier import configured_job_models
+
+    return model_error.state(only=set(configured_job_models().values()))
+
+
+def _model_fallbacks() -> list[dict]:
+    """The jobs whose configured id Claude rejected, so they run their shipped default now."""
+    from brain.bridge.model_tier import configured_job_models, model_for_tier
+
+    try:
+        return [
+            {"job": job, "configured": configured, "using": using}
+            for job, configured, using in (
+                (job, configured, model_for_tier(job)) for job, configured in configured_job_models().items()
+            )
+            if using != configured
+        ]
+    except Exception:  # noqa: BLE001 - never breaks /persona/state
+        logger.warning("persona_state: model_fallbacks failed", exc_info=True)
+        return []
+
+
+def _model_unconfirmed() -> list[str]:
+    """The chat id as configured, when it was saved unchecked (only the Claude model picker ever marks one)."""
+    from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, configured_job_models
+
+    return model_error.unconfirmed(only={configured_job_models()[TIER_INTERACTIVE_CHAT]})
+
+
+def _model_unsupported(connection: dict[str, Any]) -> str | None:
+    # The model setting only matters for the claude-cli provider; ollama / fake ignore it.
+    from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, unusable_setting_text
+
+    if connection.get("provider") != "claude-cli":
+        return None
+    return unusable_setting_text(TIER_INTERACTIVE_CHAT)
 
 
 def _is_recovering(persona_dir: Path) -> bool:
@@ -131,7 +242,7 @@ def _is_recovering(persona_dir: Path) -> bool:
                 return True
         return False
     except Exception:  # noqa: BLE001
-        return False
+        return _flag_failed("orphan_buffers")
 
 
 def _narrative_memory_replayed(persona_dir: Path) -> bool:
@@ -151,7 +262,7 @@ def _narrative_memory_replayed(persona_dir: Path) -> bool:
 
         return bool(load_or_recover(persona_dir).replayed)
     except Exception:  # noqa: BLE001
-        return False
+        return _flag_failed("narrative_memory_replayed")
 
 
 def _felt_time_recovered(persona_dir: Path) -> bool:
@@ -169,9 +280,9 @@ def _felt_time_recovered(persona_dir: Path) -> bool:
     if not state_file.exists():
         return False
     try:
-        return bool(json.loads(state_file.read_text()).get("replayed", False))
+        return bool(json.loads(state_file.read_text(encoding="utf-8")).get("replayed", False))
     except Exception:  # noqa: BLE001
-        return False
+        return _flag_failed("felt_time_recovered")
 
 
 def _build_pending_writes(persona_dir: Path) -> list[dict]:
@@ -218,15 +329,18 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
     """Provider + model + last-heartbeat — drives the Connection panel.
 
     Provider comes from persona_config (the operator-tier choice).
-    Model is provider-specific; for v1 we surface a sensible default
-    per provider rather than read it from a separate config (the
-    runner-side model isn't currently persisted).
+    Model: for a claude-cli persona, the id the chat job runs right now (the
+    install-wide ``model.interactive_chat`` setting, or its fallback to the
+    shipped default after a rejection) and ``model_choice``, the picker word that
+    id means (sonnet / opus / haiku) or None for a custom id; both are None for
+    any other provider (its own model is not a Claude id).
     Last-heartbeat-at comes from heartbeat_state.json — null when the
     heartbeat has never run.
     """
     out: dict[str, Any] = {
         "provider": None,
         "model": None,
+        "model_choice": None,
         "last_heartbeat_at": None,
         "user_pronouns": None,
         "kindled_link_enabled": False,
@@ -235,12 +349,16 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
         "notes_folder": None,
     }
     try:
+        from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, choice_for, model_for_tier
         from brain.persona_config import PersonaConfig
         from brain.pronouns import preset_key_for
 
         cfg = PersonaConfig.load(persona_dir / "persona_config.json")
         out["provider"] = cfg.provider
-        out["model"] = cfg.model
+        if cfg.provider == "claude-cli":
+            chat_model = model_for_tier(TIER_INTERACTIVE_CHAT)
+            out["model"] = chat_model
+            out["model_choice"] = choice_for(chat_model)
         out["user_pronouns"] = preset_key_for(cfg.user_pronouns)
         out["kindled_link_enabled"] = cfg.kindled_link_enabled
         out["kindled_relay_url"] = cfg.kindled_relay_url
@@ -248,59 +366,20 @@ def _build_connection(persona_dir: Path) -> dict[str, Any]:
         out["notes_folder"] = cfg.notes_folder
     except Exception:  # noqa: BLE001
         logger.warning("persona_state: persona_config read failed", exc_info=True)
-    try:
-        hb_path = persona_dir / "heartbeat_state.json"
-        if hb_path.exists():
-            hb = json.loads(hb_path.read_text(encoding="utf-8"))
-            out["last_heartbeat_at"] = hb.get("last_tick_at")
-    except Exception:  # noqa: BLE001
-        logger.warning("persona_state: heartbeat_state read failed", exc_info=True)
+    hb = read_json_result(persona_dir / "heartbeat_state.json", default=dict, expect=dict)
+    if hb.outcome == "ok":  # missing or unreadable: left unset (the module reports an unreadable one)
+        out["last_heartbeat_at"] = hb.data.get("last_tick_at")
     return out
 
 
-def _default_model_for(provider: str) -> str | None:
-    """v1 default model per provider. Replace with a real config field
-    when callers need provider-specific overrides."""
-    if provider == "claude-cli":
-        return "sonnet"
-    if provider == "ollama":
-        return "huihui_ai/qwen2.5-abliterated:7b"
-    if provider == "fake":
-        return "fake"
-    return None
-
-
 def _build_emotions(persona_dir: Path) -> dict[str, float]:
-    """Top non-zero emotions from recent emotion-carrying memories.
-
-    The previous query took the last 50 memories by ``created_at``
-    regardless of whether they actually carried an emotion vector.
-    On a steady-state brain the most recent 50 are almost all
-    heartbeats, observations, and facts — engine-internal records
-    with ``emotions_json = '{}'`` — so the aggregator returned 2-3
-    emotions even when 16+ were live in the underlying memory
-    store. Filtering to non-empty emotion rows fixes the surface
-    Inner Weather panel without aggregating over every active row
-    on each /state poll.
-    """
+    """The emotion engine's short averages, present zeros included, sorted by intensity, rounded for display."""
     try:
-        from brain.emotion.aggregate import aggregate_state
-        from brain.memory.store import MemoryStore, _row_to_memory
+        from brain.emotion import engine
 
-        store = MemoryStore(persona_dir / "memories.db")
-        try:
-            rows = store._conn.execute(  # noqa: SLF001
-                "SELECT * FROM memories "
-                "WHERE active = 1 "
-                "AND emotions_json IS NOT NULL "
-                "AND emotions_json != '{}' "
-                "ORDER BY created_at DESC LIMIT 200"
-            ).fetchall()
-            memories = [_row_to_memory(row) for row in rows]
-            state = aggregate_state(memories)
-            scores = state.emotions
-        finally:
-            store.close()
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+        # pending or retrying, read() returns nothing and the panel shows no emotions.
+        scores = engine.short_values(engine.engine_for(persona_dir).read())
         if not scores:
             return {}
         # Sort desc, round to 1 decimal for UI display
@@ -313,51 +392,54 @@ def _build_emotions(persona_dir: Path) -> dict[str, float]:
         return {}
 
 
-def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:
-    """Body block from compute_body_state. None on failure."""
+def _build_feels_high(persona_dir: Path) -> list[str] | None:
+    """The feeling names `engine.feels_high` answers True for, sorted (`[]` when none is high or the read is empty);
+    None (with a warning) when the engine cannot be asked.
+
+    The app's expressions read this instead of comparing the panel's numbers to levels of their own. Each
+    name asks the engine's predicate, which reads the engine again (the accepted cost of the predicate's one-name signature,
+    the same shape `_build_body` has).
+    """
     try:
-        from brain.body.state import compute_body_state
+        from brain.emotion import engine
+
+        live_engine = engine.engine_for(persona_dir)
+        return sorted(name for name in live_engine.read() if live_engine.feels_high(name))
+    except Exception:  # noqa: BLE001
+        logger.warning("persona_state: feels_high aggregation failed", exc_info=True)
+        return None
+
+
+def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:
+    """Body block projected from the emotion engine's short averages (body_state_from_short). None on failure."""
+    try:
+        from brain.body.state import body_state_from_short
         from brain.body.words import count_words_in_session
-        from brain.emotion.aggregate import aggregate_state
-        from brain.memory.store import MemoryStore, _row_to_memory
+        from brain.emotion import engine
         from brain.utils.memory import days_since_human
 
-        store = MemoryStore(persona_dir / "memories.db")
-        try:
-            # Same fix as _build_emotions: filter to memories that
-            # actually carry an emotion vector. The naive last-50-by-date
-            # slice was almost all heartbeats / observations / facts
-            # (empty emotions_json), so body_emotions stayed at zero
-            # even when the underlying brain had strong signal.
-            rows = store._conn.execute(  # noqa: SLF001
-                "SELECT * FROM memories "
-                "WHERE active = 1 "
-                "AND emotions_json IS NOT NULL "
-                "AND emotions_json != '{}' "
-                "ORDER BY created_at DESC LIMIT 200"
-            ).fetchall()
-            memories = [_row_to_memory(row) for row in rows]
-            state = aggregate_state(memories)
-            days = days_since_human(store, now=now, persona_dir=persona_dir)
-            # session_hours from the active conversation buffer's
-            # earliest entry — 0 when no session is open.
-            session_hours = _active_session_hours(persona_dir, now=now)
-            words = count_words_in_session(
-                store,
-                persona_dir=persona_dir,
-                session_hours=session_hours,
-                now=now,
-            )
-            body = compute_body_state(
-                emotions=state.emotions,
-                session_hours=session_hours,
-                words_written=words,
-                days_since_contact=days,
-                now=now,
-            )
-            return body.to_dict()
-        finally:
-            store.close()
+        live_engine = engine.engine_for(persona_dir)
+        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
+        # pending or retrying, read() returns nothing and the panel shows baselines.
+        short = engine.short_values(live_engine.read())
+        days = days_since_human(now=now, persona_dir=persona_dir)
+        # session_hours from the active conversation buffer's
+        # earliest entry — 0 when no session is open.
+        session_hours = _active_session_hours(persona_dir, now=now)
+        words = count_words_in_session(
+            persona_dir=persona_dir,
+            session_hours=session_hours,
+            now=now,
+        )
+        body = body_state_from_short(
+            short,
+            feels_high=live_engine.feels_high,
+            session_hours=session_hours,
+            words_written=words,
+            days_since_contact=days,
+            now=now,
+        )
+        return body.to_dict()
     except Exception:  # noqa: BLE001
         logger.warning("persona_state: body computation failed", exc_info=True)
         return None
@@ -417,7 +499,7 @@ def _build_interior(persona_dir: Path) -> dict[str, Any]:
         ds_path = persona_dir / "daemon_state.json"
         if not ds_path.exists():
             return out
-        ds = json.loads(ds_path.read_text(encoding="utf-8"))
+        ds = read_json(ds_path, default=dict, expect=dict)
         if last_dream := ds.get("last_dream"):
             # Prefer the full summary over the 80-char theme slice; theme is
             # a hard-cut headline (``mem.content[:80]``) that lands
@@ -453,10 +535,27 @@ def _build_interior(persona_dir: Path) -> dict[str, Any]:
     return out
 
 
-def _build_soul_highlight(persona_dir: Path) -> dict | None:
-    """Pick one crystallization to display: highest resonance, then most recent.
+def _soul_moment(c) -> dict:
+    """One crystallization as the app shows it."""
+    return {
+        "id": c.id,
+        "moment": c.moment,
+        "love_type": c.love_type,
+        "resonance": c.resonance,
+        "crystallized_at": (
+            c.crystallized_at.isoformat() if hasattr(c.crystallized_at, "isoformat") else str(c.crystallized_at)
+        ),
+        "why_it_matters": getattr(c, "why_it_matters", None),
+    }
 
-    None when the soul is empty or the read fails.
+
+def _build_soul(persona_dir: Path) -> tuple[dict | None, dict | None]:
+    """(highlight, strongest): the two crystallizations the Soul tab shows (#637).
+
+    The highlight is the newest active crystallization (the stronger one of two crystallized at the same time), so the
+    tab moves as the soul grows and the app's new-crystallization flash, which watches its id, fires. The strongest is
+    the highest-resonance one (the most recent of a tie), or None when it is the highlight itself. Both None when the
+    soul is empty or the read fails.
     """
     try:
         from brain.soul.store import SoulStore
@@ -464,28 +563,13 @@ def _build_soul_highlight(persona_dir: Path) -> dict | None:
         store = SoulStore(persona_dir / "crystallizations.db")
         try:
             actives = store.list_active()
-            if not actives:
-                return None
-            # sort by (resonance desc, crystallized_at desc)
-            actives.sort(
-                key=lambda c: (c.resonance, c.crystallized_at),
-                reverse=True,
-            )
-            top = actives[0]
-            return {
-                "id": top.id,
-                "moment": top.moment,
-                "love_type": top.love_type,
-                "resonance": top.resonance,
-                "crystallized_at": (
-                    top.crystallized_at.isoformat()
-                    if hasattr(top.crystallized_at, "isoformat")
-                    else str(top.crystallized_at)
-                ),
-                "why_it_matters": getattr(top, "why_it_matters", None),
-            }
         finally:
             store.close() if hasattr(store, "close") else None
+        if not actives:
+            return None, None
+        newest = max(actives, key=lambda c: (c.crystallized_at, c.resonance))
+        strongest = max(actives, key=lambda c: (c.resonance, c.crystallized_at))
+        return _soul_moment(newest), (None if strongest.id == newest.id else _soul_moment(strongest))
     except Exception:  # noqa: BLE001
         logger.warning("persona_state: soul highlight read failed", exc_info=True)
-        return None
+        return None, None

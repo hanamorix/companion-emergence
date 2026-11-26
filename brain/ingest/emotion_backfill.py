@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
@@ -23,6 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from brain import prompt_strings
+from brain.health.json_io import Recovery, read_json, write_json
 from brain.state_compat import from_known_fields
 
 if TYPE_CHECKING:
@@ -52,8 +54,6 @@ _INTER_CALL_DELAY_S = 1.5
 
 _SCHEMA_VERSION = "v1"
 
-_BACKFILL_TIMEOUT_SECONDS = 60
-
 
 # ---------------------------------------------------------------------------
 # State dataclass
@@ -78,22 +78,21 @@ def _state_path(persona_dir: Path) -> Path:
 
 
 def _load_state(persona_dir: Path) -> EmotionBackfillState | None:
-    p = _state_path(persona_dir)
-    if not p.exists():
+    # CONTENT: an unreadable file raises (as it always did); a missing or corrupt one is "no state".
+    raw = read_json(
+        _state_path(persona_dir), default=lambda: None, recover=Recovery.CONTENT, expect=dict
+    )
+    if raw is None:
         return None
     try:
-        raw = json.loads(p.read_text(encoding="utf-8"))
         return from_known_fields(EmotionBackfillState, raw)
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (TypeError, ValueError) as exc:
         logger.warning("emotion_backfill: corrupt state file: %s", exc)
         return None
 
 
 def _save_state(persona_dir: Path, state: EmotionBackfillState) -> None:
-    p = _state_path(persona_dir)
-    tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(asdict(state), indent=2, sort_keys=True), encoding="utf-8")
-    tmp.replace(p)
+    write_json(_state_path(persona_dir), asdict(state), indent=2, sort_keys=True, fsync=False)
 
 
 # ---------------------------------------------------------------------------
@@ -111,22 +110,27 @@ def _today_str(now: _datetime) -> str:
     return now.astimezone().strftime("%Y-%m-%d")
 
 
+def _budget_allows(persona_dir: Path, *, now: _datetime, cap: int) -> bool:
+    """Read-only: True while today's count is under ``cap`` (#473: checked before a call, charged after it)."""
+    raw = read_json(_budget_path(persona_dir), default=dict, recover=Recovery.CONTENT, expect=dict)
+    if raw.get("date") != _today_str(now):
+        return cap > 0
+    return int(raw.get("count", 0)) < cap
+
+
 def _consume_budget(persona_dir: Path, *, now: _datetime, cap: int) -> bool:
     """Return True and decrement if under cap; False if exhausted."""
     path = _budget_path(persona_dir)
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-    except (json.JSONDecodeError, ValueError):
-        raw = {}
+    # CONTENT: a missing or corrupt counter starts at zero, but an unreadable file raises, so the daily cost
+    # cap is never reset by a read fault.
+    raw = read_json(path, default=dict, recover=Recovery.CONTENT, expect=dict)
     today = _today_str(now)
     if raw.get("date") != today:
         raw = {"date": today, "count": 0}
     if int(raw.get("count", 0)) >= cap:
         return False
     raw["count"] = int(raw.get("count", 0)) + 1
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(raw), encoding="utf-8")
-    tmp.replace(path)
+    write_json(path, raw, indent=None, fsync=False)
     return True
 
 
@@ -144,7 +148,7 @@ def _load_vocab() -> frozenset[str]:
 
 
 def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
-    """Keep only registered names with intensity in (0, 10]; clamp to 10."""
+    """Keep only registered names with a finite intensity above 0; clamp to 10. NaN and inf are dropped."""
     result: dict[str, float] = {}
     for name, intensity in raw.items():
         if vocab and name not in vocab:
@@ -153,7 +157,7 @@ def _normalize(raw: dict[str, Any], vocab: frozenset[str]) -> dict[str, float]:
             v = float(intensity)
         except (TypeError, ValueError):
             continue
-        if v <= 0.0:
+        if not math.isfinite(v) or v <= 0.0:
             continue
         result[name] = min(v, 10.0)
     return result
@@ -169,21 +173,15 @@ _TAGGER_SYSTEM_PROMPT = prompt_strings.register("ingest.emotion_backfill.tagger_
 _TAGGER_PROMPT_SEGMENTS = prompt_strings.register_segments("ingest.emotion_backfill.tagger_prompt_segments")
 
 
-def _make_default_tagger(provider: LLMProvider | None) -> Callable:
+def _make_default_tagger(provider: LLMProvider | None, persona_dir: Path | None = None) -> Callable:
     """Return a tagger closure that calls ``provider.generate`` for each memory.
 
-    When ``provider`` is None, constructs a ``ClaudeCliProvider`` pointed at
-    the Haiku model — mirroring the ``_call_haiku`` pattern in
-    ``brain/attunement/detector.py``.
+    ``provider`` is required: the supervisor builds it for the background-classifier job. A None provider
+    raises here rather than failing later inside the tagger, whose ``except`` would turn it into an empty tag
+    for every memory.
     """
     if provider is None:
-        from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, model_for_tier
-        from brain.bridge.provider import ClaudeCliProvider
-
-        provider = ClaudeCliProvider(
-            model=model_for_tier(TIER_BACKGROUND_CLASSIFIER),
-            timeout_seconds=_BACKFILL_TIMEOUT_SECONDS,
-        )
+        raise ValueError("emotion backfill needs a tagger_fn or a provider")
 
     def _tagger(memory) -> dict[str, float]:  # noqa: ANN001
         try:
@@ -195,6 +193,10 @@ def _make_default_tagger(provider: LLMProvider | None) -> Callable:
             raw = json.loads(raw_text)
             return _normalize(raw, vocab)
         except Exception as exc:  # noqa: BLE001
+            from brain.bridge.cli_throttle import ThrottleDeferred
+
+            if isinstance(exc, ThrottleDeferred):
+                raise  # #456/#473: "not now": the run stops here, this memory stays untagged and uncharged
             logger.warning("emotion_backfill: default tagger error: %s", exc)
             return {}
 
@@ -222,8 +224,7 @@ def should_run_emotion_backfill(persona_dir: Path) -> bool:
     from brain.memory.store import MemoryStore
     store = MemoryStore(str(db_path), integrity_check=False)
     try:
-        memories = store.list_active()
-        return any(not m.emotions for m in memories)
+        return store.has_active_without_emotions()
     finally:
         store.close()
 
@@ -259,27 +260,12 @@ def has_emotion_backfill_work(
         return False
     if existing is not None and existing.status == "deferred_to_next_day":
         now = now or _datetime.now(UTC)
-        try:
-            raw = json.loads(_budget_path(persona_dir).read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            raw = {}
-        if isinstance(raw, dict) and raw.get("date") == _today_str(now):
+        raw = read_json(_budget_path(persona_dir), default=dict, expect=dict)
+        if raw.get("date") == _today_str(now):
             return False
-
-    def _scan(s: MemoryStore) -> bool:
-        cur = s._conn.execute(  # noqa: SLF001 — one-column streaming read
-            "SELECT emotions_json FROM memories WHERE active = 1"
-        )
-        try:
-            for (emotions_json,) in cur:
-                if not json.loads(emotions_json):
-                    return True
-            return False
-        finally:
-            cur.close()
 
     if store is not None:
-        return _scan(store)
+        return store.has_active_without_emotions()
 
     db_path = persona_dir / "memories.db"
     if not db_path.exists():
@@ -289,7 +275,7 @@ def has_emotion_backfill_work(
 
     own = _MemoryStore(str(db_path), integrity_check=False)
     try:
-        return _scan(own)
+        return own.has_active_without_emotions()
     finally:
         own.close()
 
@@ -330,8 +316,8 @@ def run_emotion_backfill(
       the one-shot idempotency flag having healed nothing).
 
     ``tagger_fn`` takes priority over ``provider``.  When ``tagger_fn`` is None
-    the default Haiku tagger is used; ``provider`` (if given) is passed to it so
-    tests can inject a stub without shelling out to the Claude CLI.
+    the default tagger is built on ``provider`` (the supervisor's classifier-tier provider; tests inject a stub so
+    nothing shells out to the Claude CLI); with neither given the call raises ``ValueError``.
 
     ``should_pause`` (ram-spike-fix INC-10, S14/S41/S65): checked between
     memories, same as the yield-gate always was; defaults to a bare
@@ -344,7 +330,7 @@ def run_emotion_backfill(
     Mirrors ``brain.attunement.backfill.run_backfill``.
     """
     if tagger_fn is None:
-        tagger_fn = _make_default_tagger(provider)
+        tagger_fn = _make_default_tagger(provider, persona_dir)
 
     now_dt = now_dt or _datetime.now(UTC)
     now_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -372,7 +358,7 @@ def run_emotion_backfill(
 
         # Filter to emotion-less only, sorted deterministically by id (stable cursor).
         candidates = sorted(
-            [m for m in all_active if not m.emotions],
+            [m for m in all_active if not store.has_stored_emotions(m)],
             key=lambda m: m.id,
         )
 
@@ -440,9 +426,12 @@ def run_emotion_backfill(
                         "emotion_backfill: throttle slot unavailable — "
                         "deferring; cursor preserved for next pass"
                     )
-                    break
+                    # #487: RETURN, not break: falling through would run the completion tail and mark a run
+                    # that stopped part-way `complete`, leaving the rest untagged forever.
+                    return state
 
-                if not _consume_budget(persona_dir, now=now_dt, cap=cap):
+                # #473: check the budget now (read-only); charge it after a tagger call that was not refused.
+                if not _budget_allows(persona_dir, now=now_dt, cap=cap):
                     state = replace(state, status="deferred_to_next_day")
                     _save_state(persona_dir, state)
                     logger.info(
@@ -454,9 +443,13 @@ def run_emotion_backfill(
 
                 try:
                     raw_emotions = tagger_fn(memory)
+                except _cli_throttle.ThrottleDeferred:
+                    raise  # #456/#473: "not now": state, cursor and budget stay as they are
                 except Exception as exc:  # noqa: BLE001
+                    _consume_budget(persona_dir, now=now_dt, cap=cap)
                     logger.warning("emotion_backfill: tagger error on %s: %s", memory.id, exc)
                     continue
+                _consume_budget(persona_dir, now=now_dt, cap=cap)
 
                 filtered = _normalize(raw_emotions, vocab)
                 if not filtered:

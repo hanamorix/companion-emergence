@@ -86,6 +86,9 @@ def test_status_reports_persona_config_memory_and_bridge_state(
         ),
     )
     monkeypatch.setattr(cli.state_file, "pid_is_alive", lambda pid: pid == 12345)
+    # #456 (D22): a token-less record names a live bridge only when its command line proves it; this record stands
+    # for one, so the proof is patched to pass (the patched pid stands for the bridge process).
+    monkeypatch.setattr(cli.state_file, "prove_bridge_cmdline", lambda *a, **k: True)
 
     result = cli.main(["status", "--persona", "nell"])
 
@@ -134,6 +137,9 @@ def test_dream_handler_friendly_message_when_no_seed(
     PersonaConfig(provider="fake", searcher="noop", mcp_audit_log_level="metadata").save(
         persona_dir / "persona_config.json"
     )
+    from brain.emotion.engine import ensure_engine_ready
+
+    ensure_engine_ready(persona_dir)  # a dry run needs a switched persona (it cannot do the switch-over, it writes nothing)
 
     result = cli.main(["dream", "--persona", "freshie", "--provider", "fake", "--dry-run"])
 

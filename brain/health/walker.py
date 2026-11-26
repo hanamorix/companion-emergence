@@ -4,11 +4,12 @@ and triggered automatically when a heartbeat tick produces >=2 anomalies."""
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 
 from brain.health.anomaly import BrainAnomaly, BrainIntegrityError
-from brain.health.attempt_heal import attempt_heal
+from brain.health.json_io import Recovery, read_json_result
 
 # Atomic-rewrite files this walker checks. Each entry: filename -> default dict.
 #
@@ -42,7 +43,7 @@ _OPTIONAL_TEXT_FILES: tuple[str, ...] = ("voicecraft.md",)
 def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     """Check every persona file. Heal what's healable; report anomalies.
 
-    Iterates atomic-rewrite files via attempt_heal (captures corruption +
+    Iterates atomic-rewrite files via read_json_result (HEAL) (captures corruption +
     repairs in one shot) then opens each SQLite store so the constructor's
     PRAGMA integrity_check runs. Returns an empty list when everything is
     healthy.
@@ -53,7 +54,8 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
     # to avoid Python's late-binding closure gotcha.
     for name, default in _DEFAULTS.items():
         path = persona_dir / name
-        _, anomaly = attempt_heal(path, default_factory=lambda d=default: d)
+        _res = read_json_result(path, default=lambda d=default: d, recover=Recovery.HEAL)
+        _, anomaly = _res.data, _res.anomaly
         if anomaly is not None:
             anomalies.append(anomaly)
 
@@ -87,8 +89,12 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
 
     # SQLite integrity — constructors run PRAGMA integrity_check where available;
     # works.db is checked explicitly because WorksStore is optimized for hot
-    # request paths and does not deep-scan on every init.
-    for db_name in ("memories.db", "hebbian.db", "crystallizations.db", "data/works.db"):
+    # request paths and does not deep-scan on every init. Its path comes from the one
+    # resolver (#606), so this checks the file the store actually uses.
+    from brain.works.location import works_db_path
+
+    works_name = works_db_path(persona_dir).relative_to(persona_dir).as_posix()
+    for db_name in ("memories.db", "hebbian.db", "crystallizations.db", works_name):
         db_path = persona_dir / db_name
         if not db_path.exists():
             continue
@@ -106,8 +112,9 @@ def walk_persona(persona_dir: Path) -> list[BrainAnomaly]:
                     from brain.soul.store import SoulStore
 
                     SoulStore(db_path=db_path).close()
-                else:  # data/works.db
-                    with sqlite3.connect(str(db_path)) as conn:
+                else:  # works.db
+                    # closing(): the connection's own `with` only commits; an open handle blocks a rename on Windows (#779)
+                    with closing(sqlite3.connect(str(db_path))) as conn:
                         result = conn.execute("PRAGMA integrity_check").fetchall()
                     if result != [("ok",)]:
                         detail = "; ".join(str(row[0]) for row in result)

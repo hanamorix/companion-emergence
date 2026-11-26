@@ -269,7 +269,7 @@ def test_install_service_writes_plist_and_bootstraps_launchd(
     assert calls == [
         ["bootout", target],
         ["bootstrap", launchd.launchctl_domain(), str(plist_path)],
-        ["kickstart", "-k", target],
+        ["kickstart", target],  # #456 S-k: a plain kickstart, never -k (which kills a running job)
     ]
 
 

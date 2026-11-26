@@ -25,7 +25,7 @@ def test_propose_into_authorised_notes_folder_auto_commits(tmp_path, monkeypatch
 
     h = tmp_path / "home"
     monkeypatch.setattr(Path, "home", lambda: h)
-    notes = h / "Documents" / "Phoebe Notes"
+    notes = h / "Documents" / "Canary Notes"
     notes.mkdir(parents=True)
     persona = _persona(tmp_path)
     persona.mkdir(parents=True)
@@ -48,7 +48,7 @@ def test_propose_outside_authorised_folder_still_pending(tmp_path, monkeypatch):
 
     h = tmp_path / "home"
     monkeypatch.setattr(Path, "home", lambda: h)
-    notes = h / "Documents" / "Phoebe Notes"
+    notes = h / "Documents" / "Canary Notes"
     notes.mkdir(parents=True)
     persona = _persona(tmp_path)
     persona.mkdir(parents=True)

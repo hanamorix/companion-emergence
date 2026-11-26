@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from brain.maker.sources import (
     current_emotional_intensity,
     dreams_since,
@@ -30,3 +32,82 @@ def test_dreams_since_counts_only_after_cutoff(tmp_path):
     cutoff = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
     assert dreams_since(store, cutoff) == 1
     store.close()
+
+
+def test_live_current_emotional_intensity_is_the_peak_short_average(tmp_path, emotion_engine_stub):
+    """The maker's input is the highest short average of the engine, not the store's peak."""
+    from brain.emotion.engine import Reading
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        store.create(Memory.create_new("a", "conversation", "us", emotions={"joy": 9.0}))
+        emotion_engine_stub.readings = {
+            "grief": Reading(short=3.5, long=0.0, difference=0.0, shift=0),
+            "awe": Reading(short=0.0, long=0.0, difference=0.0, shift=0),
+        }
+        assert current_emotional_intensity(store) == 3.5
+        emotion_engine_stub.readings = {}
+        assert current_emotional_intensity(store) == 0.0
+    finally:
+        store.close()
+
+
+def test_an_in_memory_store_shows_absent_even_when_the_engine_reads_something(emotion_engine_stub):
+    """An in-memory store has no persona directory, so there is no engine to ask: the intensity is 0.0."""
+    from brain.emotion.engine import Reading
+
+    emotion_engine_stub.readings = {"awe": Reading(short=9.9, long=0.0, difference=0.0, shift=0)}
+    store = MemoryStore(":memory:")
+    try:
+        store.create(Memory.create_new("a", "conversation", "us", emotions={"joy": 6.0}))
+        assert current_emotional_intensity(store) == 0.0
+    finally:
+        store.close()
+
+
+# ---- #721: a making's source is what built the charge ----
+
+
+def _charge(**parts):
+    from brain.maker.charge import MakerCharge
+
+    return MakerCharge(sum(parts.values()), None, None, 0, **parts)
+
+
+def test_making_source_is_the_largest_part(tmp_path):
+    from brain.maker.sources import making_source
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        assert making_source(_charge(emotion_part=1.0, soul_part=4.0, dream_part=2.0), store) == "soul"
+        assert making_source(_charge(emotion_part=1.0, soul_part=2.0, dream_part=4.0), store) == "dream"
+    finally:
+        store.close()
+
+
+def test_making_source_ties_go_soul_then_dream_and_an_empty_charge_has_none(tmp_path):
+    from brain.maker.sources import making_source
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        assert making_source(_charge(emotion_part=2.0, soul_part=2.0, dream_part=2.0), store) == "soul"
+        assert making_source(_charge(emotion_part=2.0, soul_part=0.0, dream_part=2.0), store) == "dream"
+        assert making_source(_charge(), store) is None
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("feelings, source", [
+    ({"grief": 7.0, "joy": 2.0}, "grief"),
+    ({"joy": 6.0, "grief": 1.0}, "joy"),
+    ({"love": 8.0, "joy": 2.0}, None),
+])
+def test_an_emotion_built_charge_takes_her_strongest_feeling(tmp_path, feelings, source):
+    from brain.maker.sources import making_source
+
+    store = MemoryStore(tmp_path / "memories.db")
+    try:
+        store.create(Memory.create_new("felt", "conversation", "us", emotions=feelings))
+        assert making_source(_charge(emotion_part=5.0, soul_part=1.0, dream_part=1.0), store) == source
+    finally:
+        store.close()

@@ -36,7 +36,7 @@ def _use_384_fake_provider(monkeypatch: pytest.MonkeyPatch) -> embeddings_mod.Fa
     this suite's production-shaped vectors."""
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
     return provider
 
 
@@ -129,7 +129,7 @@ def test_is_duplicate_ignores_rows_from_a_different_model_id(
 
     old_provider = _NamedFakeProvider(model_id="fake-384-old")
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: old_provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, old_provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, old_provider.model_id())
     _seed_embedded_memory(store, text)
 
     # Simulate a model swap: a NEW provider/model id, and a fresh matrix
@@ -139,7 +139,7 @@ def test_is_duplicate_ignores_rows_from_a_different_model_id(
     embedding_matrix_mod._reset_embedding_matrix_cache()
     new_provider = _NamedFakeProvider(model_id="fake-384-new")
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: new_provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, new_provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, new_provider.model_id())
 
     result = is_duplicate(text, store=store, threshold=DEFAULT_DEDUP_THRESHOLD)
     assert result is False

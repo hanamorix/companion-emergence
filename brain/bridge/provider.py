@@ -28,6 +28,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
@@ -38,7 +39,7 @@ from typing import Any
 import httpx
 
 from brain import tunables
-from brain.bridge import provider_auth
+from brain.bridge import cli_throttle, model_error, provider_auth, shutdown_progress
 from brain.bridge.chat import (
     ChatMessage,
     ChatResponse,
@@ -48,8 +49,10 @@ from brain.bridge.chat import (
     TextDelta,
     ToolCall,
 )
+from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, model_for_tier
 from brain.bridge.usage_log import log_usage
-from brain.utils.time import format_local, local_display
+from brain.health.json_io import append_jsonl
+from brain.utils.time import format_local, parse_iso_utc
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +63,10 @@ logger = logging.getLogger(__name__)
 # Windows, so off-platform this is 0 (a no-op). stdout/stderr capture is
 # unaffected. Passed as creationflags= on every `claude` spawn below.
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+# #456 (D23): every `claude` child starts in its own session on POSIX, so a terminal Ctrl-C on `nell supervisor run`
+# reaches the bridge (which stops gracefully) and not its in-flight calls. Windows children are already detached from
+# the console (CREATE_NO_WINDOW); subprocess ignores the flag there.
+_OWN_SESSION = os.name != "nt"
 
 # ---------------------------------------------------------------------------
 # Per-turn budget backstop (Task 6 / A)
@@ -71,11 +78,36 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # Matched by substring of the model id so short aliases ("sonnet") and
 # fully-qualified ids ("claude-sonnet-4-6") both resolve.
 _BUDGET_BY_TIER: tuple[tuple[str, float], ...] = (
-    ("haiku", tunables.register("provider.max_turn_budget_usd.haiku", 0.30)),
-    ("sonnet", tunables.register("provider.max_turn_budget_usd.sonnet", 0.75)),
-    ("opus", tunables.register("provider.max_turn_budget_usd.opus", 3.00)),
+    ("haiku", tunables.register(
+        "provider.max_turn_budget_usd.haiku", 0.30,
+        description="Safety cap on what one chat turn on a Haiku model may cost, in US dollars.",
+    )),
+    ("sonnet", tunables.register(
+        "provider.max_turn_budget_usd.sonnet", 0.75,
+        description="Safety cap on what one chat turn on a Sonnet model may cost, in US dollars.",
+    )),
+    ("opus", tunables.register(
+        "provider.max_turn_budget_usd.opus", 3.00,
+        description="Safety cap on what one chat turn on an Opus model may cost, in US dollars.",
+    )),
 )
-_BUDGET_FALLBACK: float = tunables.register("provider.max_turn_budget_usd.fallback", 1.50)
+_BUDGET_FALLBACK: float = tunables.register(
+    "provider.max_turn_budget_usd.fallback", 1.50,
+    description="Safety cap on what one chat turn on any other model may cost, in US dollars.",
+)
+
+# What json.loads raises on a line it cannot take: JSONDecodeError and, on a hostile line, a plain ValueError
+# (a 5000-digit run) or RecursionError (nesting beyond the recursion limit). JSONDecodeError is a ValueError.
+_JSON_LINE_ERRORS: tuple[type[BaseException], ...] = (ValueError, RecursionError)
+
+
+def _text_only(value: object) -> str:
+    """The value if it is a string, else "". A JSON `null` (or a number) in a text field is not text: `str(None)`
+    would put the literal word "None" into a reply (#467)."""
+    return value if isinstance(value, str) else ""
+
+# The result-frame subtype the CLI reports when --max-budget-usd stops a turn (exit code 1).
+_BUDGET_SUBTYPE: str = "error_max_budget_usd"
 
 # Graceful message when the CLI hits the per-turn ceiling mid-reply.
 _BUDGET_EXCEEDED_MSG: str = (
@@ -110,11 +142,8 @@ def _log_stream_timeout(persona_dir: Path | None, payload: dict[str, Any]) -> No
     if persona_dir is None:
         return
     try:
-        path = persona_dir / "stream_timeouts.jsonl"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:  # noqa: BLE001
+        append_jsonl(persona_dir / "stream_timeouts.jsonl", payload, on_error="log", nonfinite="null")
+    except Exception:  # noqa: BLE001 — an unencodable payload must not break stream teardown
         pass
 
 _DEFAULT_TIMEOUT_SECONDS = 300
@@ -220,7 +249,7 @@ def _claude_work_dir() -> str | None:
         logger.debug("claude work dir selection raised", exc_info=True)
     if not _claude_work_dir_warned:
         _claude_work_dir_warned = True
-        extra = " (Windows: no CLAUDE.md-free location under the profile — see #252)" if sys.platform == "win32" else ""
+        extra = " (Windows: no CLAUDE.md-free location under the profile — see #252)" if _is_windows() else ""
         logger.warning(
             "no memory-free working directory for claude spawns; tried %s — the owner's global "
             "CLAUDE.md may reach the companion%s",
@@ -228,6 +257,11 @@ def _claude_work_dir() -> str | None:
             extra,
         )
     return None
+
+
+def _is_windows() -> bool:
+    """Seam for tests: patching ``sys.platform`` globally reaches the stdlib and process-wide caches (#662)."""
+    return sys.platform == "win32"
 
 
 def _claude_work_dir_reset_for_tests() -> None:
@@ -266,17 +300,18 @@ _PROVIDER_CONTEXT_OPTION_KEYS = frozenset(
     # engine.respond — NOT generation params. They must be stripped before options are
     # forwarded to a provider's sampler (e.g. Ollama gen-params), or they corrupt the
     # model call. Keep in sync with every context key engine.py sets on chat_options
-    # (persona_dir + the Option-A/A+ trio). See fork 7e7c7491.
-    {"persona_dir", "volatile_suffix", "include_block_clock", "session_id"}
+    # (persona_dir + the Option-A/A+ trio + user_name, #227). See fork 7e7c7491.
+    {"persona_dir", "volatile_suffix", "include_block_clock", "session_id", "user_name"}
 )
 
 # Per-event idle budget for chat_stream. If no stdout line arrives within
 # this many seconds, the subprocess is treated as wedged: it gets terminated
 # and the stream yields StreamError(stage="claude_cli_idle_timeout"). This
 # is deliberately not bounded by total wall-clock duration — long Opus
-# runs can take time. Overridable via $KINDLED_HOME/tunables.json (#55).
+# runs can take time. Changeable in tunables.toml (#55).
 _STREAM_PER_EVENT_IDLE_SECONDS: float = tunables.register(
-    "provider.stream_per_event_idle_seconds", 60.0
+    "provider.stream_per_event_idle_seconds", 60.0,
+    description="Seconds of silence from Claude in the middle of a reply before the reply is treated as stuck.",
 )
 
 # First-event budget. Wider than the per-event budget because Opus can
@@ -284,7 +319,8 @@ _STREAM_PER_EVENT_IDLE_SECONDS: float = tunables.register(
 # initial subprocess spawn +
 # system-prompt-file write + MCP server boot.
 _STREAM_FIRST_EVENT_SECONDS: float = tunables.register(
-    "provider.stream_first_event_seconds", 120.0
+    "provider.stream_first_event_seconds", 120.0,
+    description="Seconds to wait for Claude to begin a reply before the reply is treated as stuck.",
 )
 
 
@@ -303,6 +339,86 @@ def _stream_first_event_seconds() -> float:
 # when the subprocess closes its stdout (normal exit, error, etc.). Lets
 # the main generator distinguish "reader hit EOF" from a real line.
 _STREAM_EOF = object()
+
+# How long a streaming child gets, at each step, to exit once it has been told to stop or has finished
+# (#482): to leave on its own after its last frame, to answer SIGTERM, to die after SIGKILL, and (a pipe
+# closes when its writer exits) for the stdout reader and the stderr drain to reach EOF after that. One knob,
+# because it is one question: how long may the CLI take to flush its last output and exit? No measurement
+# stands behind 5 seconds: it is the bound this path already used for the reader join before the knob
+# existed, and the steps run one after the other, so the worst case is a small multiple of it. A slow
+# machine raises it in tunables.toml (`provider.child_exit_grace_seconds`).
+_CHILD_EXIT_GRACE_SECONDS: float = tunables.register(
+    "provider.child_exit_grace_seconds", 5.0,
+    description="Seconds the Claude program gets to finish its output and exit before it is stopped.",
+)
+
+# stderr kept for the failure detail (the detail uses its first 200 characters; the rest of a full pipe is
+# read and dropped so the child never blocks on a write): 64 KiB is Linux's default pipe capacity.
+_STDERR_KEEP_CHARS = 65536
+# One read of the child's stderr: a page, so a very long line without a newline is read in pieces.
+_STDERR_READ_CHARS = 4096
+
+
+def _child_exit_grace_seconds() -> float:
+    return tunables.get_tunable("provider.child_exit_grace_seconds", _CHILD_EXIT_GRACE_SECONDS)
+
+
+class _StderrDrain:
+    """Read a child's stderr on a thread for the life of the process (#482).
+
+    A pipe nothing reads fills (64 KiB on Linux) and blocks the child's next write, which stops its stdout.
+    Keeps the first ``_STDERR_KEEP_CHARS`` characters for the failure detail and discards the rest.
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self._chunks: list[str] = []
+        self._kept = 0
+        self._thread = threading.Thread(target=self._run, args=(stream,), daemon=True)
+        self._thread.start()
+
+    def _run(self, stream: Any) -> None:
+        try:
+            while True:
+                chunk = stream.readline(_STDERR_READ_CHARS)
+                if not isinstance(chunk, str) or not chunk:
+                    return
+                if self._kept < _STDERR_KEEP_CHARS:
+                    self._chunks.append(chunk)
+                    self._kept += len(chunk)
+        except (OSError, ValueError):
+            return  # the pipe closed under the reader
+
+    def text(self, wait_s: float | None = None) -> str:
+        """What the child wrote to stderr; waits up to ``wait_s`` (default: the child exit grace) for the pipe to reach EOF (the child has exited)."""
+        self._thread.join(timeout=_child_exit_grace_seconds() if wait_s is None else wait_s)
+        return "".join(self._chunks)
+
+
+def _stop_child(proc: Any, *, finished: bool) -> None:
+    """Leave no child behind: a finished one is given a moment to exit on its own, then terminate, wait, kill, wait (#482).
+
+    Every exit of the streaming generator (result frame, idle timeout, error, generator close) ends here so the
+    child is reaped and one that ignores SIGTERM does not keep running. Each wait is bounded; a child that
+    survives SIGKILL is left to the OS and logged. On Windows ``terminate()`` is already a hard kill.
+    """
+    grace = _child_exit_grace_seconds()
+    try:
+        if proc.poll() is None and finished:
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                pass
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=grace)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=grace)
+    except subprocess.TimeoutExpired:
+        logger.warning("claude child %s did not exit after SIGKILL", getattr(proc, "pid", "?"))
+    except OSError:
+        pass  # already gone
 
 # ---------------------------------------------------------------------------
 # Lean CLI invocation — strip built-in tool definitions (~14K tok/call saved)
@@ -329,7 +445,7 @@ _STREAM_EOF = object()
 #
 # Keep Bash/Edit/Write/Task blocked — a companion has no business with a shell.
 # Do NOT re-add WebFetch/WebSearch; test_web_tools_stay_callable_at_chat_time
-# guards that.
+# guards that. Do NOT add ToolSearch either (#525, test_toolsearch_not_disallowed).
 _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
     "Bash",
     "Read",
@@ -346,7 +462,12 @@ _BUILTIN_TOOLS_DISALLOWED: tuple[str, ...] = (
 
 
 # Built-ins a chat turn may use (#71); background calls get none.
-_CHAT_BUILTIN_TOOLS: tuple[str, ...] = ("WebSearch", "WebFetch")
+# ToolSearch is listed for #525: on claude 2.1.303 the CLI defers tool schemas
+# (sends names, loads a schema on demand) only when ToolSearch is in the tool
+# set. Without it every chat request carried all ~32 schemas up front. With it,
+# every brain tool except ALWAYS_LOADED_TOOLS (brain/mcp_server/tools.py) and
+# both web tools are deferred. Ledger: docs/cli-provider-capabilities.md.
+_CHAT_BUILTIN_TOOLS: tuple[str, ...] = ("WebSearch", "WebFetch", "ToolSearch")
 _NO_BUILTIN_TOOLS: tuple[str, ...] = ()
 
 # Whether this machine's claude CLI has --tools. None = not yet known.
@@ -377,6 +498,14 @@ _TOOLS_REJECTED_RE = re.compile(r"(?<![\w-])--tools\b(?!-)")
 
 
 def _run_tools_probe(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+    shutdown_progress.abandon_gate()  # #456 (D17): nothing new starts once the hard exit has begun
+    try:
+        return _run_tools_probe_spawn(argv)
+    finally:
+        shutdown_progress.abandon_gate()
+
+
+def _run_tools_probe_spawn(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         list(argv),
         capture_output=True,
@@ -389,6 +518,7 @@ def _run_tools_probe(argv: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
         timeout=_TOOLS_PROBE_TIMEOUT_S,
         check=False,
         creationflags=_NO_WINDOW,
+        start_new_session=_OWN_SESSION,  # #456 D23: a terminal Ctrl-C reaches the bridge only
     )
 
 
@@ -533,7 +663,16 @@ def brain_tools_mcp_entry(
     """
     entry: dict = {
         "command": sys.executable,
-        "args": ["-P", "-m", "brain.mcp_server", "--persona-dir", str(persona_dir)],
+        "args": [
+            "-P",
+            "-m",
+            "brain.mcp_server",
+            "--persona-dir",
+            str(persona_dir),
+            # The CLI registers the tools under this entry's "brain-tools" key (#417).
+            "--tool-prefix",
+            ClaudeCliProvider.tool_name_prefix,
+        ],
     }
     env: dict[str, str] = {}
     if request_id is not None:
@@ -575,6 +714,10 @@ class ProviderError(RuntimeError):
 
 class LLMProvider(ABC):
     """Abstract LLM provider.  Subclasses implement both call shapes."""
+
+    # What this backend calls a brain tool: prepended to the bare name wherever text the model
+    # reads names one (brain.tools.naming, #417). Empty where tools are passed in by name.
+    tool_name_prefix: str = ""
 
     @abstractmethod
     def generate(self, prompt: str, *, system: str | None = None) -> str:
@@ -713,7 +856,90 @@ def _system_prompt_tempfile(text: str | None) -> Iterator[str | None]:
             pass
 
 
-def _cli_error_detail(payload: dict) -> str | None:
+# Longest stdout line the assistant-frame scan will parse (a hostile or runaway line is skipped, not parsed).
+_ASSISTANT_SCAN_MAX_LINE = 64 * 1024
+_ERROR_CODE_SHAPE = re.compile(r"[a-z_]{1,40}")
+
+
+def _argv_model(cmd: list[str]) -> str | None:
+    """The model the subprocess was actually run with: the value after ``--model`` in its argv (#448).
+
+    Read from the argv, never looked up again: a settings change can land while a call runs, and the rejection
+    must name the model that was rejected.
+    """
+    try:
+        return cmd[cmd.index("--model") + 1]
+    except (ValueError, IndexError):
+        return None
+
+
+def _assistant_error_code(stdout: str) -> str | None:
+    """The top-level ``error`` code of the LAST assistant frame in an NDJSON stdout that has one (#448).
+
+    ``model_not_found`` sits on that frame, not on the result frame. Never raises: stdout can hold lines
+    that are hostile to ``json.loads`` (a 5000-digit run raises ValueError, deep nesting RecursionError), and
+    this runs inside the failure path, where an escape would replace the real CLI failure with a crash.
+    """
+    found: str | None = None
+    try:
+        for raw in (stdout or "").split("\n"):
+            if not raw or len(raw) > _ASSISTANT_SCAN_MAX_LINE:
+                continue
+            try:
+                obj = json.loads(raw)
+            except _JSON_LINE_ERRORS:
+                continue
+            if not isinstance(obj, dict) or obj.get("type") != "assistant":
+                continue
+            code = obj.get("error")
+            if isinstance(code, str) and _ERROR_CODE_SHAPE.fullmatch(code):
+                found = code
+    except Exception:  # noqa: BLE001 - the failure path must never raise from a scan
+        return found
+    return found
+
+
+def _failure_tokens(status: object, error_code: str | None) -> str:
+    """The structured signals the model-rejection detector reads, as a prefix of the failure text (#448).
+
+    Only the two signals it reads are emitted (status 404 and the ``model_not_found`` code), so no other
+    failure text changes: string classifiers elsewhere (for example ``"429"`` / ``"rate"`` in
+    ``brain.initiate.review``) see exactly what they saw before.
+    """
+    out = ""
+    if str(status) == "404":
+        out += "api_error_status=404; "
+    if error_code == "model_not_found":
+        out += "error=model_not_found; "
+    return out
+
+
+def _with_model_token(detail: str, model: str | None) -> str:
+    """``model=<id>; `` in front of a detail classified as a model rejection: the id that was executed."""
+    from brain.bridge.model_tier import is_valid_model
+
+    if model and is_valid_model(model) and model_error.is_model_rejection(detail):
+        return f"model={model}; {detail}"
+    return detail
+
+
+def _is_over_budget_frame(frame: dict) -> bool:
+    """True for the result frame the CLI emits when --max-budget-usd stops a turn.
+
+    The one definition: `subtype == "error_max_budget_usd"`, or an `is_error` frame whose `errors`
+    say "maximum budget". Total: a malformed `errors` (None, a number, a string, a dict) counts as no
+    errors, so a frame can never raise here.
+    """
+    errors = frame.get("errors")
+    return frame.get("subtype") == _BUDGET_SUBTYPE or bool(
+        frame.get("is_error")
+        and any("maximum budget" in str(e).lower() for e in (errors if isinstance(errors, list) else []))
+    )
+
+
+def _cli_error_detail(
+    payload: dict, *, error_code: str | None = None, model: str | None = None, stdout: str | None = None
+) -> str | None:
     """Detail for a result frame that reports failure, or None if it is fine.
 
     The CLI can exit 0 and report the failure *inside* the frame (#92) — e.g.
@@ -723,18 +949,24 @@ def _cli_error_detail(payload: dict) -> str | None:
     system error as something their companion said.
 
     The over-budget frame is excluded deliberately: it also carries
-    ``is_error`` but holds partial work worth keeping, and has its own
-    graceful path at each call site.
+    ``is_error``, but it is a stop, not a failure, and has its own graceful
+    path at each call site.
+
+    #448: a frame with ``api_error_status`` 404 (and, from the streaming loop, the assistant frame's
+    ``model_not_found`` code via ``error_code``) gets those signals as a prefix; a detail classified as a model
+    rejection also gets ``model=<id the subprocess ran with>``. Frames with any other status are unchanged.
+    ``stdout`` (blocking paths) is scanned for the assistant frame's code, only when the frame is a failure.
     """
     if not payload.get("is_error"):
         provider_auth.note_cli_success()  # #246: a clean frame is the recovery signal
         return None
-    if payload.get("subtype") == "error_max_budget_usd" or any(
-        "maximum budget" in str(e).lower() for e in (payload.get("errors") or [])
-    ):
+    if _is_over_budget_frame(payload):
         return None
     detail = str(payload.get("result") or "").strip()
     detail = detail[:200] if detail else f"is_error with no result text: {payload!r}"[:200]
+    if error_code is None and stdout:
+        error_code = _assistant_error_code(stdout)
+    detail = _with_model_token(_failure_tokens(payload.get("api_error_status"), error_code) + detail, model)
     # #246: every is_error frame on every path passes through here — the one place
     # an auth-expired text can be classified without enumerating raise sites.
     # ponytail: side-effect in a formatter, chosen so no site can be missed (#119 lesson).
@@ -742,7 +974,7 @@ def _cli_error_detail(payload: dict) -> str | None:
     return detail
 
 
-def _claude_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
+def _claude_failure_detail(result: subprocess.CompletedProcess[str], *, model: str | None = None) -> str:
     """Return a useful error detail for failed Claude CLI subprocesses.
 
     Claude Code sometimes exits non-zero with an empty stderr but a structured
@@ -752,7 +984,7 @@ def _claude_failure_detail(result: subprocess.CompletedProcess[str]) -> str:
     ``exit 1:`` lines. Prefer the structured result when present, then fall
     back to stderr/stdout snippets.
     """
-    detail = _claude_failure_detail_text(result)
+    detail = _with_model_token(_claude_failure_detail_text(result), model)
     provider_auth.note_cli_failure(detail)  # #246: every exit!=0 text passes through here
     if not (result.stdout or "").strip():  # #329: a pre-execution failure, e.g. a rejected --tools
         _note_tools_flag_rejected(result.stderr or "")
@@ -768,7 +1000,7 @@ def _last_result_line(stdout: str) -> dict[str, Any] | None:
     for raw in reversed(stdout.split("\n")):
         try:
             obj = json.loads(raw)
-        except json.JSONDecodeError:
+        except _JSON_LINE_ERRORS:
             continue
         if isinstance(obj, dict) and obj.get("type") == "result":
             return obj
@@ -781,12 +1013,14 @@ def _claude_failure_detail_text(result: subprocess.CompletedProcess[str]) -> str
     if stdout:
         try:
             payload = json.loads(stdout)
-        except json.JSONDecodeError:
+        except _JSON_LINE_ERRORS:
             payload = _last_result_line(stdout)  # #330: stream-json NDJSON stdout
         if isinstance(payload, dict):
             parts: list[str] = []
             if payload.get("api_error_status") is not None:
                 parts.append(f"api_error_status={payload['api_error_status']}")
+            if _assistant_error_code(stdout) == "model_not_found":  # #448: lives on the assistant frame
+                parts.append("error=model_not_found")
             if payload.get("is_error") is not None:
                 parts.append(f"is_error={payload['is_error']}")
             if payload.get("result"):
@@ -796,7 +1030,7 @@ def _claude_failure_detail_text(result: subprocess.CompletedProcess[str]) -> str
                     parts.append(f"stderr={stderr}")
                 return "; ".join(parts)
         if not stderr:
-            return f"stdout={stdout[:500]}"
+            return f"stdout={_stdout_shape(stdout) or stdout[:500]}"
     return stderr
 
 
@@ -819,10 +1053,10 @@ class ClaudeCliProvider(LLMProvider):
     text surface:
       - The first "system" message → ``--system-prompt``.
       - A single remaining user message is passed verbatim via ``-p``.
-      - Multi-turn history is serialised as JSONL context data, not a
-        ``User:`` / ``Assistant:`` transcript. Those canonical labels make
-        Claude more likely to continue the transcript and leak labels into
-        Nell's reply.
+      - Multi-turn history is told as one line per message (``<time> Hana: ...``),
+        not a ``User:`` / ``Assistant:`` script. That script made Claude more
+        likely to continue the transcript and leak labels into Nell's reply, so
+        each line leads with its local time and the companion is ``you``.
 
     Tool-calling via --mcp-config
     -----------------------------
@@ -834,16 +1068,29 @@ class ClaudeCliProvider(LLMProvider):
     knows which persona directory to load.
 
     When ``tools`` is None, the text ``-p`` path applies. Multi-turn history
-    is encoded as JSONL context to avoid role-label leakage.
+    is told as narrative lines to avoid role-label leakage.
     """
+
+    # The CLI registers the brain tools under the "brain-tools" MCP server key.
+    tool_name_prefix = "mcp__brain-tools__"
 
     def __init__(
         self,
-        model: str = "sonnet",
+        tier: str = TIER_INTERACTIVE_CHAT,
+        *,
+        probe_model: str | None = None,
         timeout_seconds: int = _DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
-        self._model = model
+        """``tier`` is the JOB this provider does (a name from ``brain.bridge.model_tier``, not a model id): the
+        model is looked up from the user's tunables at every call, so a settings change reaches a provider that is
+        already built. ``probe_model`` pins one id for the save-time probe of a newly chosen model only."""
+        self._tier = tier
+        self._probe_model = probe_model
         self._timeout = timeout_seconds
+
+    def _cli_model(self) -> str:
+        """The id passed to ``claude --model`` for the next call: the probe's pin, else the job's model right now."""
+        return self._probe_model if self._probe_model is not None else model_for_tier(self._tier)
 
     def generate(
         self,
@@ -852,6 +1099,11 @@ class ClaudeCliProvider(LLMProvider):
         system: str | None = None,
         persona_dir: Path | None = None,
     ) -> str:
+        # #456 (D17): once the hard exit has begun, block (no spawn, no answer from a killed call).
+        shutdown_progress.abandon_gate()
+        # #456: a stopping bridge starts no new background call ("not now"; the caller keeps its work).
+        if cli_throttle.shutdown_requested():
+            raise cli_throttle.ShutdownDeferred("bridge is stopping")
         # #246: every background LLM call funnels through generate() (engines call it;
         # initiate's complete() delegates to it). While the login is expired, defer all
         # but one probe per interval so the autonomic layer stops spawning failing CLIs.
@@ -860,6 +1112,7 @@ class ClaudeCliProvider(LLMProvider):
         # Prompt piped via stdin; system prompt via --system-prompt-file.
         # Keeps both heavy payloads off argv (Windows CreateProcess 32,767-char
         # limit — WinError 206). See _system_prompt_tempfile for context.
+        model = self._cli_model()
         cmd = [
             "claude",
             "-p",
@@ -867,7 +1120,7 @@ class ClaudeCliProvider(LLMProvider):
             "--output-format",
             "json",
             "--model",
-            self._model,
+            model,
         ]
         _apply_lean_flags(cmd)  # #329: background calls get no tools at all
         with _system_prompt_tempfile(system) as sp_path:
@@ -875,19 +1128,23 @@ class ClaudeCliProvider(LLMProvider):
                 cmd.extend(["--system-prompt-file", sp_path])
 
             try:
-                result = subprocess.run(
-                    cmd,
-                    input=prompt,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=self._timeout,
-                    env=_subprocess_env(),
-                    cwd=_claude_work_dir(),  # #122: memory-free working directory
-                    check=False,
-                    creationflags=_NO_WINDOW,
-                )
+                try:
+                    result = subprocess.run(
+                        cmd,
+                        input=prompt,
+                        capture_output=True,
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        timeout=self._timeout,
+                        env=_subprocess_env(),
+                        cwd=_claude_work_dir(),  # #122: memory-free working directory
+                        check=False,
+                        creationflags=_NO_WINDOW,
+                        start_new_session=_OWN_SESSION,  # #456 D23: a terminal Ctrl-C reaches the bridge only
+                    )
+                finally:
+                    shutdown_progress.abandon_gate()
             except subprocess.TimeoutExpired as exc:
                 raise TimeoutError(
                     f"ClaudeCliProvider: subprocess timed out after {self._timeout}s"
@@ -896,28 +1153,68 @@ class ClaudeCliProvider(LLMProvider):
         if result.returncode != 0:
             raise RuntimeError(
                 f"ClaudeCliProvider failed (exit {result.returncode}): "
-                f"{_claude_failure_detail(result)}"
+                f"{_claude_failure_detail(result, model=_argv_model(cmd))}"
             )
 
         try:
             payload = json.loads(result.stdout)
-            log_usage(persona_dir, call_type="generate", model=self._model, frame=payload)
+            if not isinstance(payload, dict):
+                raise ValueError("not a result object")
+            log_usage(persona_dir, call_type="generate", model=model, frame=payload)
             # #119: the CLI can exit 0 and report the failure inside the frame,
             # so the returncode guard above never sees it. Without this the error
             # string was returned as the generation itself — and this is the
             # Haiku path, so the attunement detector then parsed "Not logged in
             # · Please run /login" as if it were its classification JSON.
-            cli_err = _cli_error_detail(payload)
+            cli_err = _cli_error_detail(payload, model=_argv_model(cmd))
             if cli_err is not None:
                 raise RuntimeError(f"ClaudeCliProvider: {cli_err}")
-            return str(payload["result"])
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            return _text_only(payload["result"])
+        except (*_JSON_LINE_ERRORS, KeyError, TypeError) as exc:
             raise RuntimeError(
                 f"ClaudeCliProvider: unexpected output format: {result.stdout[:200]!r}"
             ) from exc
 
+    def probe(self, prompt: str) -> str:
+        """One tiny tools-less call whose only job is to find out whether the model is usable (#448).
+
+        Runs ``--output-format stream-json --verbose``, the output chat uses, because only that output carries
+        the ``model_not_found`` code (on the assistant frame; the plain ``json`` output has just the status and
+        the sentence). Parsed by the same functions the blocking chat path uses (``_run_blocking_cli`` /
+        ``_cli_error_detail``), so a rejection is classified from the code. Writes no usage-log row, gives the
+        model no tools, and honours the provider's timeout. Raises ``ProviderAuthDeferred`` while the login is
+        expired (as ``generate`` does) and ``ProviderError`` for any failure, its text carrying the signals.
+        """
+        shutdown_progress.abandon_gate()  # #456 (D17)
+        if cli_throttle.shutdown_requested():  # #456: no new background call while the bridge stops
+            raise cli_throttle.ShutdownDeferred("bridge is stopping")
+        if provider_auth.should_skip_background():
+            raise provider_auth.ProviderAuthDeferred("provider auth expired — deferred")
+        model = self._cli_model()
+        cmd = [
+            "claude",
+            "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            model,
+        ]
+        _apply_lean_flags(cmd)  # #329: no tools at all
+        result, payload = self._run_blocking_cli(cmd, prompt, {})
+        if payload is None:
+            raise ProviderError(
+                "claude_cli_parse",
+                f"unexpected output format: {_stdout_shape(result.stdout) or 'no result frame'}",
+            )
+        cli_err = _cli_error_detail(payload, model=_argv_model(cmd), stdout=result.stdout)
+        if cli_err is not None:
+            raise ProviderError("claude_cli_error", cli_err)
+        return _text_only(payload.get("result"))  # #467: a null or non-string result is not text
+
     def name(self) -> str:
-        return f"claude-cli:{self._model}"
+        return f"claude-cli:{self._cli_model()}"
 
     def chat(
         self,
@@ -929,7 +1226,7 @@ class ClaudeCliProvider(LLMProvider):
         """Flatten messages into Claude CLI; route through MCP when tools given.
 
         When ``tools`` is None:
-          - Sends the current user turn, plus multi-turn JSONL context when
+          - Sends the current user turn, plus multi-turn narrative context when
             needed, via ``-p``.
           - Returns ChatResponse(content=<text>, tool_calls=()).
 
@@ -971,6 +1268,7 @@ class ClaudeCliProvider(LLMProvider):
             conversation_messages,
             volatile_suffix=volatile_suffix,
             include_block_clock=include_block_clock,
+            user_name=(options or {}).get("user_name"),
         )
         _maybe_log_cache_debug(
             options, call_type="chat", system_prompt=system_prompt, volatile_suffix=volatile_suffix
@@ -991,88 +1289,73 @@ class ClaudeCliProvider(LLMProvider):
             )
 
         # Text path for turns without image blocks. Multi-turn history is
-        # formatted as JSONL context data instead of a script with canonical
+        # told as narrative lines instead of a script with canonical
         # User:/Assistant: labels, because those labels can leak into replies.
         # Prompt → stdin, system_prompt → tempfile + --system-prompt-file
         # keeps both off argv (Windows CreateProcess 32,767-char limit).
+        # #356: with a persona dir the CLI runs `stream-json --verbose`, so its built-in
+        # tool calls (WebSearch, WebFetch) are visible in the output and can be audited.
+        # Without one - run_tool_loop's forced final pass, which passes no persona_dir
+        # on purpose - nothing could be audited, so the argv stays `json`.
+        persona_dir_opt = (options or {}).get("persona_dir")
+        audit_dir = Path(persona_dir_opt) if persona_dir_opt else None
         cmd = [
             "claude",
             "-p",
             "--dangerously-skip-permissions",
             "--output-format",
-            "json",
-            "--model",
-            self._model,
+            "stream-json" if audit_dir else "json",
         ]
-        cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
+        if audit_dir:
+            cmd.append("--verbose")
+        model = self._cli_model()
+        cmd.extend(["--model", model])
+        cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(model))])
         _apply_lean_flags(cmd, builtins=_CHAT_BUILTIN_TOOLS)
-        with _system_prompt_tempfile(system_prompt) as sp_path:
-            if sp_path is not None:
-                cmd.extend(["--system-prompt-file", sp_path])
+        builtin_calls: dict[str, dict[str, Any]] = {}
+        try:
+            with _system_prompt_tempfile(system_prompt) as sp_path:
+                if sp_path is not None:
+                    cmd.extend(["--system-prompt-file", sp_path])
+
+                result, payload = self._run_blocking_cli(cmd, flat_prompt, builtin_calls)
 
             try:
-                result = subprocess.run(
-                    cmd,
-                    input=flat_prompt,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=self._timeout,
-                    env=_subprocess_env(),
-                    cwd=_claude_work_dir(),  # #122: memory-free working directory
-                    check=False,
-                    creationflags=_NO_WINDOW,
-                )
-            except subprocess.TimeoutExpired as exc:
+                if payload is None:
+                    raise ValueError("no result frame")
+                if _is_over_budget_frame(payload):
+                    partial = _text_only(payload.get("result")).strip()
+                    text = (
+                        f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
+                    )
+                    # #399: the over-budget turn is the costliest one; log it as the streaming path does.
+                    log_usage(audit_dir, call_type="chat", model=model, frame=payload)
+                    return ChatResponse(content=text, tool_calls=(), raw=payload)
+                cli_err = _cli_error_detail(payload, model=_argv_model(cmd), stdout=result.stdout)
+                if cli_err is not None:
+                    raise ProviderError("claude_cli_error", cli_err)
+                content = _text_only(payload["result"])
+            except (ValueError, KeyError, TypeError) as exc:
                 raise ProviderError(
-                    "claude_cli_timeout",
-                    f"subprocess timed out after {self._timeout}s",
+                    "claude_cli_parse",
+                    "unexpected output format: "
+                    f"{_stdout_shape(result.stdout) or repr(result.stdout[:200])}",
                 ) from exc
 
-        if result.returncode != 0:
-            raise ProviderError(
-                "claude_cli_exit",
-                f"exit {result.returncode}: {_claude_failure_detail(result)}",
+            log_usage(
+                audit_dir,
+                call_type="chat",
+                model=model,
+                frame=payload,
             )
 
-        try:
-            payload = json.loads(result.stdout)
-            if payload.get("subtype") == "error_max_budget_usd" or (
-                payload.get("is_error")
-                and any(
-                    "maximum budget" in str(e).lower()
-                    for e in payload.get("errors", [])
-                )
-            ):
-                partial = str(payload.get("result", "")).strip()
-                text = (
-                    f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
-                )
-                return ChatResponse(content=text, tool_calls=(), raw=payload)
-            cli_err = _cli_error_detail(payload)
-            if cli_err is not None:
-                raise ProviderError("claude_cli_error", cli_err)
-            content = str(payload["result"])
-        except (json.JSONDecodeError, KeyError, TypeError) as exc:
-            raise ProviderError(
-                "claude_cli_parse",
-                f"unexpected output format: {result.stdout[:200]!r}",
-            ) from exc
-
-        persona_dir_opt = (options or {}).get("persona_dir")
-        log_usage(
-            Path(persona_dir_opt) if persona_dir_opt else None,
-            call_type="chat",
-            model=self._model,
-            frame=payload,
-        )
-
-        return ChatResponse(
-            content=_truncate_at_role_leak(content),
-            tool_calls=(),
-            raw=None,
-        )
+            return ChatResponse(
+                content=_truncate_at_role_leak(content),
+                tool_calls=(),
+                raw=None,
+            )
+        finally:
+            _flush_builtin_audit(audit_dir, builtin_calls)
 
     def chat_stream(
         self,
@@ -1084,7 +1367,7 @@ class ClaudeCliProvider(LLMProvider):
         """Yield ChatStreamEvent values as the claude subprocess streams.
 
         Per-event idle timeout: _stream_per_event_idle_seconds() (default 60s,
-        overridable via tunables key provider.stream_per_event_idle_seconds).
+        changeable via tunables key provider.stream_per_event_idle_seconds).
         First-event timeout: _stream_first_event_seconds() (default 120s,
         key provider.stream_first_event_seconds).
         Both can be monkeypatched in tests for fast verification.
@@ -1115,11 +1398,13 @@ class ClaudeCliProvider(LLMProvider):
             conversation_messages,
             volatile_suffix=volatile_suffix,
             include_block_clock=include_block_clock,
+            user_name=(options or {}).get("user_name"),
         )
         _maybe_log_cache_debug(
             options, call_type="chat_stream", system_prompt=system_prompt, volatile_suffix=volatile_suffix
         )
 
+        model = self._cli_model()
         cmd = [
             "claude",
             "-p",
@@ -1128,9 +1413,9 @@ class ClaudeCliProvider(LLMProvider):
             "stream-json",
             "--verbose",
             "--model",
-            self._model,
+            model,
         ]
-        cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
+        cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(model))])
 
         # MCP tools path — write a temp config and extend argv.
         tmp_mcp_path: str | None = None
@@ -1206,7 +1491,7 @@ class ClaudeCliProvider(LLMProvider):
         system_prompt: str | None,
         persona_dir: Path | None = None,
     ) -> Iterator[ChatStreamEvent]:
-        """Core Popen + queue-based streaming loop.
+        """Core Popen + queue-based streaming loop. The usage log names the model ``cmd`` was built with.
 
         Separated from chat_stream() so the generator's finally-block can
         clean up the MCP tempfile after the inner generator is exhausted
@@ -1219,6 +1504,7 @@ class ClaudeCliProvider(LLMProvider):
             if sp_path is not None:
                 cmd = list(cmd) + ["--system-prompt-file", sp_path]
 
+            shutdown_progress.abandon_gate()  # #456 (D17)
             try:
                 proc = subprocess.Popen(
                     cmd,
@@ -1231,6 +1517,7 @@ class ClaudeCliProvider(LLMProvider):
                     env=_subprocess_env(),
                     cwd=_claude_work_dir(),  # #122: memory-free working directory
                     creationflags=_NO_WINDOW,
+                    start_new_session=_OWN_SESSION,  # #456 D23: a terminal Ctrl-C reaches the bridge only
                 )
             except OSError as exc:
                 yield StreamError(stage="claude_cli_spawn", detail=str(exc))
@@ -1246,6 +1533,8 @@ class ClaudeCliProvider(LLMProvider):
 
             reader = threading.Thread(target=_reader, daemon=True)
             reader.start()
+            # #482: stderr is read while the process runs, so a chatty CLI cannot fill the pipe and stall stdout.
+            stderr_drain = _StderrDrain(proc.stderr) if proc.stderr is not None else None
 
             # Send prompt via stdin then close so the subprocess can start.
             try:
@@ -1257,6 +1546,7 @@ class ClaudeCliProvider(LLMProvider):
 
             delta_chunks: list[str] = []
             assistant_snapshot: str | None = None
+            assistant_error: str | None = None  # #448: last assistant frame's error code (model_not_found)
             done_emitted = False
             timeout = _stream_first_event_seconds()
 
@@ -1277,6 +1567,7 @@ class ClaudeCliProvider(LLMProvider):
                     try:
                         item = q.get(timeout=timeout)
                     except _queue_mod.Empty:
+                        shutdown_progress.abandon_gate()
                         proc.terminate()
                         _log_stream_timeout(
                             persona_dir,
@@ -1299,6 +1590,7 @@ class ClaudeCliProvider(LLMProvider):
                         )
                         return
 
+                    shutdown_progress.abandon_gate()  # #456 (D17): no frame of a killed call is acted on
                     if item is _STREAM_EOF:
                         break
 
@@ -1309,7 +1601,9 @@ class ClaudeCliProvider(LLMProvider):
                         continue
                     try:
                         obj = json.loads(line)
-                    except json.JSONDecodeError:
+                    except _JSON_LINE_ERRORS:
+                        continue
+                    if not isinstance(obj, dict):
                         continue
 
                     t = obj.get("type")
@@ -1318,16 +1612,25 @@ class ClaudeCliProvider(LLMProvider):
                     tool_in_flight = False
                     tool_name = None
                     if t == "stream_event":
-                        event = obj.get("event", {})
-                        if event.get("type") == "content_block_delta":
-                            delta = event.get("delta", {})
-                            if delta.get("type") == "text_delta":
-                                text = str(delta.get("text", ""))
-                                delta_chunks.append(text)
-                                yield TextDelta(text=text)
+                        # A frame whose nested value is not an object carries no text: skip it, as the line-level
+                        # non-object skip above does (#467). Only a string is text.
+                        event = obj.get("event")
+                        if isinstance(event, dict) and event.get("type") == "content_block_delta":
+                            delta = event.get("delta")
+                            if isinstance(delta, dict) and delta.get("type") == "text_delta":
+                                text = delta.get("text")
+                                if isinstance(text, str):
+                                    delta_chunks.append(text)
+                                    yield TextDelta(text=text)
                     elif t == "assistant":
+                        _code = obj.get("error")
+                        if isinstance(_code, str) and _ERROR_CODE_SHAPE.fullmatch(_code):
+                            assistant_error = _code
                         # Snapshot frame — fallback content when result frame absent.
-                        msg_content = obj.get("message", {}).get("content", [])
+                        # None, not [], for a message that is not an object: a skipped frame must change nothing
+                        # (an empty list would reset `assistant_snapshot` below). Same shape as the blocking scanner.
+                        message = obj.get("message", {})
+                        msg_content = message.get("content", []) if isinstance(message, dict) else None
                         _collect_builtin_calls(msg_content, builtin_calls)
                         if isinstance(msg_content, list):
                             for blk in msg_content:
@@ -1335,31 +1638,35 @@ class ClaudeCliProvider(LLMProvider):
                                     tool_in_flight = True
                                     tool_name = str(blk.get("name") or "") or None
                                     break
-                            parts = [
-                                blk.get("text", "")
-                                for blk in msg_content
-                                if isinstance(blk, dict) and blk.get("type") == "text"
-                            ]
-                            assistant_snapshot = "".join(parts)
+                            # Only string text counts: a text block whose `text` is null, a number or absent would
+                            # make the join raise TypeError (same class as the frames above; `_tool_result_text` does
+                            # this too). The snapshot is the fallback reply, so a frame whose text is empty ONLY
+                            # because its text blocks were malformed leaves it as it was, like a malformed message;
+                            # a genuinely valid message with no text blocks still replaces it.
+                            parts: list[str] = []
+                            dropped_malformed = False
+                            for blk in msg_content:
+                                if isinstance(blk, dict) and blk.get("type") == "text":
+                                    if isinstance(blk.get("text"), str):
+                                        parts.append(blk["text"])
+                                    else:
+                                        dropped_malformed = True
+                            joined = "".join(parts)
+                            if joined or not dropped_malformed:
+                                assistant_snapshot = joined
                     elif t == "user":
                         _collect_builtin_results(obj, builtin_calls)
                     elif t == "result":
-                        result_text = str(obj.get("result", ""))
+                        result_text = _text_only(obj.get("result", ""))
                         metadata: dict[str, Any] = {
                             k: obj[k]
                             for k in ("duration_ms", "num_turns", "stop_reason", "is_error")
                             if k in obj
                         }
-                        log_usage(persona_dir, call_type="chat", model=self._model, frame=obj)
+                        log_usage(persona_dir, call_type="chat", model=_argv_model(cmd) or "", frame=obj)
                         # Over-budget catastrophe backstop: the CLI hit --max-budget-usd.
                         # Flush any partial text already streamed + append the cut-off note.
-                        if obj.get("subtype") == "error_max_budget_usd" or (
-                            obj.get("is_error")
-                            and any(
-                                "maximum budget" in str(e).lower()
-                                for e in obj.get("errors", [])
-                            )
-                        ):
+                        if _is_over_budget_frame(obj):
                             partial = "".join(delta_chunks).strip() or result_text.strip()
                             cutoff = (
                                 f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}"
@@ -1371,7 +1678,7 @@ class ClaudeCliProvider(LLMProvider):
                             # #92: an exit-0 frame can still report a failure —
                             # surface it as an error rather than streaming the
                             # CLI's error text as her reply.
-                            cli_err = _cli_error_detail(obj)
+                            cli_err = _cli_error_detail(obj, error_code=assistant_error, model=_argv_model(cmd))
                             if cli_err is not None:
                                 yield StreamError(stage="claude_cli_error", detail=cli_err)
                             else:
@@ -1395,9 +1702,17 @@ class ClaudeCliProvider(LLMProvider):
 
                 # EOF: emit terminal event if result frame never arrived.
                 if not done_emitted:
-                    rc = proc.wait()
+                    try:
+                        rc = proc.wait(timeout=_child_exit_grace_seconds())
+                    except subprocess.TimeoutExpired:
+                        # stdout closed but the process did not exit (#482): do not hang here; the finally reaps it.
+                        yield StreamError(
+                            stage="claude_cli_exit",
+                            detail="the claude process did not exit after its output ended",
+                        )
+                        return
                     if rc != 0:
-                        stderr_text = proc.stderr.read() if proc.stderr else ""
+                        stderr_text = stderr_drain.text() if stderr_drain is not None else ""
                         # #246: the one exit!=0 site that bypasses _claude_failure_detail.
                         provider_auth.note_cli_failure(stderr_text)
                         if frames_seen == 0:  # #329: failed before any frame, e.g. rejected --tools
@@ -1414,12 +1729,75 @@ class ClaudeCliProvider(LLMProvider):
                 proc.terminate()
                 raise
             finally:
-                reader.join(timeout=5)
+                # Every exit reaps the child (#482); a finished one (result frame) gets a moment to leave on its own.
+                _stop_child(proc, finished=done_emitted)
+                reader.join(timeout=_child_exit_grace_seconds())
                 # One flush for every exit: on success the proxy exhausts this
                 # generator before it reads the audit log; on a StreamError it
                 # raises out of its for-loop and CPython closes the generator
                 # while the exception unwinds, so the rows are on disk first.
                 _flush_builtin_audit(persona_dir, builtin_calls)
+
+    def _run_blocking_cli(
+        self, cmd: list[str], flat_prompt: str, builtin_calls: dict[str, dict[str, Any]]
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any] | None]:
+        """#456 (D17): no spawn once the hard exit has begun, and no answer from a call it killed."""
+        shutdown_progress.abandon_gate()
+        try:
+            return self._run_blocking_cli_inner(cmd, flat_prompt, builtin_calls)
+        finally:
+            shutdown_progress.abandon_gate()
+
+    def _run_blocking_cli_inner(
+        self, cmd: list[str], flat_prompt: str, builtin_calls: dict[str, dict[str, Any]]
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any] | None]:
+        """Run `claude` to completion for the two blocking `chat()` branches.
+
+        Scans stdout for the CLI's built-in tool calls (#273/#330) BEFORE any raise, so
+        the caller's `finally` can flush them after an exit != 0 and, for a timeout
+        (#380), from the partial stdout, which is all there is. Returns the process and
+        the terminal `result` frame (None if the stream had none).
+        """
+        try:
+            result = subprocess.run(
+                cmd,
+                input=flat_prompt,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self._timeout,
+                env=_subprocess_env(),
+                cwd=_claude_work_dir(),  # #122: memory-free working directory
+                check=False,
+                creationflags=_NO_WINDOW,
+                start_new_session=_OWN_SESSION,  # #456 D23: a terminal Ctrl-C reaches the bridge only
+            )
+        except subprocess.TimeoutExpired as exc:
+            try:
+                _scan_blocking_stream_stdout(_partial_stdout_text(exc.stdout), builtin_calls)
+            except Exception as scan_exc:  # noqa: BLE001 — audit must never mask the timeout
+                logger.warning("built-in tool audit scan of a timed-out turn failed: %s", scan_exc)
+            raise ProviderError(
+                "claude_cli_timeout",
+                f"subprocess timed out after {self._timeout}s",
+            ) from exc
+
+        # Scan before the exit-code check so a non-zero exit still flushes the
+        # built-in calls it saw.
+        payload = _scan_blocking_stream_stdout(result.stdout, builtin_calls)
+
+        # #399: the real CLI exits 1 on a --max-budget-usd overrun (both output formats), with a
+        # result frame saying so. That is the graceful path's input, not a failure: the callers
+        # turn the frame into the budget reply. Keyed on the subtype alone - every real frame
+        # carries it - so no other non-zero exit is swallowed.
+        over_budget = payload is not None and payload.get("subtype") == _BUDGET_SUBTYPE
+        if result.returncode != 0 and not over_budget:
+            raise ProviderError(
+                "claude_cli_exit",
+                f"exit {result.returncode}: {_claude_failure_detail(result, model=_argv_model(cmd))}",
+            )
+        return result, payload
 
     def _chat_with_mcp_tools(
         self,
@@ -1507,6 +1885,7 @@ class ClaudeCliProvider(LLMProvider):
             # even after a long session has grown voice.md + buffer into the
             # tens of KB. This is the exact code path that surfaced WinError
             # 206 in the field.
+            model = self._cli_model()
             cmd = [
                 "claude",
                 "-p",
@@ -1515,71 +1894,49 @@ class ClaudeCliProvider(LLMProvider):
                 "stream-json",
                 "--verbose",
                 "--model",
-                self._model,
+                model,
             ]
             cmd.extend(["--mcp-config", tmp_path])
             cmd.extend(["--allowedTools", *allowed_mcp])
             _apply_lean_flags(cmd, builtins=_CHAT_BUILTIN_TOOLS)
-            cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(self._model))])
+            cmd.extend(["--max-budget-usd", str(_MAX_TURN_BUDGET_USD(model))])
 
             with _system_prompt_tempfile(system_prompt) as sp_path:
                 if sp_path is not None:
                     cmd.extend(["--system-prompt-file", sp_path])
-                try:
-                    result = subprocess.run(
-                        cmd,
-                        input=flat_prompt,
-                        capture_output=True,
-                        env=_subprocess_env(),
-                        cwd=_claude_work_dir(),  # #122: memory-free working directory
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=self._timeout,
-                        check=False,
-                        creationflags=_NO_WINDOW,
-                    )
-                except subprocess.TimeoutExpired as exc:
-                    # #330 / ledger C12: the partial stdout is not scanned, so built-in
-                    # calls made before a timeout are not audited (the streaming path is).
-                    raise ProviderError(
-                        "claude_cli_timeout",
-                        f"subprocess timed out after {self._timeout}s",
-                    ) from exc
-
-            # Parse before the exit-code check so a non-zero exit still flushes
-            # the built-in calls it saw.
-            payload = _scan_blocking_stream_stdout(result.stdout, builtin_calls)
-
-            if result.returncode != 0:
-                raise ProviderError(
-                    "claude_cli_exit",
-                    f"exit {result.returncode}: {_claude_failure_detail(result)}",
-                )
+                result, payload = self._run_blocking_cli(cmd, flat_prompt, builtin_calls)
 
             try:
                 if payload is None:
                     raise ValueError("no result frame")
-                if payload.get("subtype") == "error_max_budget_usd" or (
-                    payload.get("is_error")
-                    and any(
-                        "maximum budget" in str(e).lower()
-                        for e in payload.get("errors", [])
-                    )
-                ):
-                    partial = str(payload.get("result", "")).strip()
+                if _is_over_budget_frame(payload):
+                    partial = _text_only(payload.get("result")).strip()
                     text = (
                         f"{partial}\n\n{_BUDGET_EXCEEDED_MSG}" if partial else _BUDGET_EXCEEDED_MSG
                     )
-                    return ChatResponse(content=text, tool_calls=(), raw=payload)
-                cli_err = _cli_error_detail(payload)
+                    # #399: the over-budget turn is the costliest one; log it as the streaming path does.
+                    log_usage(persona_dir, call_type="chat", model=model, frame=payload)
+                    # The tools that ran before the stop are real (the budget is the backstop for
+                    # runaway tool loops): keep their records, as the success path does.
+                    return ChatResponse(
+                        content=text,
+                        tool_calls=(),
+                        dispatched_invocations=tuple(
+                            _read_audit_lines_since(
+                                audit_log_path, audit_offset_before, request_id=request_id
+                            )
+                        ),
+                        raw=payload,
+                    )
+                cli_err = _cli_error_detail(payload, model=_argv_model(cmd), stdout=result.stdout)
                 if cli_err is not None:
                     raise ProviderError("claude_cli_error", cli_err)
-                content = str(payload["result"])
+                content = _text_only(payload["result"])
             except (ValueError, KeyError, TypeError) as exc:
                 raise ProviderError(
                     "claude_cli_parse",
-                    f"unexpected output format: {result.stdout[:200]!r}",
+                    "unexpected output format: "
+                    f"{_stdout_shape(result.stdout) or repr(result.stdout[:200])}",
                 ) from exc
 
             # Log per-call token usage (incl. cache_creation/cache_read) like the
@@ -1588,7 +1945,7 @@ class ClaudeCliProvider(LLMProvider):
             log_usage(
                 persona_dir,
                 call_type="chat",
-                model=self._model,
+                model=model,
                 frame=payload,
             )
 
@@ -1615,7 +1972,7 @@ class ClaudeCliProvider(LLMProvider):
 
 
 _CLI_BUILTIN_ORIGIN = "cli_builtin"
-_BRAIN_TOOLS_PREFIX = "mcp__brain-tools__"
+_BRAIN_TOOLS_PREFIX = ClaudeCliProvider.tool_name_prefix
 
 
 def _collect_builtin_calls(content: Any, calls: dict[str, dict[str, Any]]) -> None:
@@ -1679,6 +2036,66 @@ def _tool_result_text(content: Any) -> str:
     return json.dumps(content, default=str, ensure_ascii=False)
 
 
+def _partial_stdout_text(raw: bytes | str | None) -> str:
+    """`TimeoutExpired.stdout` as text (#380).
+
+    Even in text mode it is `bytes` on POSIX (the partial read taken before the kill),
+    `str` on Windows (re-read after the kill), and `None` when nothing arrived. Total:
+    never raises.
+    """
+    if isinstance(raw, bytes):
+        return raw.decode("utf-8", errors="replace")
+    return raw if isinstance(raw, str) else ""
+
+
+# The CLI's own `type`/`subtype` words. 40 covers its longest (`error_max_structured_output_retries`,
+# 35, in 2.1.300) with margin; a cap picked against the subtypes first seen turned
+# `error_during_execution` (22) into `?`. The charset, not the length, is what keeps text out.
+_FRAME_KIND_RE = re.compile(r"[A-Za-z0-9_.-]{1,40}")
+_SHAPE_MAX_KINDS = 8
+
+
+def _frame_kind_part(value: Any) -> str:
+    """A frame's `type` or `subtype` as it may be printed: only the CLI's own short
+    vocabulary (<= 40 chars of [A-Za-z0-9_.-]); anything else is the fixed `?`."""
+    return value if isinstance(value, str) and _FRAME_KIND_RE.fullmatch(value) else "?"
+
+
+def _stdout_shape(stdout: str | None) -> str | None:
+    """What a stream-json stdout held, as frame kinds and counts, never its text (#358).
+
+    Under `--verbose` the head of stdout is the CLI's configured hook output, so an
+    error detail built from "the first N characters" would carry whatever the user's
+    hooks print into the bridge logs. None when there is no frame, so callers keep
+    their raw snippet for plain-text and untyped-JSON stdout.
+    """
+    counts: dict[str, int] = {}
+    last = ""
+    other = 0
+    for raw in (stdout or "").split("\n"):
+        if not raw.strip():
+            continue
+        try:
+            obj = json.loads(raw)
+        except Exception:  # noqa: BLE001 — an error path must not raise (RecursionError on deep nesting)
+            obj = None
+        if isinstance(obj, dict) and "type" in obj:
+            last = _frame_kind_part(obj["type"])
+            if obj.get("subtype"):
+                last = f"{last}/{_frame_kind_part(obj['subtype'])}"
+            counts[last] = counts.get(last, 0) + 1
+        else:
+            other += 1
+    if not counts:
+        return None
+    listed = list(counts.items())
+    kinds = ", ".join(f"{kind} x{n}" for kind, n in listed[:_SHAPE_MAX_KINDS])
+    if len(listed) > _SHAPE_MAX_KINDS:
+        kinds += f", +{len(listed) - _SHAPE_MAX_KINDS} more"
+    tail = f"; {other} other line(s)" if other else ""
+    return f"{sum(counts.values())} frame(s), last={last}: {kinds}{tail}"
+
+
 def _scan_blocking_stream_stdout(
     stdout: str | None, calls: dict[str, dict[str, Any]]
 ) -> dict[str, Any] | None:
@@ -1688,7 +2105,6 @@ def _scan_blocking_stream_stdout(
     the terminal `result` frame (the same object `--output-format json` printed),
     or None. Lines split on "\n" only: `str.splitlines()` also breaks on
     U+2028/U+2029/U+0085, which JSON serialisers emit raw inside strings.
-    Not `_parse_stream_json_result`, which is an unrelated (dead) parser below.
     """
     result: dict[str, Any] | None = None
     for raw in (stdout or "").split("\n"):
@@ -1697,7 +2113,7 @@ def _scan_blocking_stream_stdout(
             continue
         try:
             obj = json.loads(line)
-        except json.JSONDecodeError:
+        except _JSON_LINE_ERRORS:
             continue
         if not isinstance(obj, dict):
             continue
@@ -1716,7 +2132,7 @@ def _scan_blocking_stream_stdout(
         # _cli_error_detail would call provider_auth.note_cli_success() on it.
         try:
             whole = json.loads(stdout or "")
-        except json.JSONDecodeError:
+        except _JSON_LINE_ERRORS:
             return None
         if isinstance(whole, dict) and whole.get("type") in (None, "result"):
             return whole
@@ -1814,7 +2230,10 @@ def _read_audit_lines_since(
             continue
         try:
             entry = json.loads(line)
-        except json.JSONDecodeError:
+        except _JSON_LINE_ERRORS:
+            malformed += 1
+            continue
+        if not isinstance(entry, dict):
             malformed += 1
             continue
         if entry.get("origin") == _CLI_BUILTIN_ORIGIN:
@@ -1857,13 +2276,6 @@ def _read_audit_lines_since(
 # ---------------------------------------------------------------------------
 # ClaudeCliProvider — prompt/context formatting helpers
 # ---------------------------------------------------------------------------
-
-
-_CLAUDE_SAFE_SPEAKERS = {
-    "user": "human",
-    "assistant": "companion",
-    "tool": "tool_result",
-}
 
 
 # Lines beginning with a known role label followed by ': ' indicate the
@@ -1946,9 +2358,7 @@ def _maybe_log_cache_debug(
             "volatile_present": bool(volatile_suffix),
             "volatile_tok_est": len(vol_bytes) // 4,
         }
-        path = Path(pd) / "cache_debug.jsonl"
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        append_jsonl(Path(pd) / "cache_debug.jsonl", row, on_error="log")
     except Exception:  # noqa: BLE001 — debug logging must never break a turn
         pass
 
@@ -1958,21 +2368,24 @@ def _format_claude_print_prompt(
     *,
     volatile_suffix: str | None = None,
     include_block_clock: bool = True,
+    user_name: str | None = None,
 ) -> str:
     """Format messages for ``claude -p`` without transcript role labels.
 
     A single text turn stays verbatim to preserve the simple generation shape.
-    Multi-turn history is encoded as JSONL data with non-canonical speaker
-    names. The previous ``User:`` / ``Assistant:`` script shape primed Claude
-    to continue that transcript, which sometimes leaked role labels into
-    Nell's visible reply.
+    Multi-turn history is told as one line per message (``<time> Hana: ...``),
+    one per message. The oldest shape, a ``User:`` / ``Assistant:`` script, primed
+    Claude to continue that transcript and leaked role labels into Nell's visible
+    reply; the JSONL shape that replaced it was sometimes completed onto a reply
+    as ``", "ts": "..."}`` (#227). ``user_name`` is the configured name of the
+    person Nell is talking to (``User`` when absent).
 
     ``volatile_suffix`` (Option A+) is the per-turn ambient context chunk. When
     provided it is appended AFTER the rendered context block in BOTH branches —
     so it is never dropped on a session's first turn (which hits the single-
     message branch) — placing every changing byte at the very end of the stdin
     prompt. ``include_block_clock=False`` drops the relocated clock line from the
-    top of the JSONL block (the suffix carries it instead). Both default to the
+    top of the context block (the suffix carries it instead). Both default to the
     pre-change behaviour, so non-chat callers are unaffected.
     """
     if not messages:
@@ -1984,6 +2397,7 @@ def _format_claude_print_prompt(
             messages,
             includes_latest_user=True,
             include_block_clock=include_block_clock,
+            user_name=user_name,
         )
     if volatile_suffix:
         return f"{base}\n\n{volatile_suffix}"
@@ -1996,13 +2410,15 @@ def _format_claude_context_block(
     includes_latest_user: bool,
     now: datetime | None = None,
     include_block_clock: bool = True,
+    user_name: str | None = None,
 ) -> str:
-    """Return a JSONL context block for Claude CLI prompt/system text.
+    """Return the narrative context block for Claude CLI prompt/system text.
 
-    The wording intentionally avoids the canonical ``User:`` and
-    ``Assistant:`` delimiters. JSON-string encoding also keeps embedded
-    newlines or user-supplied delimiter-looking text inside the data field
-    instead of creating new transcript lines.
+    One physical line per message (see ``_claude_context_lines``). The wording
+    intentionally avoids the canonical ``User:`` and ``Assistant:`` delimiters,
+    and each message's text is a JSON-string literal, so embedded newlines or
+    user-supplied delimiter-looking text stay inside the line instead of
+    creating new transcript lines.
 
     ``now`` is an optional test seam — when None the real UTC clock is used
     internally, then converted to local wall-clock time for display (issue
@@ -2013,10 +2429,10 @@ def _format_claude_context_block(
     of the block. The chat path passes False because that anchor moves to the
     Option A+ volatile suffix (it was the one per-call-changing byte sitting
     above the whole transcript, busting the history prefix); the image path and
-    any other caller keep it. Per-message ``ts`` values are unaffected by this
-    toggle either way, but are independently converted to local time for
-    display in ``_claude_context_jsonl_lines`` (stored/passed-through values
-    stay UTC; only the rendered JSONL is localized).
+    any other caller keep it. Per-message times are unaffected by this toggle
+    either way, but are independently converted to local time for display in
+    ``_claude_context_lines`` (stored/passed-through values stay UTC; only the
+    rendered line is localized).
     """
     if includes_latest_user:
         instruction = (
@@ -2032,105 +2448,160 @@ def _format_claude_context_block(
         )
 
     lines = [
-        "Conversation context is encoded below as JSONL data, not as a transcript to continue.",
+        "What has been said so far is below, one line per message, with the local time "
+        "it was said where that is known. It is context, not a transcript to continue.",
     ]
     if include_block_clock:
         # tz-local-display: block-level "Current time:" anchor (image path etc.)
         now_iso = format_local(now or datetime.now(UTC))
         lines.append(f"Current time: {now_iso}.")
         lines.append(
-            "Each entry's `ts` field (when present) is the wall-clock time of that message; use it to compute how much time has passed."
+            "Each line's time (when present) is the wall-clock time of that message; "
+            "use it to compute how much time has passed."
         )
     lines.append(instruction)
     lines.append("")
-    lines.extend(_claude_context_jsonl_lines(messages))
+    lines.extend(_claude_context_lines(messages, user_name=user_name))
     return "\n".join(lines)
 
 
-def _claude_context_jsonl_lines(messages: list[ChatMessage]) -> Iterator[str]:
-    """Yield one JSON object per chat turn using leak-resistant speaker names.
+_NARRATIVE_NAME_MAX = 40
+_NARRATIVE_LINE_BREAKS = {"\u2028": "\\u2028", "\u2029": "\\u2029", "\u0085": "\\u0085"}
+# Every character that can end a line for ``str.splitlines()`` or a terminal, plus the other C0 controls and DEL.
+# Tab is left alone: it does not start a new line and escaping it only costs readability.
+_NARRATIVE_ESCAPE = re.compile("[\x00-\x08\x0a-\x1f\x7f\x85\u2028\u2029]")
+_NARRATIVE_NAMED_ESCAPES = {"\n": "\\n", "\r": "\\r"}
 
-    ``ts`` (when present) is rendered as local wall-clock time (issue #217) —
-    ``msg.ts`` itself stays the raw stored UTC string; only this rendered
-    copy is converted.
+
+def _one_line(text: str) -> str:
+    """Escape the Unicode line breaks ``json.dumps(ensure_ascii=False)`` leaves raw."""
+    for ch, escaped in _NARRATIVE_LINE_BREAKS.items():
+        text = text.replace(ch, escaped)
+    return text
+
+
+def _narrative_literal(text: str) -> str:
+    """``text`` as a JSON string literal that can never span two physical lines."""
+    return _one_line(json.dumps(text, ensure_ascii=False))
+
+
+def _narrative_text(text: str) -> str:
+    """``text`` with every line break and control character escaped, so it can never span two physical lines.
+
+    Quotes and backslashes are left as written. # ponytail: that makes the escape lossy (a typed ``\\n`` and a
+    real line break read the same); the point is that a message cannot forge a line, and the model does not decode
+    it. Escape the backslash too if anything ever needs to parse the line back.
     """
-    for msg in messages:
-        record: dict[str, Any] = {
-            "speaker": _CLAUDE_SAFE_SPEAKERS.get(msg.role, msg.role),
-            "text": msg.content_text(),
-        }
-        if msg.ts:
-            record["ts"] = local_display(msg.ts)  # tz-local-display: per-message ts in JSONL chat context
-        if msg.tool_call_id:
-            record["tool_call_id"] = msg.tool_call_id
-        if msg.tool_calls:
-            record["tool_calls"] = [tc.to_dict() for tc in msg.tool_calls]
-        yield json.dumps(record, ensure_ascii=False)
-
-
-def _parse_stream_json_result(stdout: str) -> str:
-    """Extract the final assistant reply from a claude stream-json output.
-
-    The stream emits a sequence of JSON-line events; the canonical reply
-    text lives on the ``{"type": "result", "result": "..."}`` frame
-    emitted last. If no result frame is present, fall back to
-    concatenating any ``{"type":"assistant"}`` content with type "text".
-
-    Raises
-    ------
-    ProviderError("error_max_budget_usd", partial_text)
-        When the result frame carries ``subtype == "error_max_budget_usd"``
-        (the per-turn catastrophe ceiling was hit). The partial text so far
-        is included as the detail so the caller can prepend it to the
-        graceful cut-off message.
-    """
-    result_text: str | None = None
-    result_frame: dict | None = None
-    assistant_chunks: list[str] = []
-    for line in stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            frame = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        ftype = frame.get("type")
-        if ftype == "result" and "result" in frame:
-            result_text = str(frame["result"])
-            result_frame = frame
-        elif ftype == "assistant":
-            content = frame.get("message", {}).get("content") or []
-            for block in content:
-                if block.get("type") == "text":
-                    assistant_chunks.append(str(block.get("text", "")))
-    if result_frame is not None and (
-        result_frame.get("subtype") == "error_max_budget_usd"
-        or (
-            result_frame.get("is_error")
-            and any(
-                "maximum budget" in str(e).lower()
-                for e in result_frame.get("errors", [])
-            )
-        )
-    ):
-        raise ProviderError("error_max_budget_usd", result_text or "")
-    # #119: any OTHER is_error frame is a failure, not a reply. Checked after
-    # the over-budget branch above so that frame keeps its dedicated graceful
-    # path — it carries real partial work. Without this the error text was
-    # returned as the assistant reply and persisted as a companion turn.
-    if result_frame is not None:
-        cli_err = _cli_error_detail(result_frame)
-        if cli_err is not None:
-            raise ProviderError("claude_cli_error", cli_err)
-    if result_text is not None:
-        return result_text
-    if assistant_chunks:
-        return "".join(assistant_chunks)
-    raise ProviderError(
-        "claude_cli_parse",
-        f"no result frame in stream-json output: {stdout[:300]!r}",
+    return _NARRATIVE_ESCAPE.sub(
+        lambda m: _NARRATIVE_NAMED_ESCAPES.get(m.group(), f"\\u{ord(m.group()):04x}"), text
     )
+
+
+def _narrative_name(raw: Any) -> str:
+    """A speaker name safe to put in a line: no control or line-break characters, bounded.
+
+    Whitespace of any kind becomes one space first, so a tab inside a name keeps two
+    words; the control, format and separator characters that remain are dropped.
+    May return "".
+    """
+    if not isinstance(raw, str):
+        return ""
+    spaced = "".join(" " if ch.isspace() else ch for ch in raw)
+    kept = "".join(
+        ch
+        for ch in spaced
+        if not unicodedata.category(ch).startswith("C")
+        and unicodedata.category(ch) not in ("Zl", "Zp")
+    )
+    return " ".join(kept.split())[:_NARRATIVE_NAME_MAX].strip()
+
+
+def _narrative_time(ts: str | None) -> str:
+    """Local display time for a stored ``ts``, or "" when absent or unparseable.
+
+    The raw string is never echoed: an unparseable value could carry a line break.
+    """
+    if not ts or not isinstance(ts, str):
+        return ""
+    try:
+        # tz-local-display: per-message time in the narrative chat context. `local_display` is total and would return the
+        # raw text on failure; this caller never echoes an unparseable value, so it renders directly and returns "" itself.
+        return format_local(parse_iso_utc(ts))
+    except Exception:  # noqa: BLE001 — unparseable, or no local equivalent (year 1 in a zone behind UTC)
+        return ""
+
+
+def _claude_context_lines(messages: list[ChatMessage], *, user_name: str | None = None) -> Iterator[str]:
+    """Yield one line per chat turn: ``<time> <who>: <text>`` (#227).
+
+    The time is the stored UTC ``ts`` rendered as local wall-clock time (issue #217);
+    ``msg.ts`` itself is untouched and a missing or unparseable ``ts`` drops the clause.
+    ``<who>`` is the configured user name (``User`` without one, so it cannot be mistaken
+    for a person called "Human") for ``user`` messages and ``you`` for the companion's own.
+    Line breaks inside the text are escaped, so nothing in a message, a name, an id or a
+    ``ts`` can add, remove or reorder lines.
+    """
+    name = _narrative_name(user_name) or "User"
+    for msg in messages:
+        when = _narrative_time(msg.ts)
+        text = _narrative_text(msg.content_text())
+        if msg.role == "user":
+            body = f"{name}: {text}"
+        elif msg.role == "assistant":
+            body = f"you: {text}"
+            for tc in msg.tool_calls:
+                args = _one_line(json.dumps(tc.arguments, ensure_ascii=False, default=str))
+                body += (
+                    f"; it called {_narrative_name(tc.name) or 'a tool'} with {args}"
+                    f" (call id {_narrative_literal(tc.id)})"
+                )
+        elif msg.role == "tool":
+            what = (
+                f"The result of tool call {_narrative_literal(msg.tool_call_id)} came back"
+                if msg.tool_call_id
+                else "The result of a tool call came back"
+            )
+            body = f"{what}: {text}"
+        else:
+            yield f"A {_narrative_name(msg.role) or 'system'} note: {text}"
+            continue
+        yield f"{when} {body}" if when else body
+
+
+def _ollama_messages(messages: list[ChatMessage], options: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Ollama's ``messages`` list, carrying the time context the Claude CLI path puts in its prompt (#551).
+
+    Each ``user`` message with a parseable ``ts`` starts with its local send time (``_narrative_time``, as on the
+    Claude path). The companion's own messages, tool results and system messages are sent as ``to_dict()`` gives
+    them, so a small model never sees itself writing a timestamp and starts copying it. The per-turn
+    ``volatile_suffix`` (current time, felt time, reply frame) is appended to the latest user message: every chat
+    template keeps a user message, where some drop a system message that is not first. With no user message it is
+    sent as a trailing one. Built fresh from the immutable messages on every call, so a tool loop's follow-up calls
+    send the suffix once each, never stacked.
+    """
+    suffix = (options or {}).get("volatile_suffix")
+    out: list[dict[str, Any]] = []
+    latest_user: dict[str, Any] | None = None
+    for msg in messages:
+        d = msg.to_dict()
+        if msg.role == "user":
+            when = _narrative_time(msg.ts)
+            if when:
+                content = d["content"]
+                if isinstance(content, str):
+                    d["content"] = f"{when} {content}"
+                else:
+                    d["content"] = [{"type": "text", "text": when}, *content]
+            latest_user = d
+        out.append(d)
+    if suffix:
+        if latest_user is None:
+            out.append({"role": "user", "content": suffix})
+        elif isinstance(latest_user["content"], str):
+            latest_user["content"] = f"{latest_user['content']}\n\n{suffix}"
+        else:
+            latest_user["content"] = [*latest_user["content"], {"type": "text", "text": suffix}]
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -2151,12 +2622,18 @@ class OllamaProvider(LLMProvider):
     Streaming
     ---------
     ``chat_stream()`` POSTs with ``stream=True`` and yields each content
-    chunk as Ollama emits it. The bridge WS handler (or any other
-    streaming consumer) can pipe these straight to the client without
-    waiting for the full reply. Tool-calling is intentionally not on
+    chunk as Ollama emits it, for a consumer that wants raw text as it
+    arrives. The bridge's ``/stream`` WebSocket does not use it: chat turns
+    carry tools, so ``_StreamingProxy`` calls :meth:`chat` and word-chunks
+    the reply (see ``chat_stream_speaks_events``). Tool-calling is intentionally not on
     the streaming path — pass ``tools=`` through :meth:`chat` instead,
     which returns a structured ChatResponse with parsed tool_calls.
     """
+
+    # chat_stream() yields plain str chunks and takes no tools, so the bridge's
+    # _StreamingProxy must not treat it as an event stream; it sends Ollama
+    # turns through chat() and word-chunks the reply instead (#810).
+    chat_stream_speaks_events = False
 
     def __init__(
         self,
@@ -2199,7 +2676,7 @@ class OllamaProvider(LLMProvider):
         """
         payload: dict[str, Any] = {
             "model": self._model,
-            "messages": [m.to_dict() for m in messages],
+            "messages": _ollama_messages(messages, options),
             "stream": False,
         }
         if tools:
@@ -2227,21 +2704,33 @@ class OllamaProvider(LLMProvider):
 
         try:
             data = resp.json()
-        except ValueError as exc:
+        except _JSON_LINE_ERRORS as exc:
             raise ProviderError("ollama_parse", f"invalid json: {exc}") from exc
 
+        # A body or a nested value of the wrong shape is a parse error, not an AttributeError/TypeError out of
+        # chat() (#468). A falsy `message` (null, "", 0, [], false) stays "an empty message", as it always was.
+        if not isinstance(data, dict):
+            raise ProviderError("ollama_parse", f"response is not a JSON object: {type(data).__name__}")
         msg = data.get("message") or {}
-        content: str = msg.get("content", "") or ""
-        raw_tool_calls: list[dict[str, Any]] = msg.get("tool_calls") or []
+        if not isinstance(msg, dict):
+            raise ProviderError("ollama_parse", f"message is not an object: {type(msg).__name__}")
+        content = msg.get("content", "") or ""
+        if not isinstance(content, str):
+            raise ProviderError("ollama_parse", f"message.content is not a string: {type(content).__name__}")
+        raw_tool_calls = msg.get("tool_calls") or []
+        if not isinstance(raw_tool_calls, list):
+            raise ProviderError(
+                "ollama_parse", f"message.tool_calls is not a list: {type(raw_tool_calls).__name__}"
+            )
 
         parsed_tool_calls: list[ToolCall] = []
         for tc_dict in raw_tool_calls:
             try:
                 parsed_tool_calls.append(ToolCall.from_provider_dict(tc_dict))
-            except ValueError as exc:
+            except _JSON_LINE_ERRORS as exc:
                 raise ProviderError(
                     "ollama_parse",
-                    f"malformed tool_call in response: {exc}",
+                    f"malformed tool_call in response: {str(exc)[:200]}",
                 ) from exc
 
         return ChatResponse(
@@ -2280,7 +2769,12 @@ class OllamaProvider(LLMProvider):
         Yields
         ------
         str
-            Each content chunk Ollama emits. Empty chunks are skipped.
+            Each content chunk Ollama emits. Empty chunks are skipped, and so is
+            anything that is not a usable frame: a line that is valid JSON but not
+            an object, and a frame whose ``message`` is not an object or whose
+            ``content`` is not a string contribute no chunk (a ``done`` on such a
+            frame still ends the stream). Unlike :meth:`chat`, which rejects a
+            reply of the wrong shape with ``ollama_parse``, the stream keeps going.
 
         Raises
         ------
@@ -2289,11 +2783,12 @@ class OllamaProvider(LLMProvider):
         ProviderError("ollama_request", ...)
             Network-level failure (connection refused, DNS, etc.).
         ProviderError("ollama_parse", ...)
-            A streamed line could not be JSON-decoded.
+            A streamed line could not be JSON-decoded (including a line nested
+            past the recursion limit or a digit run past the integer limit).
         """
         payload: dict[str, Any] = {
             "model": self._model,
-            "messages": [m.to_dict() for m in messages],
+            "messages": _ollama_messages(messages, options),
             "stream": True,
         }
         if options:
@@ -2326,14 +2821,16 @@ class OllamaProvider(LLMProvider):
                         continue
                     try:
                         frame = json.loads(line)
-                    except json.JSONDecodeError as exc:
+                    except _JSON_LINE_ERRORS as exc:
                         raise ProviderError(
                             "ollama_parse",
                             f"invalid streaming line json: {exc}",
                         ) from exc
+                    if not isinstance(frame, dict):
+                        continue  # valid JSON that is not an object carries no frame (#468)
                     msg = frame.get("message") or {}
-                    chunk = msg.get("content")
-                    if chunk:
+                    chunk = msg.get("content") if isinstance(msg, dict) else None
+                    if chunk and isinstance(chunk, str):
                         yield chunk
                     if frame.get("done"):
                         return
@@ -2347,6 +2844,9 @@ class OllamaProvider(LLMProvider):
         lives in one place.  This is the first working Ollama generate() path
         in companion-emergence — previously this raised NotImplementedError.
         """
+        shutdown_progress.abandon_gate()  # #456 (D17)
+        if cli_throttle.shutdown_requested():  # #456: no new background call while the bridge stops
+            raise cli_throttle.ShutdownDeferred("bridge is stopping")
         messages: list[ChatMessage] = []
         if system:
             messages.append(ChatMessage(role="system", content=system))
@@ -2360,42 +2860,24 @@ class OllamaProvider(LLMProvider):
 # ---------------------------------------------------------------------------
 
 
-def get_provider(
-    name: str,
-    *,
-    persona_dir: Path | None = None,
-    model_override: str | None = None,
-) -> LLMProvider:
+def get_provider(name: str, *, tier: str = TIER_INTERACTIVE_CHAT) -> LLMProvider:
     """Resolve a provider identifier to an instance.
 
     Parameters
     ----------
     name:
-        Provider name — "claude-cli", "ollama", or "fake".
-    persona_dir:
-        Optional path to the persona directory. When provided and the
-        provider is "claude-cli", the model is read from the persona's
-        persona_config.json (if present). Ignored for non-claude-cli providers.
-    model_override:
-        Explicit model name that wins over both persona_config and the
-        default. Useful for CLI --model flags. Ignored for non-claude-cli
-        providers.
+        Provider name: "claude-cli", "ollama", or "fake".
+    tier:
+        The JOB the provider will do (a ``brain.bridge.model_tier`` name). The "claude-cli" provider looks its model
+        up from the user's tunables for that job at every call. Ignored for "ollama" and "fake", which run their own
+        model.
 
     Raises ValueError on unknown name.
     """
     if name == "fake":
         return FakeProvider()
     if name == "claude-cli":
-        from brain.persona_config import DEFAULT_MODEL, PersonaConfig
-
-        model = model_override
-        if model is None and persona_dir is not None:
-            cfg_path = persona_dir / "persona_config.json"
-            if cfg_path.exists():
-                model = PersonaConfig.load(cfg_path).model
-        if model is None:
-            model = DEFAULT_MODEL
-        return ClaudeCliProvider(model=model)
+        return ClaudeCliProvider(tier)
     if name == "ollama":
         return OllamaProvider()
     raise ValueError(f"Unknown provider: {name!r}")

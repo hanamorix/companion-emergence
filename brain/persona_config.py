@@ -7,19 +7,19 @@ sensible defaults; a persona's owner (developer, or future GUI tooling)
 can override them in this file. CLI `--provider` / `--searcher` flags are
 developer overrides only — they don't get written back to the file.
 
-See `docs/superpowers/audits/2026-04-25-principle-alignment-audit.md`
-(PR-B) for the principle behind this split.
+The principle behind this split came from the 2026-04-25 principle-alignment
+audit (PR-B), which was never committed and is lost (#797).
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from brain.health.json_io import Recovery, read_json_result, write_json
 
 if TYPE_CHECKING:
     from brain.health.anomaly import BrainAnomaly
@@ -27,7 +27,6 @@ if TYPE_CHECKING:
 DEFAULT_PROVIDER = "claude-cli"
 DEFAULT_SEARCHER = "ddgs"
 DEFAULT_MCP_AUDIT_LOG_LEVEL = "redacted"
-DEFAULT_MODEL = "sonnet"
 # The hosted Kindled-link relay (free CF Worker, Phase 1). NOT wired into
 # PersonaConfig.load — kindled_relay_url stays None until a peer connect adopts
 # a relay (Phase 2), so an un-connected persona is dormant. Used only at
@@ -35,13 +34,14 @@ DEFAULT_MODEL = "sonnet"
 DEFAULT_KINDLED_RELAY_URL = "https://kindled-relay.kindledrelay.workers.dev"
 
 # Allowlists for hand-edited or migrated config files. A value outside
-# the set degrades to the default with an attempt_heal anomaly logged
+# the set degrades to the default with a json_io HEAL anomaly logged
 # rather than letting an invalid choice surface as a runtime crash at
-# bridge startup or heartbeat-close time. Keep these in sync with
+# bridge startup or in a heartbeat. Keep these in sync with
 # brain/bridge/provider.py:get_provider and brain/search/factory.py.
 KNOWN_PROVIDERS = frozenset({"claude-cli", "ollama", "fake"})
 KNOWN_SEARCHERS = frozenset({"ddgs", "noop"})
-KNOWN_MODELS = frozenset({"sonnet", "opus", "haiku"})
+# The retired per-persona model keys (see ``PersonaConfig.legacy_model_settings`` and ``brain.model_migration``).
+LEGACY_MODEL_KEYS = ("model", "tier_models", "derived_unavailable")
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +52,6 @@ def _default_persona_config_dict() -> dict:
         "searcher": DEFAULT_SEARCHER,
         "mcp_audit_log_level": DEFAULT_MCP_AUDIT_LOG_LEVEL,
         "user_name": None,
-        "model": DEFAULT_MODEL,
         "user_pronouns": None,
         "notes_enabled": False,
         "notes_folder": None,
@@ -63,7 +62,8 @@ def _default_persona_config_dict() -> dict:
 
 @dataclass
 class PersonaConfig:
-    """Per-persona routing config — currently provider + searcher.
+    """Per-persona routing config (currently provider + searcher). The model is NOT here: which model runs a job
+    is an install-wide setting in the tunables file (``brain.bridge.model_tier``).
 
     Future fields (face, body, voice presets) will land here too — the
     file is the persona's "who am I" surface, separate from the heartbeat's
@@ -85,13 +85,18 @@ class PersonaConfig:
     searcher: str = DEFAULT_SEARCHER
     mcp_audit_log_level: str = DEFAULT_MCP_AUDIT_LOG_LEVEL
     user_name: str | None = None
-    model: str = DEFAULT_MODEL
     last_opened_at: str | None = None  # ISO8601 with Z suffix; written by bridge on startup
     user_pronouns: dict | None = None  # expanded PronounSet dict; None → she/her at use-time
     notes_enabled: bool = False
     notes_folder: str | None = None  # resolved cross-platform path, set on enable
     kindled_link_enabled: bool = False
     kindled_relay_url: str | None = None  # relay where this Kindled's mailbox lives; None = not wired
+    # PERMANENT backward compatibility (an install can upgrade from any earlier version, now or later): the raw values
+    # of the retired per-persona model keys (`model`, `tier_models`, `derived_unavailable`) exactly as the file holds
+    # them, never interpreted. `save()` rebuilds the file from this dataclass, and the bridge's first config touch is
+    # a load -> save, so without this field a saved model would be erased before `brain.model_migration` reads it.
+    # Re-emitted by `save()` while non-empty; the migration removes the keys from the file once it has dealt with them.
+    legacy_model_settings: dict = field(default_factory=dict)
 
     def touch_last_opened(self) -> None:
         """Set last_opened_at to current UTC time, ISO8601 with Z suffix."""
@@ -148,17 +153,7 @@ class PersonaConfig:
             if isinstance(kindled_relay_url_raw, str) and kindled_relay_url_raw.strip()
             else None
         )
-        model_raw = data.get("model", DEFAULT_MODEL)
-        model_str = model_raw if isinstance(model_raw, str) and model_raw else DEFAULT_MODEL
-        if model_str in KNOWN_MODELS:
-            model = model_str
-        else:
-            logger.warning(
-                "PersonaConfig: unknown model %r — falling back to %r",
-                model_str,
-                DEFAULT_MODEL,
-            )
-            model = DEFAULT_MODEL
+        legacy_model_settings = {k: data[k] for k in LEGACY_MODEL_KEYS if k in data}
         last_opened_at_raw = data.get("last_opened_at")
         last_opened_at = (
             last_opened_at_raw
@@ -170,13 +165,13 @@ class PersonaConfig:
             searcher=searcher,
             mcp_audit_log_level=audit_level,
             user_name=user_name,
-            model=model,
             last_opened_at=last_opened_at,
             user_pronouns=user_pronouns,
             notes_enabled=notes_enabled,
             notes_folder=notes_folder,
             kindled_link_enabled=kindled_link_enabled,
             kindled_relay_url=kindled_relay_url,
+            legacy_model_settings=legacy_model_settings,
         )
 
     @classmethod
@@ -186,10 +181,8 @@ class PersonaConfig:
         Returns (instance, anomaly_or_None). Missing file → defaults, no anomaly.
         Corrupt file → quarantine + restore from .bak1/.bak2/.bak3 or reset.
         """
-        from brain.health.attempt_heal import attempt_heal
-
-        data, anomaly = attempt_heal(path, _default_persona_config_dict)
-        return cls._parse_data(data), anomaly
+        res = read_json_result(path, default=_default_persona_config_dict, recover=Recovery.HEAL)
+        return cls._parse_data(res.data), res.anomaly
 
     @classmethod
     def load(cls, path: Path) -> PersonaConfig:
@@ -204,16 +197,14 @@ class PersonaConfig:
         return instance
 
     def save(self, path: Path) -> None:
-        """Atomic save via .bak rotation (save_with_backup)."""
+        """Atomic save via .bak rotation (write_json)."""
         from brain.health.adaptive import compute_treatment
-        from brain.health.attempt_heal import save_with_backup
 
         payload = {
             "provider": self.provider,
             "searcher": self.searcher,
             "mcp_audit_log_level": self.mcp_audit_log_level,
             "user_name": self.user_name,
-            "model": self.model,
             "last_opened_at": self.last_opened_at,
             "user_pronouns": self.user_pronouns,
             "notes_enabled": self.notes_enabled,
@@ -221,21 +212,7 @@ class PersonaConfig:
             "kindled_link_enabled": self.kindled_link_enabled,
             "kindled_relay_url": self.kindled_relay_url,
         }
+        payload.update(self.legacy_model_settings)  # permanent pass-through, see the field's comment
         treatment = compute_treatment(path.parent, path.name)
-        save_with_backup(path, payload, backup_count=treatment.backup_count)
-        if treatment.verify_after_write:
-            self._verify_after_write(path)
+        write_json(path, payload, backups=treatment.backup_count, verify=treatment.verify_after_write)
 
-    def _verify_after_write(self, path: Path) -> None:
-        """Re-read the written file; if corrupt, restore from .bak1."""
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError("non-dict payload after write")
-        except (json.JSONDecodeError, ValueError, OSError):
-            logger.error(
-                "PersonaConfig verify_after_write failed for %s; restoring from .bak1", path
-            )
-            bak1 = path.with_name(path.name + ".bak1")
-            if bak1.exists():
-                shutil.copy2(bak1, path)

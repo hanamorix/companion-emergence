@@ -10,7 +10,7 @@ import json
 from pathlib import Path
 
 import brain.ingest.buffer as buffer_mod
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import read_jsonl
 from brain.ingest.buffer import (
     _archive_segments,
     _archived_conversations_dir,
@@ -85,7 +85,7 @@ def test_c11_archive_segments_reader_crash(tmp_path: Path, monkeypatch) -> None:
     # H6: a newest-segment-only reader would miss the earlier records —
     # confirm the full multi-segment reader recovers strictly more.
     newest_seg_num, newest_seg_path = _archive_segments(tmp_path, sid)[-1]
-    newest_only = read_jsonl_skipping_corrupt(newest_seg_path)
+    newest_only = read_jsonl(newest_seg_path)
     assert len(newest_only) < len(got_after_crash)
 
     # --- back-compat: a legacy single <sid>.jsonl still reads ----------

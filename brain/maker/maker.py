@@ -9,8 +9,10 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 from brain import prompt_strings
+from brain.health.parse_failures import record_parse_failure
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +59,8 @@ def parse_making(raw: str) -> Making:
     )
 
 
-def make(provider, *, charge_sources: list[str], emotion_summary: str) -> Making:
+def make(provider, *, charge_sources: list[str], emotion_summary: str,
+         persona_dir: Path | None = None) -> Making:
     """Run one budgeted making call through the provider. Caller holds the
     background_slot + budget (Task 9). Raises ValueError on unusable output.
 
@@ -67,4 +70,8 @@ def make(provider, *, charge_sources: list[str], emotion_summary: str) -> Making
     """
     prompt = build_making_prompt(charge_sources=charge_sources, emotion_summary=emotion_summary)
     raw = provider.complete(prompt)
-    return parse_making(raw)
+    try:
+        return parse_making(raw)
+    except ValueError as exc:
+        record_parse_failure(persona_dir, site="maker", raw=raw, error=str(exc))  # #364
+        raise

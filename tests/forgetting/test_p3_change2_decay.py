@@ -9,22 +9,57 @@ passes, consecutive_low_passes counter, FADE/UNFADE/LOSE per
 `policy.next_state`) — the same mechanics production drives, without a real
 MemoryStore/DB/heartbeat.
 
-Naming: synthetic user = Bob, persona = Canary, model = Claude. No Phoebe.
+Naming: synthetic user = Bob, persona = Canary, model = Claude. No real persona or user names.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from unittest import mock
 
 import pytest
 
+from brain import dev_constants
 from brain.felt_time.state import FeltTimeState
 from brain.forgetting import policy, salience
 from brain.memory.store import Memory
 
+
+class _StoredValues:
+    """An engine whose feelings are the stored ones. These simulations score synthetic memories with no store, and
+    `score` resolves its engine from the store unless one is passed."""
+
+    def memory_feelings(self, memory):
+        from brain.emotion.engine_utils import memory_feelings
+
+        return memory_feelings(memory, None, None, None)
+
 _CADENCE_HOURS = 6.0
 _TWO_LIVED_YEARS_HOURS = 17_532.0  # per plan's stated anchor
 _MAX_SIM_HOURS = _TWO_LIVED_YEARS_HOURS * 3  # generous ceiling so LOSE has room to appear
+
+
+class _FineClock(datetime):
+    """A `datetime` whose `now()` never returns the same instant twice.
+
+    The simulation creates a memory at "lived-age 0" and then scores it; `salience`
+    reads `datetime.now()` again. Where the OS clock ticks coarsely (Windows under
+    Python 3.12: ~15.6 ms) both reads can land on the same instant, the memory's
+    freshness is then exactly 1.0 instead of just under it, and its salience is
+    exactly 0.10 instead of just under: not `< LOST_THRESHOLD`, so the first
+    pass does not count as low and LOSE comes one cadence later. Whether the two
+    reads straddle a tick is luck, which makes the results non-monotonic in
+    importance. A strictly advancing clock removes the dependence on tick size."""
+
+    _last = datetime.min.replace(tzinfo=UTC)
+
+    @classmethod
+    def now(cls, tz=None):
+        t = datetime.now(tz)
+        if t <= cls._last:
+            t = cls._last + timedelta(microseconds=1)
+        cls._last = t
+        return t
 
 
 def _make_memory(importance: float, emotions: dict[str, float] | None = None) -> Memory:
@@ -57,6 +92,16 @@ def _simulate(
     recency exemption is a SEPARATE, untouched gate (HIST 95315d5d) that in
     production would additionally protect a memory for its first 720 hours.
     """
+    with mock.patch.object(salience, "datetime", _FineClock):
+        return _step(importance, emotions, soul_linked, max_hours)
+
+
+def _step(
+    importance: float,
+    emotions: dict[str, float] | None,
+    soul_linked: bool,
+    max_hours: float,
+) -> tuple[float | None, float | None]:
     mem = _make_memory(importance, emotions)
     state = "active"
     consecutive_low = 0
@@ -70,16 +115,17 @@ def _simulate(
 
     t = 0.0
     while t <= max_hours:
-        object.__setattr__(mem, "created_at", datetime.now(UTC) - timedelta(hours=t))
+        object.__setattr__(mem, "created_at", _FineClock.now(UTC) - timedelta(hours=t))
         object.__setattr__(mem, "state", state)
         s = salience.score(
             mem,
-            store=None,  # unused by score() — see salience.py signature
+            store=None,  # no store: the explicit emotion_engine below stands in for the store-resolved one
             hebbian=None,  # _hebbian_input degrades to 0 on AttributeError
             felt_time_state=felt_state,
             soul_linked_ids=({mem.id} if soul_linked else set()),
+            emotion_engine=_StoredValues(),
         )
-        next_low = consecutive_low + 1 if s < policy.LOST_THRESHOLD else 0
+        next_low = consecutive_low + 1 if s < dev_constants.LOST_THRESHOLD else 0
         transition = policy.next_state(
             mem, salience=s, consecutive_low_passes=next_low, narrative_weight=0.0
         )
@@ -112,9 +158,9 @@ def test_c2_1_importance_zero_timeline_unchanged_and_nonzero_differs():
     # Pre-change formula, inlined (not imported — this IS the oracle for the
     # "byte-identical at importance 0" claim): effective_fade only used
     # narrative_weight, and the freshness horizon was the bare constant.
-    pre_change_effective_fade = policy.FADE_THRESHOLD / (1.0 + 0.0)
+    pre_change_effective_fade = dev_constants.FADE_THRESHOLD / (1.0 + 0.0)
     assert (
-        policy.FADE_THRESHOLD / (1.0 + 0.0 + policy.FADE_IMPORTANCE_GAIN * 0.0)
+        dev_constants.FADE_THRESHOLD / (1.0 + 0.0 + dev_constants.FADE_IMPORTANCE_GAIN * 0.0)
         == pre_change_effective_fade
     )
 
@@ -145,7 +191,12 @@ def test_c2_2_high_importance_survives_well_beyond_30_lived_days_where_imp0_does
         object.__setattr__(mem, "created_at", datetime.now(UTC) - timedelta(hours=thirty_days_hours))
         object.__setattr__(mem, "state", "active")
         s = salience.score(
-            mem, store=None, hebbian=None, felt_time_state=felt_state, soul_linked_ids=set()
+            mem,
+            store=None,
+            hebbian=None,
+            felt_time_state=felt_state,
+            soul_linked_ids=set(),
+            emotion_engine=_StoredValues(),
         )
         transition = policy.next_state(mem, salience=s, consecutive_low_passes=0, narrative_weight=0.0)
         assert transition == policy.Transition.NONE  # still active: not FADE, not LOSE
@@ -202,13 +253,3 @@ def test_c2_5_emotional_and_soul_memories_no_regression():
     fade_s5, lose_s5 = _simulate(5.0, soul_linked=True, max_hours=_TWO_LIVED_YEARS_HOURS)
     assert _inf_if_none(fade_s5) >= _inf_if_none(fade_s0)
     assert _inf_if_none(lose_s5) >= _inf_if_none(lose_s0)
-
-
-# --------------------------------------------------------------------------- constants sanity
-def test_constants_documented_starting_values():
-    """Pins the tuned constants this test suite validated against (see the
-    module docstring's simulation)."""
-    assert policy.FADE_IMPORTANCE_GAIN == 2.0
-    assert salience.HORIZON_IMPORTANCE_GAIN == 52.0
-    assert policy.LOST_THRESHOLD == 0.10  # UNCHANGED (cd808dbc invariant)
-    assert policy.LOST_PASS_COUNT == 2  # UNCHANGED

@@ -12,8 +12,8 @@ strengthens the hebbian co-recall edges (the W5 signal — `salience.hebbian`).
 Retrieval itself is bump-free: search_memories ranks via `rank_memories`,
 which always calls `store.search_fts_scored`/`search_text` with `bump=False`,
 so this reach never touches `recall_count` or `last_accessed_at` here (only a
-deliberate `read_full_memory` full-read, or the passive recall-block's
-fractional snippet bump, do that — neither fires in this test). The W5
+full open through `open_memory` (`read_full_memory` or a full render in the recall block), or the recall-block's
+fractional snippet bump, do that: none fires in this test). The W5
 invariant is specifically that the *edges* don't ratchet the memory
 permanently vivid — so a faithful abandonment must (a) decay+GC the edges AND
 (b) pin the freshness signal explicitly into the deep past (it was already

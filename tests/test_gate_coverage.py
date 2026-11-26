@@ -3,10 +3,9 @@
 TEMP — companion to tests/test_consolidation_gate.py. These tests close the coverage the
 isolation tests missed (change: changes/gate-leak-coverage/):
 
-- G1-G4: four automatic writers routed through ``route_write``. G2-G4
-  (self_model_resolved / making / file_write) are GATED — a candidate lands in the pending
-  queue and ZERO rows reach memories.db. G1 (self_model_reconcile) is a later owner-decision
-  BYPASS (GATE_BYPASS_TYPES in brain/memory/pending.py) — it commits straight to memories.db.
+- G2-G4: three automatic writers routed through ``route_write`` (self_model_resolved / making /
+  file_write). They are GATED — a candidate lands in the pending queue and ZERO rows reach
+  memories.db. (G1, the self_model_reconcile writer, was removed with the emotion-only row writes.)
 - G5: a LIVE-PATH integration test proving the gate FIRES end-to-end when the real per-turn
   write path runs (monologue capture + the public pass-2 ``apply_side_effects`` wrapper) — the
   coverage that would have caught the Run-#1 apparatus regression at unit level.
@@ -31,6 +30,7 @@ import pytest
 from brain.emotion import vocabulary
 from brain.memory.pending import PendingQueue
 from brain.memory.store import Memory, MemoryStore
+from tests.source_tree import brain_sources
 
 _BRAIN_ROOT = Path(__file__).resolve().parents[1] / "brain"
 _TEST_CHANNEL = "gatecoverage_channel"
@@ -84,20 +84,7 @@ def registered_channel():
     vocabulary._unregister(_TEST_CHANNEL)
 
 
-# ── G1: self_model_reconcile BYPASSES the gate (owner decision); G2-G4: each
-# remaining newly-routed automatic writer enqueues, none reach memories.db ──
-def test_g1_reconcile_bypasses_gate(tmp_path, registered_channel):
-    """self_model_reconcile BYPASSES the gate (owner decision, GATE_BYPASS_TYPES in
-    brain/memory/pending.py): it commits straight to memories.db so a self-authored
-    emotional nudge affects felt state immediately."""
-    from brain.self_model.reconcile import _write_self_authored_delta
-
-    wrote = _write_self_authored_delta(tmp_path, registered_channel, 0.5)
-    assert wrote is True
-    assert _db_count(tmp_path, "self_model_reconcile") == 1
-    assert _queue_types(tmp_path).count("self_model_reconcile") == 0  # bypasses the gate
-
-
+# ── G2-G4: each newly-routed automatic writer enqueues, none reach memories.db ──
 def test_g2_resolve_routes_and_still_queues_soul(tmp_path):
     from brain.self_model.gap import Gap
     from brain.self_model.resolve import _emit_resolution
@@ -184,11 +171,10 @@ def test_g5_live_path_gate_fires_end_to_end(tmp_path, registered_channel):
     # ... and NO gated type leaked straight into the recall channel.
     for gated in ("monologue", "monologue_trace"):
         assert _db_count(tmp_path, gated) == 0, f"{gated} leaked into memories.db"
-    # monologue_emotion BYPASSES the gate (owner decision, GATE_BYPASS_TYPES in
-    # brain/memory/pending.py): it commits straight to memories.db so per-turn
-    # emotional nudges affect felt state immediately, not queued for consolidation.
-    assert _db_count(tmp_path, "monologue_emotion") == 1, "monologue_emotion bypass didn't fire"
-    assert "monologue_emotion" not in qtypes, "monologue_emotion should bypass the queue"
+    # The pass-2 emotion_delta no longer writes a row at all: no monologue_emotion row in
+    # memories.db and none queued.
+    assert _db_count(tmp_path, "monologue_emotion") == 0, "emotion_delta must not write a row"
+    assert "monologue_emotion" not in qtypes, "emotion_delta must not queue a candidate"
 
     # Shown-able-to-fail: the oracle distinguishes a gated write that DOES reach the DB
     # (an ungated direct store.create — the pre-gate behavior). If this assertion could not
@@ -217,11 +203,11 @@ _ALLOWED_DIRECT = {
     ("grief/breadcrumb.py", "return store.create(memory)"),
     ("kindled_link/relationship.py", "mem_store.create(mem)"),
     ("memory/pending.py", "return store.create(mem)"),
-    ("migrator/cli.py", "store.create(mem)"),
+    ("migrator/cli.py", "store.create(mem, fold=False)"),
     ("migrator/cli.py", "soul_store.create(crystal)"),
     ("migrator/emergence_kit.py", "soul_store.create(crystal)"),
-    ("migrator/emergence_kit.py", "store.create(mem)"),
-    ("recovery/engine.py", "store.create(mem)"),
+    ("migrator/emergence_kit.py", "store.create(mem, fold=False)"),
+    ("recovery/engine.py", "store.create(mem, fold=False)"),
     ("soul/review.py", "soul_store.create(c)"),
     ("tools/impls/add_journal.py", "store.create(memory)"),
     ("tools/impls/add_memory.py", "store.create(memory)"),
@@ -236,11 +222,16 @@ _ROUTED_LOCI = {
 }
 
 
-def _enumerate_create_sites(root: Path = _BRAIN_ROOT) -> set[tuple[str, str]]:
+def _enumerate_create_sites(root: Path | None = None) -> set[tuple[str, str]]:
+    """Every ``.create(`` line as (path relative to brain/, stripped line). ``root`` None reads the real ``brain/`` from
+    the process-wide copy in tests/source_tree.py; a path scans that tree (the synthetic one in the can-fail test)."""
+    if root is None:
+        files = {rel.removeprefix("brain/"): text for rel, text in brain_sources().items()}
+    else:
+        files = {py.relative_to(root).as_posix(): py.read_text(encoding="utf-8") for py in root.rglob("*.py")}
     found: set[tuple[str, str]] = set()
-    for py in root.rglob("*.py"):
-        rel = py.relative_to(root).as_posix()
-        for raw in py.read_text(encoding="utf-8").splitlines():
+    for rel, text in files.items():
+        for raw in text.splitlines():
             line = raw.strip()
             if ".create(" in line and ".create_new(" not in line:
                 found.add((rel, line))

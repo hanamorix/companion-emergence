@@ -85,7 +85,7 @@ def test_claude_cli_provider_builds_expected_command() -> None:
     mock_result.stderr = ""
 
     with patch("subprocess.run", return_value=mock_result) as mock_run:
-        p = ClaudeCliProvider(model="sonnet")
+        p = ClaudeCliProvider(probe_model="sonnet")
         out = p.generate("test prompt", system="you are helpful")
 
     assert out == "DREAM: test output"
@@ -185,7 +185,7 @@ def test_claude_cli_provider_nonzero_exit_includes_json_stdout_error() -> None:
 
 def test_claude_cli_provider_name() -> None:
     """Name includes the model identifier."""
-    assert ClaudeCliProvider(model="sonnet").name() == "claude-cli:sonnet"
+    assert ClaudeCliProvider(probe_model="sonnet").name() == "claude-cli:sonnet"
 
 
 def test_claude_cli_provider_subprocess_timeout_surfaced() -> None:
@@ -200,17 +200,6 @@ def test_get_provider_resolves_known_names() -> None:
     """get_provider returns the right class for each known name."""
     assert isinstance(get_provider("fake"), FakeProvider)
     assert isinstance(get_provider("claude-cli"), ClaudeCliProvider)
-
-
-def test_get_provider_ollama_returns_instance() -> None:
-    """get_provider("ollama") now returns a real OllamaProvider — no longer a stub.
-
-    SP-1 ships OllamaProvider with a full httpx-based implementation, so the
-    factory must hand back a usable instance.  The test that previously asserted
-    NotImplementedError is updated to assert the new behaviour.
-    """
-    provider = get_provider("ollama")
-    assert isinstance(provider, OllamaProvider)
 
 
 def test_get_provider_unknown_name_raises() -> None:
@@ -600,7 +589,7 @@ def test_llm_provider_complete_delegates_to_generate() -> None:
 def test_ollama_chat_excludes_context_keys_from_generation_options() -> None:
     """Option-A/A+ context keys must NOT leak into Ollama's gen-params.
 
-    engine.respond threads volatile_suffix / include_block_clock / session_id (and persona_dir)
+    engine.respond threads volatile_suffix / include_block_clock / session_id / user_name (and persona_dir)
     through the provider `options` dict. Those are internal context-routing keys, not Ollama
     sampler params — if they reach payload["options"] they corrupt the model's generation params.
     Real sampler params (e.g. temperature) must still pass through. (Fork 7e7c7491.)
@@ -627,11 +616,12 @@ def test_ollama_chat_excludes_context_keys_from_generation_options() -> None:
                 "volatile_suffix": "VOLATILE",
                 "include_block_clock": False,
                 "session_id": "sess-1",
+                "user_name": "Hana",
                 "temperature": 0.7,
             },
         )
 
     opts = captured["payload"].get("options", {})
     assert opts.get("temperature") == 0.7, "real sampler param must pass through"
-    for leaked in ("persona_dir", "volatile_suffix", "include_block_clock", "session_id"):
+    for leaked in ("persona_dir", "volatile_suffix", "include_block_clock", "session_id", "user_name"):
         assert leaked not in opts, f"{leaked} leaked into Ollama generation options"

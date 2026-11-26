@@ -25,18 +25,22 @@ the last saved message"; see that function's docstring.
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
 from brain import tunables
+from brain.health.json_io import Recovery, read_jsonl_tail
 
 log = logging.getLogger(__name__)
 
-_MAX_CONCURRENT_BACKGROUND = tunables.register("throttle.max_concurrent_background", 1)
+_MAX_CONCURRENT_BACKGROUND = tunables.register(
+    "throttle.max_concurrent_background", 1,
+    description="How many background Claude calls may run at the same time.",
+)
 
 
 def _max_concurrent_background() -> int:
@@ -55,7 +59,16 @@ _lock = threading.Lock()
 # exceed any finite lull.
 _last_message_mono: float = float("-inf")
 _inflight_replies: int = 0
+# S218: replies STARTED in this process (monotone; `reset()` leaves it alone, so a snapshot
+# compared by equality can never be confused by a reset). A reply that starts and ends
+# between two looks is invisible to `_inflight_replies` and visible here.
+_replies_started: int = 0
 _inflight_background = 0
+# S218: signalled by `note_reply_end` (built on `_lock`, so waiting and the counters share it).
+_reply_ended = threading.Condition(_lock)
+# S223: callbacks registered through `ReplyWatch.on_reply_start`, run by `note_user_message` (after
+# its counters changed and OUTSIDE `_lock`). Guarded by `_lock`.
+_start_hooks: list[_StartHook] = []
 
 # Rate-limited error logging state for is_chat_idle (S63; r2 m1 fix: bounded
 # volume under a persistent fault). Guarded by _lock alongside the state above.
@@ -75,6 +88,35 @@ class ThrottleDeferred(RuntimeError):  # noqa: N818 — a control signal, not an
     """
 
 
+class ShutdownDeferred(ThrottleDeferred):  # noqa: N818 — a control signal, not an error
+    """A background Claude call refused because the bridge is stopping (#456).
+
+    "Not now": the caller leaves its work in place (queue record, cursor, candidate, schedule file) for the next
+    run. A subclass of ThrottleDeferred so every handler that already treats a denied slot as a quiet no-op also
+    treats this one so."""
+
+
+# #456: set once when the bridge is told to stop; every background gate then reports "not idle" and every
+# background Claude spawn site refuses with ShutdownDeferred. Never cleared in a running bridge (reset() is a test
+# helper). A threading.Event: set from the stop request's thread or the monitor, never from a signal handler.
+_shutdown = threading.Event()
+
+
+def request_shutdown() -> None:
+    """Mark the process as stopping: no new background work starts from here on."""
+    _shutdown.set()
+
+
+def clear_shutdown() -> None:
+    """A new bridge app in this process starts unstopped (#456; one bridge per process in production, several
+    sequential apps in tests)."""
+    _shutdown.clear()
+
+
+def shutdown_requested() -> bool:
+    return _shutdown.is_set()
+
+
 def reset() -> None:  # test helper
     global _last_message_mono, _inflight_background, _inflight_replies
     global _err_last_key, _err_last_logged_mono, _err_suppressed_count
@@ -85,6 +127,9 @@ def reset() -> None:  # test helper
         _err_last_key = None
         _err_last_logged_mono = float("-inf")
         _err_suppressed_count = 0
+        _start_hooks.clear()
+        _reply_ended.notify_all()
+    _shutdown.clear()
 
 
 def mark_interactive_active(at: float | None = None) -> None:
@@ -104,10 +149,16 @@ def mark_interactive_active(at: float | None = None) -> None:
 def note_user_message(at: float | None = None) -> None:
     """Call at the start of a chat turn: stamps activity and marks a reply
     in flight (is_chat_idle is False until the matching note_reply_end)."""
-    global _last_message_mono, _inflight_replies
+    global _last_message_mono, _inflight_replies, _replies_started
     with _lock:
         _last_message_mono = time.monotonic() if at is None else at
         _inflight_replies += 1
+        _replies_started += 1
+        hooks = list(_start_hooks)
+    # S223: outside the lock (a callback may call back into this module) and never raising: the
+    # reply path must not break because a measurement's stop callback failed.
+    for hook in hooks:
+        hook.fire()
 
 
 def note_reply_end(at: float | None = None) -> None:
@@ -118,6 +169,85 @@ def note_reply_end(at: float | None = None) -> None:
     with _lock:
         _last_message_mono = time.monotonic() if at is None else at
         _inflight_replies = max(0, _inflight_replies - 1)
+        _reply_ended.notify_all()
+
+
+class _StartHook:
+    """One registration of `ReplyWatch.on_reply_start`: runs its callback at most once."""
+
+    def __init__(self, callback: Callable[[], None]) -> None:
+        self._callback = callback
+        self._fired = False
+        self._guard = threading.Lock()
+
+    def fire(self) -> None:
+        with self._guard:
+            if self._fired:
+                return
+            self._fired = True
+        try:
+            self._callback()
+        except Exception:  # noqa: BLE001 - a stop callback must never break a reply
+            log.warning("cli_throttle: a reply-start callback raised", exc_info=True)
+
+
+class ReplyWatch:
+    """S218: a snapshot of the reply activity. Calling it returns `still_clear()` (see
+    `reply_watch`). S223: `on_reply_start` lets a measurement be told the moment a reply starts."""
+
+    def __init__(self) -> None:
+        with _lock:
+            self._started = _replies_started
+            self._idle = _inflight_replies == 0
+
+    def __call__(self) -> bool:
+        if not self._idle:
+            return False
+        with _lock:
+            return _replies_started == self._started
+
+    def on_reply_start(self, callback: Callable[[], None]) -> Callable[[], None]:
+        """S223: run `callback()` once, on the thread that calls `note_user_message`, when a reply
+        starts (after the counters changed, outside the module lock; an exception it raises is
+        logged and swallowed). If this watch is already not clear (a reply was in flight at the
+        snapshot, or one started since) the callback runs at once, on the calling thread. Returns
+        an idempotent `unregister()`; a callback unregistered before a reply starts never runs.
+        Used by the RAM ladder to stop its running ONNX call (the reply must not wait for it).
+        The callback runs on the REPLY thread, inside `note_user_message`: it must be quick and
+        must not block."""
+        hook = _StartHook(callback)
+        with _lock:
+            _start_hooks.append(hook)
+        if not self():
+            hook.fire()
+
+        def unregister() -> None:
+            with _lock:
+                with contextlib.suppress(ValueError):
+                    _start_hooks.remove(hook)
+
+        return unregister
+
+
+def reply_watch() -> ReplyWatch:
+    """S218: a snapshot of the reply activity, as a callable `still_clear()`.
+
+    `still_clear()` is True while no reply was in flight when the snapshot was taken AND no
+    reply has started since (a reply that started after the snapshot counts even if it has
+    already ended: its allocations may be inside whatever was measured meanwhile). If a reply
+    was in flight at the snapshot, it is False from the start, even after that reply ends.
+    The RAM ladder of `nell chat --no-bridge` abandons the rung in progress when this
+    turns False (the process-wide RSS reading would be inflated by the reply), and (S223)
+    registers `on_reply_start` to stop the rung's running ONNX call at that moment."""
+    return ReplyWatch()
+
+
+def wait_for_no_reply_in_flight() -> None:
+    """S218: return at once when no reply is in flight, else block until the last one ends
+    (`note_reply_end`, which `respond()` calls in a `finally`). No timeout and no polling
+    interval. For a background thread; never call it on the reply path."""
+    with _reply_ended:
+        _reply_ended.wait_for(lambda: _inflight_replies == 0)
 
 
 def reply_in_flight() -> bool:
@@ -153,52 +283,6 @@ def _parse_saved_ts(raw: object) -> datetime:
     return parsed
 
 
-def _last_nonempty_raw_line(path: Path, *, chunk_size: int = 8192) -> str | None:
-    """Return the LAST non-empty raw line of a jsonl file, or None if the
-    file has no lines (missing, empty, or blank-only).
-
-    Deliberately does NOT go through ``read_jsonl_skipping_corrupt``
-    (``brain/health/jsonl_reader.py``): that reader silently drops a
-    syntactically corrupt line (e.g. one truncated by a crash/OOM
-    mid-append — exactly the kind of event this project's RAM-spike fix
-    targets) and logs only a warning, which would make the seed silently
-    fall back to an OLDER, previously-good turn as "newest". A malformed
-    trailing line must surface as a parse failure here instead, so the
-    caller's fail-closed handling (S63) covers it, rather than silently
-    understating how recent the chat actually was.
-
-    Bounded I/O via a backward seek (same growing-chunk algorithm as this
-    module's sibling ``read_last_n_jsonl_lines``, round-2 red-team MINOR):
-    cost scales with the last line's own length, not the whole file's size —
-    reading the whole buffer just to get its last line would itself be an
-    unbounded read, on a branch whose entire point is fixing exactly that
-    class of RAM spike. NOT reused directly: that helper decodes with
-    ``errors="replace"``, which would silently paper over an invalid-
-    encoding fault instead of raising it into this function's caller's
-    fail-closed handling — this needs a STRICT decode instead.
-    """
-    if not path.exists():
-        return None
-    with path.open("rb") as f:
-        f.seek(0, 2)  # SEEK_END
-        remaining = f.tell()
-        if remaining == 0:
-            return None
-        block = b""
-        while True:
-            read_size = min(chunk_size, remaining)
-            remaining -= read_size
-            f.seek(remaining)
-            block = f.read(read_size) + block
-            if remaining <= 0 or block.count(b"\n") >= 2:
-                break
-    text = block.decode("utf-8")  # strict: a bad byte must fail closed, never be papered over
-    for line in reversed(text.splitlines()):
-        if line.strip():
-            return line
-    return None
-
-
 def seed_last_message_from_active_conversations(
     persona_dir: Path,
     *,
@@ -214,7 +298,7 @@ def seed_last_message_from_active_conversations(
 
     Call once, synchronously, at bridge start — BEFORE anything can call
     ``is_chat_idle``/``time_since_last_message`` (same ordering rationale as
-    ``tunables_migration.migrate_idle_keys``): both functions read the SAME
+    ``tunables_migration.migrate_legacy_json``): both functions read the SAME
     ``_last_message_mono`` anchor this seeds, so seeding it once here keeps
     them consistent with each other for free — there is no separate anchor
     for the S72 prune accessor to fall out of step with.
@@ -226,8 +310,8 @@ def seed_last_message_from_active_conversations(
     - **A malformed/unparseable saved ``ts``** (missing field, corrupt
       value) — INCLUDING a syntactically corrupt/truncated trailing JSONL
       line (e.g. a crash/OOM mid-append; deliberately NOT silently skipped
-      the way ``read_jsonl_skipping_corrupt`` skips a corrupt line elsewhere
-      — see ``_last_nonempty_raw_line``, because silently falling back to an
+      the way ``read_jsonl`` skips a corrupt line elsewhere
+      — see the strict tail read below, because silently falling back to an
       OLDER good line here would understate how recent the chat really was,
       the wrong direction for a fail-closed idle gate): treated as an
       is_chat_idle FAULT per S63's fail-closed rule — logged once at ERROR
@@ -249,11 +333,12 @@ def seed_last_message_from_active_conversations(
         newest: datetime | None = None
         for session_id in list_active_sessions(persona_dir):
             path = persona_dir / "active_conversations" / f"{session_id}.jsonl"
-            raw_line = _last_nonempty_raw_line(path)
-            if raw_line is None:
+            # strict + RAISE: a corrupt, truncated or non-object trailing line (a crash/OOM mid-append) must
+            # raise into the fail-closed handler below, never fall back to an OLDER good turn (S63).
+            tail = read_jsonl_tail(path, 1, strict=True, recover=Recovery.RAISE)
+            if not tail:
                 continue
-            record = json.loads(raw_line)  # raises on a corrupt/truncated trailing line -> fail closed
-            parsed = _parse_saved_ts(record.get("ts"))
+            parsed = _parse_saved_ts(tail[0].get("ts"))
             if newest is None or parsed > newest:
                 newest = parsed
     except Exception as exc:  # noqa: BLE001 — malformed ts or any read fault: fail CLOSED (S63)
@@ -284,6 +369,16 @@ def time_since_last_message(*, now: float | None = None) -> float:
     with _lock:
         t = time.monotonic() if now is None else now
         return t - _last_message_mono
+
+
+def chat_activity_marker() -> float:
+    """An opaque token that changes whenever the user chats: the monotonic
+    anchor ``is_chat_idle`` reads (last user message / reply end). Callers
+    compare it for equality only, e.g. the floor-bootstrap retry rule ("retry
+    at the next lull" = once chat has happened since the failed attempt,
+    name-recall fix S85)."""
+    with _lock:
+        return _last_message_mono
 
 
 def _log_is_chat_idle_error(exc: Exception) -> None:
@@ -338,7 +433,12 @@ def is_chat_idle(*, now: float | None = None) -> bool:
 
     Fails CLOSED on any internal error (S63): returns False ("not idle") and
     logs at a rate-limited pace (see ``_log_is_chat_idle_error``) so a
-    persistent fault stays visible without flooding."""
+    persistent fault stays visible without flooding.
+
+    While the bridge is stopping (#456) it reports "not idle", so every gate built on it (``acquire_background``,
+    ``slot_available``, ``should_yield``, the central cadence and the item-loop pauses) lets nothing new start."""
+    if _shutdown.is_set():
+        return False
     try:
         with _lock:
             t = time.monotonic() if now is None else now

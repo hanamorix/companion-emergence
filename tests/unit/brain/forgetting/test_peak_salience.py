@@ -9,15 +9,15 @@ long as the constraints hold:
 """
 from datetime import UTC, datetime, timedelta
 
+from brain import dev_constants
 from brain.felt_time.state import FeltTimeState
-from brain.forgetting.policy import FADE_THRESHOLD
 from brain.forgetting.salience import DEFAULT_WEIGHTS, _emotion_input, _peak_input
 from brain.memory.store import Memory, MemoryStore
 
 
 def _mem(peak: float, days_old: float, emotions: dict | None = None) -> Memory:
     created = datetime.now(UTC) - timedelta(days=days_old)
-    return Memory(
+    return Memory.from_stored_row(
         id="m" * 36, content="x", memory_type="conversation", domain="us",
         created_at=created, emotions=emotions or {},
         last_accessed_at=created, peak_emotion_intensity=peak,
@@ -31,27 +31,26 @@ def _fts(rate_one_hours: float = 24 * 200) -> FeltTimeState:
 
 
 def _emotion_term(mem: Memory) -> float:
-    blended = max(_emotion_input(mem), _peak_input(mem, _fts()))
+    blended = max(_emotion_input(mem, None), _peak_input(mem, _fts()))
     return DEFAULT_WEIGHTS["emotion"] * blended
 
 
 def test_peak5_above_fade_at_45_days():
-    assert _emotion_term(_mem(peak=5.0, days_old=45)) >= FADE_THRESHOLD
+    assert _emotion_term(_mem(peak=5.0, days_old=45)) >= dev_constants.FADE_THRESHOLD
 
 
 def test_peak1_below_fade_by_14_days():
-    assert _emotion_term(_mem(peak=1.0, days_old=14)) < FADE_THRESHOLD
+    assert _emotion_term(_mem(peak=1.0, days_old=14)) < dev_constants.FADE_THRESHOLD
 
 
 def test_peak5_reaches_lose_within_six_months():
-    from brain.forgetting.policy import LOST_THRESHOLD
-    assert _emotion_term(_mem(peak=5.0, days_old=180)) < LOST_THRESHOLD
+    assert _emotion_term(_mem(peak=5.0, days_old=180)) < dev_constants.LOST_THRESHOLD
 
 
 def test_blend_takes_living_feeling_when_hotter():
     """A still-hot current emotion dominates a modest peak — max, not sum."""
     mem = _mem(peak=2.0, days_old=0, emotions={"joy": 9.0})
-    assert max(_emotion_input(mem), _peak_input(mem, _fts())) == _emotion_input(mem)
+    assert max(_emotion_input(mem, None), _peak_input(mem, _fts())) == _emotion_input(mem, None)
 
 
 def test_peak_zero_contributes_nothing():
@@ -59,9 +58,9 @@ def test_peak_zero_contributes_nothing():
 
 
 def test_peak_survives_empty_emotions():
-    """The Phoebe failure shape: emotions dict noise-floor-emptied, peak intact."""
+    """The live failure shape: emotions dict noise-floor-emptied, peak intact."""
     mem = _mem(peak=5.0, days_old=7, emotions={})
-    assert _emotion_input(mem) == 0.0
+    assert _emotion_input(mem, None) == 0.0
     assert _peak_input(mem, _fts()) > 0.0
 
 

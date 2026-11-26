@@ -8,6 +8,9 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
+import { fetchHealth, resetBridgeCredentialCache } from "./bridge";
+import { alongside, waitForHealth, type EngineProgressCallback } from "./lib/engineProgress";
+import { HEALTH_WAIT_MS } from "./lib/requestTimeout";
 import { errString } from "./lib/errString";
 
 export interface AppConfig {
@@ -104,10 +107,32 @@ export async function listPersonas(): Promise<PersonaSummary[]> {
   }
 }
 
-export async function ensureBridgeRunning(persona: string): Promise<void> {
+/** `nell supervisor start` exit 2: another start already holds the bridge lock, or a bridge is alive but not yet
+ *  answering (a service the app's install, or the OS, has just started). */
+const START_UNDER_WAY = /supervisor start failed \(exit 2\)/;
+
+/** #456 review R2-M1: wait for a bridge another start has under way to answer /health; false after HEALTH_WAIT_MS, a wait
+ *  that is paused while the engine's start-up record shows (HR5, lib/engineProgress.ts). */
+async function awaitStartedBridge(persona: string, onProgress?: EngineProgressCallback): Promise<boolean> {
+  resetBridgeCredentialCache(persona); // the starting bridge writes a new port and token
+  return waitForHealth(persona, () => fetchHealth(persona), HEALTH_WAIT_MS, onProgress); // each request is bounded
+}
+
+/**
+ * Start the persona's bridge (`nell supervisor start`, which waits for /health). With `onProgress`, the engine's start-up
+ * progress (its first rebuild, the scale update) is read every few seconds while that blocking call runs and handed to the
+ * callback, which is how the launch screen shows it; the waits here and in Rust pause while it shows. No callback: the
+ * start shows nothing (the watchdog, the setup wizard).
+ */
+export async function ensureBridgeRunning(persona: string, onProgress?: EngineProgressCallback): Promise<void> {
   try {
-    await invoke("ensure_bridge_running", { persona });
+    await alongside(persona, onProgress, () => invoke("ensure_bridge_running", { persona }));
   } catch (e) {
+    // A start already under way (exit 2) is not a failure: wait for that bridge instead (review R2-M1).
+    if (START_UNDER_WAY.test(errString(e))) {
+      if (await awaitStartedBridge(persona, onProgress)) return;
+      throw e;
+    }
     // Browser dev mode — Tauri's invoke is undefined. Treat as a no-op
     // and assume the bridge is already running externally; the next
     // fetch through bridge.ts will surface a real failure if it isn't.
@@ -116,6 +141,9 @@ export async function ensureBridgeRunning(persona: string): Promise<void> {
       return;
     }
     throw e;
+  } finally {
+    // A spawned bridge writes a new port and token to bridge.json (#365).
+    resetBridgeCredentialCache(persona);
   }
 }
 
@@ -140,12 +168,10 @@ export interface InitArgs {
   voice_template: "default" | "nell-example" | "skip";
   migrate_from: string | null;
   force: boolean;
-  model: string;
+  /** The model the user typed in the wizard, or null to keep the install's current setting. The model is one
+   *  install-wide setting the brain owns; the app holds no default of its own. */
+  model: string | null;
 }
-
-/** Wizard installs with the framework default model; users change it later
- *  via the Connection panel ModelPicker. Mirrors brain.persona_config.DEFAULT_MODEL. */
-export const DEFAULT_INIT_MODEL = "sonnet";
 
 export interface InitResult {
   success: boolean;
@@ -259,12 +285,15 @@ export async function installSupervisorService(persona: string): Promise<InitRes
 }
 
 /**
- * Install a symlink at ~/.local/bin/nell pointing at the bundled CLI so
- * the user can run `nell ...` from their Terminal. Mirrors the
- * supervisor-install shape: idempotent, AppTranslocation-guarded,
- * surfaces structured success/error the panel renders inline.
+ * Put `nell` on the user's PATH so they can run `nell ...` from a terminal.
+ * Mirrors the supervisor-install shape: idempotent, never overwrites a user's
+ * own `nell`, surfaces structured success/error the panel renders inline.
  *
- * macOS-only for now (the Tauri command short-circuits on non-Darwin).
+ * The mechanism depends on the install: a symlink at ~/.local/bin/nell on
+ * macOS and the Linux .deb; a small script at ~/.local/bin/nell that runs the
+ * AppImage in CLI mode on a Linux AppImage; nell.cmd in a per-user folder plus
+ * a user PATH entry on Windows. An AppImage running without FUSE gets no
+ * shortcut and an explanation in `stderr` (exit 78).
  */
 export async function installNellCliSymlink(): Promise<InitResult> {
   return await invoke<InitResult>("install_nell_cli_symlink");

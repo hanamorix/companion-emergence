@@ -124,11 +124,19 @@ def test_read_file_image_audit_line_has_no_base64(tmp_path):
     assert '"tool": "read_file"' in audit_text and '"ok": true' in audit_text
 
 
-def test_read_file_large_image_not_refused_by_text_cap(tmp_path):
-    """C12 — an image between the 256KB text cap and image_max_bytes returns an
+# Since #590 the default text cap equals the 20 MiB image cap, so these cap-ordering
+# tests lower the text cap to put an image between the two (a user can set it lower).
+_LOW_TEXT_CAP = 256 * 1024
+
+
+def test_read_file_large_image_not_refused_by_text_cap(tmp_path, monkeypatch):
+    """C12 — an image between the text cap and image_max_bytes returns an
     image result, NOT 'file too large'. This is the cap-ordering guard: the
     image branch runs before the text cap."""
-    size = _FILE_READ_MAX_BYTES + 50_000  # > 256KB text cap, << 20MB image cap
+    import brain.tools.impls.read_file as rf
+
+    monkeypatch.setattr(rf, "_file_read_max_bytes", lambda: _LOW_TEXT_CAP)
+    size = _LOW_TEXT_CAP + 50_000  # > text cap, << 20MB image cap
     f = tmp_path / "big.png"
     f.write_bytes(_png_of_size(size))
     out = read_file(path=str(f), persona_dir=tmp_path)
@@ -136,17 +144,18 @@ def test_read_file_large_image_not_refused_by_text_cap(tmp_path):
     assert "error" not in out
     # Discriminator: the file IS over the text cap, so a text-cap-first ordering
     # would refuse it — proving the ordering is load-bearing.
-    assert f.stat().st_size > _FILE_READ_MAX_BYTES
+    assert f.stat().st_size > _LOW_TEXT_CAP
 
 
 def test_read_file_large_image_refused_when_image_branch_disabled(tmp_path, monkeypatch):
     """C12 shown-able-to-fail (arm b) — reproduce the mis-ordered/pre-change
-    behaviour: with the image branch effectively off, the same >256KB image
-    hits the text cap and returns 'file too large'."""
+    behaviour: with the image branch effectively off, the same image over the
+    text cap hits the text cap and returns 'file too large'."""
     import brain.tools.impls.read_file as rf
 
     monkeypatch.setattr(rf, "_image_types", lambda: [])  # disable image detection
-    size = _FILE_READ_MAX_BYTES + 50_000
+    monkeypatch.setattr(rf, "_file_read_max_bytes", lambda: _LOW_TEXT_CAP)
+    size = _LOW_TEXT_CAP + 50_000
     f = tmp_path / "big2.png"
     f.write_bytes(_png_of_size(size))
     out = read_file(path=str(f), persona_dir=tmp_path)

@@ -14,6 +14,7 @@ from brain.bridge import cli_throttle as _cli_throttle
 from brain.maker import maker as _maker
 from brain.maker.charge import load_charge
 from brain.maker.persist import persist_making
+from brain.works.location import works_db_path
 from brain.works.store import WorksStore
 
 logger = logging.getLogger(__name__)
@@ -41,9 +42,9 @@ def make_and_wire(*, persona_dir: Path, store: Any, provider: Any,
             # failure (no cooldown, no charge penalty, no error log).
             raise _cli_throttle.ThrottleDeferred("throttle deferred")
         making = _maker.make(provider, charge_sources=sources,
-                             emotion_summary=_emotion_summary(store))
+                             emotion_summary=_emotion_summary(store), persona_dir=persona_dir)
 
-    works = WorksStore(persona_dir / "works.db")
+    works = WorksStore(works_db_path(persona_dir))
     try:
         wid = persist_making(persona_dir, works, making, charge_sources=sources, now=now)
     finally:
@@ -53,13 +54,22 @@ def make_and_wire(*, persona_dir: Path, store: Any, provider: Any,
     # The three wire-backs of a completed making. For a non-discard making the
     # emotion delta is applied exactly as W8 applies reach_emotions: it is
     # vocab-filtered by making_emotion_delta() and seeded onto the act-memory
-    # via Memory.create_new(emotions=...), so aggregate_state picks it up. A
+    # via Memory.create_new(emotions=...), so the engine folds it in. A
     # discarded making moves nothing — empty-emotion act-memory only. The feed
     # wire-back (eventual_share → shared) is driven by flip_ready_shares from
     # run_maker_tick, not here.
+    from brain.dev_constants import NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED
+    from brain.emotion.write_scale import writes_engine_scale
     from brain.maker import wiring
+    from brain.maker.sources import making_source
     if making.disposition != "discard":
-        delta = wiring.making_emotion_delta(making, dominant_source=sources[0] if sources else "soul")
+        # The accent comes from what built the charge (#721); `sources` above is prompt provenance, not a source key.
+        delta = wiring.making_emotion_delta(
+            making,
+            dominant_source=making_source(charge, store),
+            # A making goes to the pending queue: only the x10 fix's queue step (cut 2) rescales it (B1 PR 7).
+            engine_scale=writes_engine_scale(persona_dir, store, cut=NUDGE_SCALE_FIX_PROGRESS_QUEUE_STARTED),
+        )
         wiring.write_making_memory(store, making, emotions=delta)
     else:
         wiring.write_making_memory(store, making, emotions={})

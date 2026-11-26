@@ -40,6 +40,21 @@ def _claude_workdir_in_tmp(tmp_path: Path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _drop_root_log_handlers_added_by_a_test():
+    """`supervisor run` sets up the runtime log on the root logger (D26: before its start back-off wait); keep a test's
+    handler from outliving the test."""
+    import logging
+
+    root = logging.getLogger()
+    before = list(root.handlers)
+    yield
+    for h in list(root.handlers):
+        if h not in before:
+            root.removeHandler(h)
+            h.close()
+
+
+@pytest.fixture(autouse=True)
 def _reset_session_registry():
     """Clear the in-memory session registry between bridge tests."""
     from brain.chat.session import reset_registry

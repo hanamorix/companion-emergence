@@ -15,38 +15,6 @@ def _write_turn(conv_dir: Path, *, speaker: str, ts: datetime) -> None:
     )
 
 
-def test_compute_silence_days_no_buffer_returns_zero(tmp_path: Path) -> None:
-    from brain.initiate.user_pattern import _compute_silence_days
-
-    assert _compute_silence_days(tmp_path) == pytest.approx(0.0)
-
-
-def test_compute_silence_days_recent_user_turn(tmp_path: Path) -> None:
-    from brain.initiate.user_pattern import _compute_silence_days
-
-    conv_dir = tmp_path / "active_conversations"
-    conv_dir.mkdir()
-    twelve_hours_ago = datetime.now(UTC) - timedelta(hours=12)
-    _write_turn(conv_dir, speaker="user", ts=twelve_hours_ago)
-
-    result = _compute_silence_days(tmp_path)
-    assert 0.4 < result < 0.6  # ~0.5 days
-
-
-def test_compute_silence_days_skips_companion_turns(tmp_path: Path) -> None:
-    """Turns from the companion (persona_dir.name) must not reset the silence clock."""
-    from brain.initiate.user_pattern import _compute_silence_days
-
-    conv_dir = tmp_path / "active_conversations"
-    conv_dir.mkdir()
-    # Companion spoke 5 minutes ago; user spoke 3 days ago
-    _write_turn(conv_dir, speaker=tmp_path.name, ts=datetime.now(UTC) - timedelta(minutes=5))
-    _write_turn(conv_dir, speaker="user", ts=datetime.now(UTC) - timedelta(days=3))
-
-    result = _compute_silence_days(tmp_path)
-    assert result > 2.9  # ~3 days — companion turn ignored
-
-
 def _write_audit_rows(persona_dir: Path, rows: list[dict]) -> None:
     """Write rows to initiate_audit.jsonl."""
     path = persona_dir / "initiate_audit.jsonl"
@@ -124,9 +92,9 @@ def test_compute_likely_active_peak_hour_true_offpeak_false(tmp_path: Path) -> N
 
     # Inject _now at UTC 02:00 — 12 hours away, that bucket has 0 turns
     now_off = datetime(2026, 1, 15, 2, 0, 0, tzinfo=UTC)
-    # Guard: confirm these map to different local hours (always true since 12h apart)
-    if now_off.astimezone().hour != now_peak.astimezone().hour:
-        assert _compute_likely_active(tmp_path, _now=now_off) is False
+    # The code buckets by the host's local hour; two instants 12 h apart never share one, in any zone.
+    assert now_off.astimezone().hour != now_peak.astimezone().hour
+    assert _compute_likely_active(tmp_path, _now=now_off) is False
 
 
 def test_compute_response_lag_p50_no_file_returns_none(tmp_path: Path) -> None:
@@ -219,7 +187,9 @@ def test_c1_no_full_scan_when_daily_cadence_not_due(
 ) -> None:
     """Two calls to compute_user_presence in the same day: the first (cadence
     never-run -> due) may full-scan; the second (cadence not due) must not
-    call the full-directory-glob-and-read reader at all."""
+    call the full-directory-glob-and-read reader at all. (silence_days is not
+    one of those scans: it is read per call through ``last_user_turn_ts``
+    in brain.ingest.buffer, which uses its own reader, not this module's.)"""
     import brain.initiate.user_pattern as up
 
     conv_dir = tmp_path / "active_conversations"
@@ -234,47 +204,23 @@ def test_c1_no_full_scan_when_daily_cadence_not_due(
     up.compute_user_presence(tmp_path, _now=now0)  # cadence due (first ever call)
 
     calls = {"n": 0}
-    real_reader = up.read_jsonl_skipping_corrupt
+    real_read, real_iter = up.read_jsonl, up.iter_jsonl
 
-    def spy(path):
+    def spy_read(*a, **k):
         calls["n"] += 1
-        return real_reader(path)
+        return real_read(*a, **k)
 
-    monkeypatch.setattr(up, "read_jsonl_skipping_corrupt", spy)
+    def spy_iter(*a, **k):
+        calls["n"] += 1
+        return real_iter(*a, **k)
+
+    monkeypatch.setattr(up, "read_jsonl", spy_read)  # the full-file readers (json_io)
+    monkeypatch.setattr(up, "iter_jsonl", spy_iter)
 
     now1 = now0 + timedelta(hours=1)  # well within the 24h cadence
     up.compute_user_presence(tmp_path, _now=now1)
 
     assert calls["n"] == 0, "no full-directory/full-file reader call expected on the cheap path"
-
-
-def test_c1_self_test_spy_would_catch_the_old_every_call_full_scan(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """ST1.5f: the same spy DOES detect a call when the reference (pre-#225)
-    full-scan implementations are invoked directly — proving the spy in the
-    test above is actually discriminating, not vacuously passing."""
-    import brain.initiate.user_pattern as up
-
-    conv_dir = tmp_path / "active_conversations"
-    conv_dir.mkdir()
-    _write_turn(conv_dir, speaker="user", ts=datetime.now(UTC) - timedelta(hours=1))
-
-    calls = {"n": 0}
-    real_reader = up.read_jsonl_skipping_corrupt
-
-    def spy(path):
-        calls["n"] += 1
-        return real_reader(path)
-
-    monkeypatch.setattr(up, "read_jsonl_skipping_corrupt", spy)
-
-    # The OLD reference implementation (kept as an oracle, no longer on the
-    # hot path) calls the full reader every time it's invoked directly.
-    up._compute_silence_days(tmp_path)
-    up._compute_likely_active(tmp_path)
-
-    assert calls["n"] > 0, "the spy must be capable of detecting a full-scan call"
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +384,7 @@ def test_c2h_tied_timestamps_straddling_window_boundary(tmp_path: Path) -> None:
     tie-safe extension must capture the whole cluster; a tie-unaware plain
     cutoff must NOT (ST1.5f self-test, proving this test is discriminating).
     """
-    from brain.health.jsonl_reader import read_last_n_jsonl_lines
+    from brain.health.json_io import read_jsonl_tail
     from brain.initiate.user_pattern import (
         _compute_ignore_streak,
         _compute_ignore_streak_bounded,
@@ -475,8 +421,7 @@ def test_c2h_tied_timestamps_straddling_window_boundary(tmp_path: Path) -> None:
 
     # Self-test: a tie-unaware plain window_n-row cutoff must diverge.
     path = tmp_path / "initiate_audit.jsonl"
-    naive_lines = read_last_n_jsonl_lines(path, window_n)
-    naive_rows = [json.loads(line) for line in naive_lines]
+    naive_rows = read_jsonl_tail(path, window_n)
     naive_value = _ignore_streak_from_rows(naive_rows)
     assert naive_value != oracle, (
         "the naive tie-unaware cutoff must diverge from the oracle here — "
@@ -532,7 +477,7 @@ def test_c19_ignore_streak_bounded_read_does_not_full_scan_large_file(
     import brain.initiate.user_pattern as up
 
     rows = []
-    for i in range(10_000):
+    for i in range(1_000):  # well past the primary window (window_n + tie margin = 350 rows)
         rows.append({
             "audit_id": f"old_{i}", "ts": f"2026-01-{(i % 27) + 1:02d}T00:00:{i % 60:02d}+00:00",
             "decision": "send_notify", "delivery": {"current_state": "dismissed"},
@@ -550,13 +495,18 @@ def test_c19_ignore_streak_bounded_read_does_not_full_scan_large_file(
     _write_audit_rows(tmp_path, rows)
 
     calls = {"n": 0}
-    real_reader = up.read_jsonl_skipping_corrupt
+    real_read, real_iter = up.read_jsonl, up.iter_jsonl
 
-    def spy(path):
+    def spy_read(*a, **k):
         calls["n"] += 1
-        return real_reader(path)
+        return real_read(*a, **k)
 
-    monkeypatch.setattr(up, "read_jsonl_skipping_corrupt", spy)
+    def spy_iter(*a, **k):
+        calls["n"] += 1
+        return real_iter(*a, **k)
+
+    monkeypatch.setattr(up, "read_jsonl", spy_read)  # the full-file readers (json_io)
+    monkeypatch.setattr(up, "iter_jsonl", spy_iter)
 
     result = up._compute_ignore_streak_bounded(tmp_path)
     assert result == 10  # the 10 trailing dismissed rows, stopping at "resolved"
@@ -568,10 +518,14 @@ def test_c19_ignore_streak_bounded_read_does_not_full_scan_large_file(
     assert oracle == result
 
 
-def test_c20a_widen_on_no_resolution_finds_it_and_matches_oracle(tmp_path: Path) -> None:
+def test_c20a_widen_on_no_resolution_finds_it_and_matches_oracle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """No resolution in the primary window_n rows, but one exists further
     back within window_n_max: the widened read must find it and match the
-    oracle's exact count."""
+    oracle's exact count, and the widen step (a second, larger read) must
+    really fire, not merely leave the count right by some other means."""
+    import brain.initiate.user_pattern as up
     from brain.initiate.user_pattern import _compute_ignore_streak, _compute_ignore_streak_bounded
 
     rows = [
@@ -587,29 +541,6 @@ def test_c20a_widen_on_no_resolution_finds_it_and_matches_oracle(tmp_path: Path)
 
     oracle = _compute_ignore_streak(tmp_path)
     assert oracle == 29
-    bounded = _compute_ignore_streak_bounded(tmp_path, window_n=5, window_n_max=30)
-    assert bounded == oracle
-
-
-def test_c20a_widen_path_is_actually_exercised(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Confirms the widen step (a second, larger read) actually fires when
-    the primary window has no resolution — not merely that the final count
-    happens to be right by some other means."""
-    import brain.initiate.user_pattern as up
-
-    rows = [
-        {"audit_id": "resolved", "ts": "2026-05-01T00:00:00+00:00", "decision": "send_notify",
-         "delivery": {"current_state": "replied_explicit"}},
-    ]
-    for i in range(29):
-        rows.append({
-            "audit_id": f"d_{i}", "ts": f"2026-05-{2 + i:02d}T00:00:00+00:00",
-            "decision": "send_notify", "delivery": {"current_state": "dismissed"},
-        })
-    _write_audit_rows(tmp_path, rows)
-
     seen_ns: list[int] = []
     real_window = up._read_ignore_streak_window
 
@@ -618,7 +549,8 @@ def test_c20a_widen_path_is_actually_exercised(
         return real_window(persona_dir, n)
 
     monkeypatch.setattr(up, "_read_ignore_streak_window", spy)
-    up._compute_ignore_streak_bounded(tmp_path, window_n=5, window_n_max=30)
+    bounded = _compute_ignore_streak_bounded(tmp_path, window_n=5, window_n_max=30)
+    assert bounded == oracle
     assert seen_ns == [5, 30]  # primary window, then the widened read
 
 
@@ -800,8 +732,8 @@ def test_c5_likely_active_flips_across_hour_boundary_without_a_new_recompute(
     assert presence_peak.likely_active is True
 
     now_off = now_peak + timedelta(hours=12)  # well within the 24h cadence -> NOT due
-    if now_off.astimezone().hour == now_peak.astimezone().hour:
-        pytest.skip("12h-apart hours coincide on this host's local zone")
+    # The code buckets by the host's local hour; two instants 12 h apart never share one, in any zone.
+    assert now_off.astimezone().hour != now_peak.astimezone().hour
     presence_off = compute_user_presence(tmp_path, _now=now_off)
     assert presence_off.likely_active is False, (
         "classification must reflect the CURRENT hour, not a boolean frozen "
@@ -824,20 +756,98 @@ def test_c6_new_inbound_turn_reflected_without_forcing_a_recompute(tmp_path: Pat
     t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
     _write_turn(conv_dir, speaker="user", ts=t0 - timedelta(days=5))
 
-    presence_stale = compute_user_presence(tmp_path, _now=t0)  # due -> caches 5-day-old last_seen
+    presence_stale = compute_user_presence(tmp_path, _now=t0)  # due -> the daily recompute runs
     assert presence_stale.silence_days > 4.5
 
-    # A REAL inbound turn arrives (the actual event hook engine.py fires).
+    # A REAL inbound turn arrives: the chat saves the user row (the file silence_days is read from) and fires the
+    # presence event hook (engine.py).
     fresh_ts = t0.isoformat()
+    _write_turn(conv_dir, speaker="user", ts=t0)
     presence_state.record_inbound_turn(tmp_path, fresh_ts)
 
     # Cadence must NOT be due yet (only a moment has passed) -- this call
     # must NOT trigger a new daily recompute to reflect the fresh event.
     presence_fresh = compute_user_presence(tmp_path, _now=t0 + timedelta(seconds=1))
     assert presence_fresh.silence_days < 0.01, (
-        "silence_days must reflect the fresh event immediately, not the "
-        "stale cached day-count from the last daily recompute"
+        "silence_days must reflect the fresh turn immediately, not wait for the next daily recompute"
     )
+
+
+def _stale_presence_file(persona_dir: Path, last_seen: datetime, now: datetime) -> None:
+    """A presence sidecar claiming the user was last seen at ``last_seen``, with the daily recompute not due."""
+    from brain.bridge.persisted_cadence import CadenceState, save_cadence
+    from brain.initiate import presence_state
+
+    persona_dir.mkdir(parents=True, exist_ok=True)
+    save_cadence(persona_dir, "presence_daily_cadence.json", CadenceState(next_at=now + timedelta(days=1)))
+    presence_state.record_inbound_turn(persona_dir, last_seen.isoformat())
+
+
+def test_silence_days_comes_from_the_last_user_turn_not_from_the_presence_file(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import compute_user_presence
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+    _stale_presence_file(tmp_path, now - timedelta(days=10), now)
+    conv_dir = tmp_path / "active_conversations"
+    conv_dir.mkdir()
+    _write_turn(conv_dir, speaker="user", ts=now - timedelta(hours=6))
+
+    assert compute_user_presence(tmp_path, _now=now).silence_days == pytest.approx(0.25, abs=1e-3)
+
+
+def test_silence_days_is_zero_with_no_user_turn_whatever_the_presence_file_says(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import compute_user_presence
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+    _stale_presence_file(tmp_path, now - timedelta(days=10), now)
+
+    assert compute_user_presence(tmp_path, _now=now).silence_days == pytest.approx(0.0)
+
+
+def test_silence_days_is_never_negative_for_a_user_turn_dated_after_now(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import compute_user_presence
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+    _stale_presence_file(tmp_path, now - timedelta(days=10), now)
+    conv_dir = tmp_path / "active_conversations"
+    conv_dir.mkdir()
+    _write_turn(conv_dir, speaker="user", ts=now + timedelta(hours=3))  # clock skew
+
+    assert compute_user_presence(tmp_path, _now=now).silence_days == pytest.approx(0.0)
+
+
+def test_silence_days_reads_the_archive_when_no_active_file_holds_a_user_turn(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import compute_user_presence
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
+    _stale_presence_file(tmp_path, now - timedelta(days=10), now)
+    archive = tmp_path / "archived_conversations"
+    archive.mkdir()
+    (archive / "sess_old.000.jsonl").write_text(
+        json.dumps({"speaker": "user", "text": "hi", "ts": (now - timedelta(days=2)).isoformat()}) + "\n",
+        encoding="utf-8",
+    )
+
+    assert compute_user_presence(tmp_path, _now=now).silence_days == pytest.approx(2.0, abs=1e-3)
+
+
+def test_a_failing_last_user_turn_ts_gives_zero_silence_and_leaves_the_other_signals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import brain.ingest.buffer as buffer_mod
+    from brain.initiate.user_pattern import compute_user_presence
+
+    def boom(_persona_dir):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(buffer_mod, "last_user_turn_ts", boom)
+    _write_audit_rows(tmp_path, [
+        {"audit_id": "1", "ts": "2026-05-29T10:00:00+00:00", "decision": "send_notify",
+         "delivery": {"current_state": "dismissed"}},
+    ])
+    presence = compute_user_presence(tmp_path)
+    assert presence.silence_days == pytest.approx(0.0)
+    assert presence.ignore_streak == 1
 
 
 # ---------------------------------------------------------------------------
@@ -984,19 +994,17 @@ def test_c8_source_removal_after_populated_fails_open_at_next_recompute(
     presence_immediately_after = compute_user_presence(tmp_path, _now=now_peak + timedelta(seconds=1))
     assert presence_immediately_after.ignore_streak == 0
 
-    # silence_days/likely_active are cached at daily granularity; force the
-    # cadence due again so the removal is actually noticed, and assert the
-    # result is fail-open (not an exception, not still trusting the vanished
-    # histogram as if it were still valid).
+    # likely_active is cached at daily granularity; force the cadence due
+    # again so the removal is actually noticed, and assert the result is
+    # fail-open (not an exception, not still trusting the vanished histogram
+    # as if it were still valid).
     presence_after_next_recompute = compute_user_presence(
         tmp_path, _now=now_peak + timedelta(hours=25)
     )
     assert presence_after_next_recompute.likely_active is True  # hour_counts reset to None
-    # silence_days can only ever grow (never shrink) once its source
-    # vanishes -- per gates.py, a HIGHER silence_days only loosens gates
-    # further, so "no less permissive than the fail-open default" holds
-    # even though the exact cached last_seen_ts isn't reset to None.
-    assert presence_after_next_recompute.silence_days >= presence_before.silence_days
+    # silence_days is read from the conversation files on every call, so with
+    # no user turn left it is the fail-open 0.0 at once (no cached value).
+    assert presence_after_next_recompute.silence_days == pytest.approx(0.0)
 
 
 def test_c8_reply_lag_fails_open_after_source_removed_post_bootstrap(tmp_path: Path) -> None:
@@ -1081,7 +1089,6 @@ def test_c10_same_input_same_gate_decision_old_vs_new_mechanism(tmp_path: Path) 
         _compute_ignore_streak,
         _compute_likely_active,
         _compute_response_lag_p50,
-        _compute_silence_days,
         compute_user_presence,
     )
 
@@ -1118,9 +1125,10 @@ def test_c10_same_input_same_gate_decision_old_vs_new_mechanism(tmp_path: Path) 
     # New mechanism, settled.
     new_presence = compute_user_presence(tmp_path, _now=now)
 
-    # Old from-scratch mechanism, over the IDENTICAL final on-disk data.
+    # Old from-scratch mechanism, over the IDENTICAL final on-disk data. silence_days has no second implementation
+    # any more (both mechanisms read it from last_user_turn_ts), so it is taken as it is.
     old_presence = UserPresence(
-        silence_days=_compute_silence_days(tmp_path, _now=now),
+        silence_days=new_presence.silence_days,
         ignore_streak=_compute_ignore_streak(tmp_path),
         likely_active=_compute_likely_active(tmp_path, _now=now),
         response_lag_p50=_compute_response_lag_p50(tmp_path),
@@ -1159,3 +1167,212 @@ def test_c15_bootstrap_runs_at_most_once_even_with_zero_history(
 
     from brain.initiate import presence_state
     assert presence_state.load_presence_state(tmp_path).bootstrapped is True
+
+
+# ---------------------------------------------------------------------------
+# #621 — only the user's rows count. The chat writes the user's rows with
+# speaker "user" and the kindled's with "assistant" (plus "image" annotation
+# rows and the compaction "summary" row); none of those may count as the user.
+# ---------------------------------------------------------------------------
+
+_T621_NOW = datetime(2026, 11, 10, 12, 0, 0, tzinfo=UTC)
+
+
+def _write_621_conversation(persona_dir: Path) -> list[datetime]:
+    """Write user rows, each answered by an assistant row 90 minutes later
+    (so a different local hour), plus a newer image, summary and assistant
+    row. Returns the user rows' timestamps."""
+    conv_dir = persona_dir / "active_conversations"
+    conv_dir.mkdir(parents=True)
+    from brain.initiate.user_pattern import _SCHEDULE_MIN_TURNS
+
+    user_times = [
+        _T621_NOW - timedelta(days=1 + i // 5, minutes=17 * i) for i in range(_SCHEDULE_MIN_TURNS)
+    ]
+    for ts in user_times:
+        _write_turn(conv_dir, speaker="user", ts=ts)
+        _write_turn(conv_dir, speaker="assistant", ts=ts + timedelta(minutes=90))
+    _write_turn(conv_dir, speaker="image", ts=_T621_NOW - timedelta(minutes=3))
+    _write_turn(conv_dir, speaker="summary", ts=_T621_NOW - timedelta(minutes=2))
+    _write_turn(conv_dir, speaker="assistant", ts=_T621_NOW - timedelta(minutes=1))
+    return user_times
+
+
+def _user_only_hour_counts(user_times: list[datetime]) -> list[int]:
+    counts = [0] * 24
+    for ts in user_times:
+        counts[ts.astimezone().hour] += 1
+    return counts
+
+
+def test_621_daily_scan_counts_only_the_user_rows(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _daily_scan_conversations
+
+    persona_dir = tmp_path / "nell"
+    user_times = _write_621_conversation(persona_dir)
+
+    hour_counts, _threshold, latest_ts = _daily_scan_conversations(persona_dir, _now=_T621_NOW)
+
+    assert latest_ts == max(user_times).isoformat()
+    assert hour_counts == _user_only_hour_counts(user_times)
+
+
+def test_621_daily_recompute_persists_the_user_last_seen(tmp_path: Path) -> None:
+    """Through the path: the daily recompute's max-merge must not move
+    last_seen_ts forward to the kindled's reply."""
+    from brain.initiate import presence_state
+    from brain.initiate.user_pattern import _run_daily_presence_recompute
+
+    persona_dir = tmp_path / "nell"
+    user_times = _write_621_conversation(persona_dir)
+
+    _run_daily_presence_recompute(persona_dir, _now=_T621_NOW)
+
+    state = presence_state.load_presence_state(persona_dir)
+    assert state.last_seen_ts == max(user_times).isoformat()
+    assert list(state.hour_counts) == _user_only_hour_counts(user_times)
+
+
+def test_621_hour_histogram_counts_only_the_user_rows(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _build_hour_histogram
+
+    persona_dir = tmp_path / "nell"
+    user_times = _write_621_conversation(persona_dir)
+
+    hour_counts, _threshold = _build_hour_histogram(persona_dir, _now=_T621_NOW)
+
+    assert hour_counts == _user_only_hour_counts(user_times)
+
+
+# --- #804: the histogram counts the archived sessions too ------------------------------------------------------------
+# A closed session's buffer is archived in full (``_archive_buffer``) and then deleted, so the live folder holds only the
+# sessions not yet closed. The 30 days of turns the histogram counts are in ``archived_conversations/``.
+
+_T804_NOW = datetime(2026, 1, 15, 14, 30, 0, tzinfo=UTC)
+
+
+def _write_rows(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
+
+
+def _user_row(ts: datetime, text: str = "hi") -> dict:
+    return {"speaker": "user", "text": text, "ts": ts.isoformat()}
+
+
+def _daily_user_turns(hour: int, days: range, per_day: int) -> list[datetime]:
+    """``per_day`` user turns at ``hour`` UTC on each day before _T804_NOW in ``days``, a minute apart."""
+    return [
+        datetime(2026, 1, 15, hour, m, 0, tzinfo=UTC) - timedelta(days=d) for d in days for m in range(per_day)
+    ]
+
+
+def _hour_counts(times: list[datetime]) -> list[int]:
+    counts = [0] * 24
+    for ts in times:
+        counts[ts.astimezone().hour] += 1
+    return counts
+
+
+def test_804_the_daily_recompute_builds_the_histogram_from_archived_sessions(tmp_path: Path) -> None:
+    """Through compute_user_presence: every session is closed, so all 30 days of history are in the archive."""
+    from brain.initiate.user_pattern import compute_user_presence
+
+    archive = tmp_path / "archived_conversations"
+    user_times = _daily_user_turns(14, range(1, 30), 2)  # 58 user turns at 14:00 UTC, all inside the 30-day window
+    for i, ts in enumerate(user_times):
+        _write_rows(archive / f"sess_{i % 6}.000.jsonl", [_user_row(ts), {"speaker": "assistant", "text": "x", "ts": ts.replace(hour=2).isoformat()}])
+    # User turns at 02:00 UTC older than the 30-day window, which must not count.
+    _write_rows(archive / "sess_old.jsonl", [_user_row(ts) for ts in _daily_user_turns(2, range(31, 61), 2)])
+    (archive / "sess_dir.000.jsonl").mkdir()  # not a file: skipped
+    (tmp_path / "active_conversations").mkdir()
+
+    at_peak = compute_user_presence(tmp_path, _now=_T804_NOW)
+    off_peak = _T804_NOW.replace(hour=2)
+    assert off_peak.astimezone().hour != _T804_NOW.astimezone().hour
+    # The histogram was built at the first call; the second reads it from the presence state.
+    assert at_peak.likely_active is True
+    assert compute_user_presence(tmp_path, _now=off_peak).likely_active is False
+
+
+def test_804_one_open_session_does_not_become_the_whole_pattern(tmp_path: Path) -> None:
+    """An open session holding 50 user turns from one day must not make every other hour look inactive."""
+    from brain.initiate import presence_state
+    from brain.initiate.user_pattern import _run_daily_presence_recompute, compute_user_presence
+
+    today = [datetime(2026, 1, 15, 10, m, 0, tzinfo=UTC) for m in range(50)]
+    _write_rows(tmp_path / "active_conversations" / "sess_open.jsonl", [_user_row(ts) for ts in today])
+    earlier = _daily_user_turns(20, range(1, 30), 2)
+    _write_rows(tmp_path / "archived_conversations" / "sess_closed.000.jsonl", [_user_row(ts) for ts in earlier])
+
+    _run_daily_presence_recompute(tmp_path, _now=_T804_NOW)
+
+    assert list(presence_state.load_presence_state(tmp_path).hour_counts) == _hour_counts(today + earlier)
+    evening = _T804_NOW.replace(hour=20)
+    assert compute_user_presence(tmp_path, _now=evening).likely_active is True
+
+
+def _write_repeated_turns(persona_dir: Path) -> list[datetime]:
+    """58 distinct user turns inside the window, with copies in several files, as a crash-retried close and a retained
+    buffer leave them."""
+    times = _daily_user_turns(9, range(1, 30), 1) + _daily_user_turns(21, range(1, 30), 1)
+    rows = [_user_row(ts, text=f"turn {i}") for i, ts in enumerate(times)]
+    archive = persona_dir / "archived_conversations"
+    _write_rows(archive / "sess_a.000.jsonl", rows[:40])
+    _write_rows(archive / "sess_a.000.jsonl", rows[:40])  # the same batch again: a crash between append and marker
+    _write_rows(archive / "sess_a.001.jsonl", rows[20:])  # a later close of the retained buffer
+    _write_rows(persona_dir / "active_conversations" / "sess_a.jsonl", rows[48:])  # still in the live buffer
+    return times
+
+
+def test_804_a_turn_archived_more_than_once_is_counted_once(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _daily_scan_conversations
+
+    times = _write_repeated_turns(tmp_path)
+
+    hour_counts, _threshold, _latest = _daily_scan_conversations(tmp_path, _now=_T804_NOW)
+
+    assert hour_counts == _hour_counts(times)
+
+
+def test_804_the_reference_histogram_reads_the_archive_too(tmp_path: Path) -> None:
+    from brain.initiate.user_pattern import _build_hour_histogram
+
+    times = _write_repeated_turns(tmp_path)
+
+    hour_counts, _threshold = _build_hour_histogram(tmp_path, _now=_T804_NOW)
+
+    assert hour_counts == _hour_counts(times)
+
+
+def test_804_an_archived_file_last_written_before_the_window_is_not_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file's rows are no later than its last write, so a file last written before the window holds none of its turns."""
+    import os
+
+    from brain.initiate import user_pattern
+
+    archive = tmp_path / "archived_conversations"
+    old = archive / "sess_old.000.jsonl"
+    recent = archive / "sess_new.000.jsonl"
+    _write_rows(old, [_user_row(ts) for ts in _daily_user_turns(3, range(40, 45), 1)])
+    _write_rows(recent, [_user_row(ts) for ts in _daily_user_turns(14, range(1, 3), 1)])
+    written = (_T804_NOW - timedelta(days=31)).timestamp()
+    os.utime(old, (written, written))
+    os.utime(recent, (_T804_NOW.timestamp(), _T804_NOW.timestamp()))
+
+    read: list[str] = []
+    real_iter_jsonl = user_pattern.iter_jsonl
+
+    def recording_iter_jsonl(path, *args, **kwargs):
+        read.append(Path(path).name)
+        return real_iter_jsonl(path, *args, **kwargs)
+
+    monkeypatch.setattr(user_pattern, "iter_jsonl", recording_iter_jsonl)
+    user_pattern._daily_scan_conversations(tmp_path, _now=_T804_NOW)
+    user_pattern._build_hour_histogram(tmp_path, _now=_T804_NOW)
+
+    assert read == ["sess_new.000.jsonl", "sess_new.000.jsonl"]

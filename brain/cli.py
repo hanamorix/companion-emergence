@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import shutil
 import sys
@@ -17,6 +18,9 @@ from pathlib import Path
 from brain import __version__, prompt_strings
 from brain.bridge import state_file
 from brain.bridge.provider import get_provider
+from brain.emotion import engine as emotion_engine
+from brain.emotion import engine_files
+from brain.emotion.engine_utils import feelings_of
 from brain.emotion.persona_loader import load_persona_vocabulary
 from brain.engines._interests import InterestSet
 from brain.engines.dream import DreamEngine
@@ -24,7 +28,7 @@ from brain.engines.heartbeat import HeartbeatEngine
 from brain.engines.reflex import ReflexEngine
 from brain.engines.research import ResearchEngine
 from brain.health.alarm import compute_pending_alarms
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
+from brain.health.json_io import JsonFileError, Recovery, append_jsonl, iter_jsonl, read_jsonl
 from brain.health.walker import walk_persona
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import Memory, MemoryStore
@@ -132,7 +136,7 @@ def _status_handler(args: argparse.Namespace) -> int:
 
     state = state_file.read(persona_dir)
     if not persona_exists:
-        _print_bridge_status(state)
+        _print_bridge_status(state, persona_dir)
         return 1
 
     config = PersonaConfig.load(persona_dir / "persona_config.json")
@@ -150,17 +154,88 @@ def _status_handler(args: argparse.Namespace) -> int:
     else:
         print("memories_active: missing")
 
-    _print_bridge_status(state)
+    _print_bridge_status(state, persona_dir)
     return 0
 
 
-def _print_bridge_status(state: state_file.BridgeState | None) -> None:
+def _supervisor_status_handler(args: argparse.Namespace) -> int:
+    """`nell supervisor status`; with --json, one machine-readable object for the desktop app (#456)."""
+    from brain.bridge import daemon
+
+    if getattr(args, "json", False):
+        print(json.dumps(daemon.status_dict(get_persona_dir(args.persona))))  # json-io: ok -- CLI output, not a file
+        return 0
+    return daemon.cmd_status(args)
+
+
+def _supervisor_rebuild_handler(args: argparse.Namespace) -> int:
+    """`nell supervisor rebuild`: the one-shot rebuild as its own process (S107, HS1 of #633). Internal: the start spawns it.
+
+    In order: (1) the first progress record ("rebuilding") before anything slow, removed in a `finally`, so a waiting start and the
+    window show the child at once; (2) the runtime log, as `cmd_run` sets it up (its bridge-stack import comes after the record);
+    (3) no store and no vocabulary are opened here: `ensure_engine_ready` opens its own and the rebuild reads half-lives from the
+    persona's vocabulary file; (4) `ensure_engine_ready`, which is the x10 step and the first rebuild, or a switched persona's
+    roll-forward check and rebuild, which waits for an engine lock another process holds until it comes (no stop check, no
+    limit: S101). Nothing catches a failure: `main()` logs it to cli-crash.log and the process exits 1. Exit 0 on
+    success, on S61's skip (an unreadable state and a failing integrity check) and on a roll-forward failure the engine logs.
+    Each way the switch-over does not complete (the exit-1 failures and the skips that exit 0) also leaves the rebuild notice
+    (`engine_files.settle_rebuild_notice`) while the persona is not switched over, so the window can say so (Hana's point 5 on #633);
+    a failed roll-forward of a switched persona leaves none. When the ready step returns, the handler itself clears the notice
+    (`settle_rebuild_notice` with no reason, which deletes it only once the persona is switched over), so a hand run that completes
+    clears it as the start's child does; a failure the step raises leaves it. A delete that fails is logged and leaves the notice
+    until the next start's or command's need check clears it; running the handler again is safe (the call is idempotent).
+
+    A missing persona directory is refused before anything is written, as the other supervisor actions refuse it (`daemon.cmd_start`,
+    `cmd_run`, `cmd_tail_log`): a hand-run on a mistyped name makes no folder and rebuilds nothing. A bridge recorded running
+    (`state_file.is_running`) is refused next, still before the first record and any engine call: one plain line on stderr, nothing
+    written, exit 2 (a hand run only; the product never spawns this process beside a bridge).
+    """
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        print(f"persona directory not found: {persona_dir}", file=sys.stderr)
+        return 1
+    # Hana's 11-18 review of #633, point 3 (Planning's HRV answer): a hand run beside a live bridge would read the bridge's
+    # committed-but-unapplied rows as a roll-forward and rebuild under it. The product spawns this process from `cmd_start`,
+    # `cmd_run` and `run_rebuild_step` only when no bridge runs (each holds the start lock, which a live bridge holds too), so
+    # only a hand run reaches this refusal. The start lock cannot be the check here: the parent holds it while its child runs.
+    # Accepted edge (P4, R2): `is_running` answers False for a bridge whose identity cannot be read and for a bridge that is
+    # still starting (the runner takes the lock before it writes the state file), so a hand run in either case is not refused and
+    # runs beside the bridge as it did before, with edge (i) of `engine.EmotionEngine._roll_forward`'s losses. It needs a hand run
+    # and one of those two states at once.
+    if state_file.is_running(persona_dir):
+        print("A bridge is running for this persona, so the rebuild was not run.", file=sys.stderr)
+        return 2
+    progress = engine_files.EngineProgress(persona_dir, "rebuilding")
+    progress.write()
+    try:
+        from brain.bridge import runner
+
+        runner._setup_runtime_logging(persona_dir)
+        emotion_engine.ensure_engine_ready(persona_dir)
+        # Hana's 11-18b point 4: the ready step returned (a completed switch-over, no rebuild needed, or a skip or logged failure
+        # that returns), so the notice an earlier attempt left is cleared here, whichever process completed the switch-over. The
+        # writer deletes it only once the persona is switched over, so on any other ending this call changes nothing; it never raises.
+        engine_files.settle_rebuild_notice(persona_dir, None)
+    finally:
+        progress.remove()
+    return 0
+
+
+def _print_bridge_status(state: state_file.BridgeState | None, persona_dir: Path) -> None:
     """Print bridge status while never exposing bearer tokens."""
     if state is None or state.pid is None:
         print("bridge: not running")
+        if state is not None and state_file.recovery_needed(persona_dir):
+            # C33 (#471): a record whose pid was cleared but whose stop was not clean.
+            print("recovery: needed on next bridge start")
         return
 
-    if state_file.pid_is_alive(state.pid):
+    live = state_file.bridge_liveness(state, persona_dir)
+    if live == state_file.UNKNOWN:
+        print("bridge: unknown (its process identity could not be read)")
+        print(f"pid: {state.pid}")
+        return
+    if live == state_file.ALIVE:
         print("bridge: running")
         print(f"pid: {state.pid}")
         print(f"port: {state.port or 'unknown'}")
@@ -218,7 +293,10 @@ def _service_backend_errors(backend: object) -> tuple[type[BaseException], ...]:
         if isinstance((exc := getattr(backend, name, None)), type)
         and issubclass(exc, BaseException)
     )
-    return found or (ValueError, RuntimeError)
+    # #456: an install refused while the bridge runs is reported like any other service error.
+    from brain.service.lifecycle import BridgeRunningError
+
+    return (*found, BridgeRunningError) if found else (ValueError, RuntimeError)
 
 
 def _render_service_config(
@@ -270,7 +348,9 @@ def _service_status_field(status: object, *names: str, default: object = None) -
 
 def _service_print_plist_handler(args: argparse.Namespace) -> int:
     """Print the macOS LaunchAgent plist for a persona without installing it."""
-    if sys.platform != "darwin":
+    from brain import service as _service
+
+    if _service.current_platform() != "darwin":
         print(
             "service print-plist: macOS launchd plist output is only supported on macOS",
             file=sys.stderr,
@@ -319,6 +399,12 @@ def _service_install_handler(args: argparse.Namespace) -> int:
     if backend is None:
         return 1
 
+    # #456 (C58 d): on a terminal, an install over a running bridge first stops it through the stop watcher.
+    from brain.bridge import daemon as _daemon
+    from brain.service import lifecycle as _lifecycle
+
+    _lifecycle.interactive_stop = lambda persona: _daemon._stop_before_service_change(persona, 180.0)
+
     try:
         nell_path = backend.resolve_nell_path(args.nell_path)
         if args.dry_run:
@@ -347,11 +433,22 @@ def _service_install_handler(args: argparse.Namespace) -> int:
 
 
 def _service_uninstall_handler(args: argparse.Namespace) -> int:
-    """Stop/remove the persona OS service."""
+    """Stop/remove the persona OS service.
+
+    #456 (C54): a running bridge is first asked to stop (the shutdown request and the stop watcher, with the hard-exit
+    offer on a terminal); without a terminal, a bridge still stopping after --timeout leaves the service installed.
+    """
     backend = _service_backend("uninstall")
     if backend is None:
         return 1
 
+    from brain.bridge import daemon as _daemon
+    from brain.service import lifecycle as _lifecycle
+
+    if _lifecycle.bridge_running(args.persona):
+        if not _daemon._stop_before_service_change(args.persona, float(getattr(args, "timeout", 180.0))):
+            print("service uninstall: the bridge is still stopping; the service stays installed", file=sys.stderr)
+            return 1
     try:
         service_path = backend.uninstall_service(persona=args.persona, keep_plist=args.keep_plist)
     except _service_backend_errors(backend) as exc:
@@ -460,6 +557,7 @@ def _dedup_sweep_handler(args: argparse.Namespace) -> int:
     Idempotent — safe to re-run.
     """
     from brain.engines.dedup_sweep import run_dedup_sweep
+    from brain.forgetting import SoulExemptionsUnavailableError
 
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
@@ -469,6 +567,10 @@ def _dedup_sweep_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(persona_dir / "memories.db", integrity_check=False)
     try:
         report = run_dedup_sweep(store, persona_dir)
+    except SoulExemptionsUnavailableError as exc:
+        # The sweep fails closed (#392): it touched nothing. The loader has logged each failed read.
+        print(f"dedup-sweep stopped, nothing was deleted: {exc}.", file=sys.stderr)
+        return 1
     finally:
         store.close()
 
@@ -576,6 +678,7 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
         return rc
     try:
         memory = store.get(args.memory_id)
+        engine = store.emotion_engine()
     finally:
         store.close()
 
@@ -583,6 +686,7 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
         print(f"unknown memory id: {args.memory_id}", file=sys.stderr)
         return 1
 
+    felt = feelings_of(memory, engine)
     print(f"id: {memory.id}")
     print(f"type: {memory.memory_type}")
     print(f"domain: {memory.domain}")
@@ -591,14 +695,106 @@ def _memory_show_handler(args: argparse.Namespace) -> int:
         f"last_accessed_at: {memory.last_accessed_at.isoformat() if memory.last_accessed_at else '(never)'}"
     )
     print(f"importance: {memory.importance:.2f}")
-    print(f"score: {memory.score:.2f}")
+    print(f"score: {felt.score:.2f}")
     print(f"active: {'yes' if memory.active else 'no'}")
-    print(f"protected: {'yes' if memory.protected else 'no'}")
     print(f"tags: {', '.join(memory.tags) if memory.tags else '(none)'}")
-    print(f"emotions: {_format_mapping(memory.emotions)}")
+    print(f"emotions: {_format_mapping(felt.feelings)}")
     print(f"metadata: {json.dumps(memory.metadata, sort_keys=True)}")
     print("content:")
     print(memory.content)
+    return 0
+
+
+def _memory_backfill_extraction_handler(args: argparse.Namespace) -> int:
+    """`nell memory backfill-extraction` (#523): re-extract conversation text the old extraction's tail cut never showed.
+
+    Default mode: the lost starts of long spans (``heads``); ``--all``: everything archived (no soul candidates). A plan keeps
+    its mode; the other mode needs ``--restart``. ``--dry-run`` prints both modes' sizes and writes nothing. ``--background``
+    arms the plan for the bridge, which runs one chunk per lull pass. Default: with no bridge running, run it here through the
+    same central-cadence job until done or until it stops (chat active, a deferral, ...); with a bridge running, arm it for the
+    bridge (this process cannot see the bridge's chat state). ``--status``, ``--stop``. See
+    ``brain/ingest/extraction_backfill.py``.
+
+    Every path that starts spending model calls (foreground, ``--background``, and arming for a running bridge, which spends at
+    lulls with no further prompt) prints the number of calls still to make and starts only with ``--yes``; without it nothing is
+    planned or armed and the exit code is 1. A plan with nothing to run (already complete, or the other mode, which is refused)
+    needs no ``--yes``, nor do ``--status``, ``--stop`` and ``--dry-run``.
+    """
+    from brain.ingest import extraction_backfill as eb
+    from brain.service import lifecycle as _lifecycle
+
+    persona_dir = get_persona_dir(args.persona)
+    if not persona_dir.exists():
+        print(f"No persona directory at {persona_dir}.", file=sys.stderr)
+        return 1
+    mode = "all" if args.all else "heads"
+    if args.restart and (args.status or args.stop or args.dry_run):
+        print("--restart cannot be combined with --status, --stop or --dry-run", file=sys.stderr)
+        return 2
+    if args.status:
+        print(eb.status_text(persona_dir))
+        return 0
+    if args.stop:
+        print(eb.stop(persona_dir))
+        return 0
+    if args.dry_run:
+        print(eb.dry_run_text(persona_dir))
+        return 0
+
+    calls = eb.planned_calls(persona_dir, mode, restart=args.restart)
+    if calls:
+        print(f"mode {mode}: about {calls} model call(s) to make (one per chunk of extracted text; an over-long exchange takes several).")
+        if not args.yes:
+            print(
+                "Not started: this spends model calls. Run the same command again with --yes to start "
+                "(--dry-run shows what each mode would extract).",
+                file=sys.stderr,
+            )
+            return 1
+
+    restart_note = "a bridge started before this update must be restarted to have the backfill job"
+    outcome, message = eb.restart(persona_dir, mode) if args.restart else eb.arm(persona_dir, mode)
+    print(message)
+    if outcome == "refused":
+        return 1
+    if outcome == "complete":
+        return 0  # nothing to run: the plan is done (or planned nothing)
+
+    if args.background:
+        print(
+            "armed: the bridge runs it one chunk per lull; with no bridge running nothing happens until one runs "
+            f"({restart_note})."
+        )
+        return 0
+    if _lifecycle.bridge_running(args.persona):
+        print(
+            "the persona's bridge is running, so the plan is armed for it: it runs one chunk per lull "
+            f"({restart_note})."
+        )
+        return 0
+
+    from brain.bridge.model_tier import TIER_BACKGROUND_HOUSEKEEPING, build_tier_provider
+
+    store = MemoryStore(db_path=persona_dir / "memories.db")
+    try:
+        # No bridge is running here, so nothing has registered the persona's own emotions in this process: without this the
+        # extraction would drop every emotion that is not in the baseline vocabulary (524-1).
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
+        try:
+            eb.run_foreground(
+                persona_dir,
+                store=store,
+                hebbian=hebbian,
+                provider=build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
+                bridge_running=lambda: _lifecycle.bridge_running(args.persona),
+            )
+        except KeyboardInterrupt:
+            print("\ninterrupted: progress is kept (written after each chunk); run the command again to continue.")
+        finally:
+            hebbian.close()
+    finally:
+        store.close()
     return 0
 
 
@@ -645,7 +841,7 @@ def _embed_backfill_handler(args: argparse.Namespace) -> int:
         MIN_CHARS_TO_EMBED,
         run_embedding_backfill_to_completion,
     )
-    from brain.memory.embeddings import build_embedding_provider
+    from brain.memory.embeddings import resolve_embedding_model_id
 
     # `_open_memory_store_for_cli` is documented as opening for "read-only
     # CLI inspection" (its other 3 call sites only ever read) — `MemoryStore`
@@ -659,9 +855,12 @@ def _embed_backfill_handler(args: argparse.Namespace) -> int:
 
     persona_dir = get_persona_dir(args.persona)
     try:
-        provider = build_embedding_provider()
+        # The id only: no provider is built here (constructing one downloads
+        # the model when uncached, even for an empty backlog); the drain builds
+        # its own when there are rows to embed.
+        model_id = resolve_embedding_model_id()
         total_backlog = store.count_unembedded(
-            current_model_id=provider.model_id(), min_chars=MIN_CHARS_TO_EMBED
+            current_model_id=model_id, min_chars=MIN_CHARS_TO_EMBED
         )
 
         if total_backlog == 0:
@@ -670,7 +869,7 @@ def _embed_backfill_handler(args: argparse.Namespace) -> int:
 
         print(
             f"embedding backfill for '{args.persona}': {total_backlog} row(s) to "
-            f"embed (model={provider.model_id()!r})"
+            f"embed (model={model_id!r})"
         )
 
         start = time.monotonic()
@@ -802,6 +1001,9 @@ def _dream_handler(args: argparse.Namespace) -> int:
         from brain.soul.store import SoulStore
 
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
+        if refused is not None:
+            return refused
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         soul_store = SoulStore(str(persona_dir / "crystallizations.db"))
         try:
@@ -846,6 +1048,53 @@ def _dream_handler(args: argparse.Namespace) -> int:
     return 0
 
 
+def _drain_emotion_engine(persona_dir: Path) -> None:
+    """Run the emotion engine's drain and day close now (spec 3.1 S4); it catches and logs its own failures and never raises.
+
+    Called by the commands that run in their own process (`nell heartbeat`, `nell chat --no-bridge`) after the work that
+    queues or writes emotions, since no bridge supervisor is running to do it. The module is imported as `emotion_engine`
+    (a local named `engine` exists in several handlers here), and a patch of the module reaches this call.
+    """
+    from datetime import UTC, datetime
+
+    emotion_engine.engine_for(persona_dir).note_active(datetime.now(UTC))
+
+
+def _engine_ready_or_refuse(persona_dir: Path, dry_run: bool) -> int | None:
+    """Make the emotion engine ready before a command's work (Engine 6, spec 3.1 S6, S107): None to go on, or an exit code to return.
+
+    Called by the six commands that touch the engine, right after their own vocabulary load. A real run no longer rebuilds
+    in-process: it registers the command (`engine_files.register_command_run`, so a start that needs a rebuild can end it) and runs
+    the rebuild step (`daemon.run_rebuild_step`): with no bridge running and a rebuild needed it takes the start lock, ends every
+    other running command and runs the rebuild as its own process (`nell supervisor rebuild`), then goes on. Its code is returned:
+    1 when another command could not be ended, 2 when a start or another rebuild holds the start lock (nothing was run). A dry run writes nothing, so it cannot do the switch-over: on a persona that is
+    not live (not switched yet, or its emotion state file cannot be read: the fail-safe answer is "not switched") it prints a
+    plain message on stderr (a different one for each of the two causes, since the advice differs), runs no reader and returns 2;
+    on a switched persona it goes on as today.
+    """
+    if not dry_run:
+        from brain.bridge import daemon
+
+        engine_files.register_command_run(persona_dir)  # through the module: the tests' fixture replaces the name
+        return daemon.run_rebuild_step(persona_dir)
+    if emotion_engine.engine_for(persona_dir).is_live():
+        return None
+    if engine_files.switch_over_state(engine_files.read_state(persona_dir)) is None:
+        message = (
+            f"This persona's emotion state file ({engine_files.state_path(persona_dir)}) cannot be read, so its emotion engine "
+            "counts as not switched, and a dry run writes nothing. Nothing was run. Check that the file and its folder are "
+            "readable, then try again."
+        )
+    else:
+        message = (
+            "This persona's emotion engine is not switched on yet, and a dry run writes nothing, so it cannot switch it on. "
+            "Nothing was run. The switch-over happens at the persona's first start: the bridge, or any of these commands "
+            "without --dry-run."
+        )
+    print(message, file=sys.stderr)
+    return 2
+
+
 def _heartbeat_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell heartbeat` to the HeartbeatEngine."""
     persona_dir = get_persona_dir(args.persona)
@@ -863,6 +1112,9 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
+        if refused is not None:
+            return refused
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
             provider = get_provider(provider_name)
@@ -892,6 +1144,8 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
             hebbian.close()
     finally:
         store.close()
+    if not args.dry_run:  # a dry run writes nothing, so it drains nothing
+        _drain_emotion_engine(persona_dir)
 
     if result.initialized:
         if args.dry_run:
@@ -901,7 +1155,6 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
     elif args.dry_run:
         print("Heartbeat dry-run — no writes.")
         print(f"  elapsed: {result.elapsed_seconds / 3600:.2f}h")
-        print(f"  would decay: {result.memories_decayed} memories")
         print(f"  would prune: {result.edges_pruned} edges")
         # `or "gated"` defends against any future engine refactor that could
         # leave dream_gated_reason=None — prevents literal "dream: None" output.
@@ -921,7 +1174,7 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
 
         print(f"Heartbeat tick complete ({args.trigger}).")
         print(f"  elapsed: {result.elapsed_seconds / 3600:.2f}h")
-        print(f"  decayed: {result.memories_decayed} memories, pruned {result.edges_pruned} edges")
+        print(f"  pruned {result.edges_pruned} edges")
 
         # Dream: show fires + interesting gates. Suppress "not_due" by default.
         if result.dream_id:
@@ -985,6 +1238,9 @@ def _reflex_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
+        if refused is not None:
+            return refused
         provider = get_provider(provider_name)
         engine = ReflexEngine(
             store=store,
@@ -1041,6 +1297,9 @@ def _research_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
+        if refused is not None:
+            return refused
         provider = get_provider(provider_name)
         searcher = get_searcher(searcher_name)
         engine = ResearchEngine(
@@ -1084,7 +1343,11 @@ def _interest_list_handler(args: argparse.Namespace) -> int:
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(f"No persona directory at {persona_dir}")
-    load_persona_vocabulary(persona_dir / "emotion_vocabulary.json")
+    # Listing only reads (#708): a corrupt vocabulary is left as it is for a load that has the store and can rebuild it.
+    try:
+        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", read_only=True)
+    except JsonFileError as exc:
+        print(f"Warning: the emotion vocabulary could not be read and was left as it is ({exc}).", file=sys.stderr)
     interests = InterestSet.load(
         persona_dir / "interests.json", default_path=_default_interests_path()
     )
@@ -1166,7 +1429,7 @@ def _health_show_handler(args: argparse.Namespace) -> int:
 
     # Collect recent anomaly records from the audit log.
     recent_treatments: list[dict] = []
-    for entry in read_jsonl_skipping_corrupt(audit_path):
+    for entry in iter_jsonl(audit_path, recover=Recovery.RAISE):
         try:
             from brain.utils.time import parse_iso_utc
 
@@ -1188,7 +1451,7 @@ def _health_show_handler(args: argparse.Namespace) -> int:
         date_str = alarm.first_seen_at.strftime("%Y-%m-%d")
         print(
             f"    {alarm.file}: {alarm.kind} {date_str} "
-            f"({alarm.occurrences_in_window} occurrences in window)"
+            f"({'at least ' if alarm.at_least else ''}{alarm.occurrences_in_window} occurrences in window)"
         )
 
     print(f"  Recent self-treatments (last 7 days): {len(recent_treatments)}")
@@ -1284,15 +1547,11 @@ def _health_acknowledge_handler(args: argparse.Namespace) -> int:
         alarms = compute_pending_alarms(persona_dir)
         files_to_ack = [alarm.file for alarm in alarms]
 
-    import json
-
     entry = {
         "timestamp": iso_utc(datetime.now(UTC)),
         "user_acknowledged": files_to_ack,
     }
-    audit_path = persona_dir / "heartbeats.log.jsonl"
-    with audit_path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry) + "\n")
+    append_jsonl(persona_dir / "heartbeats.log.jsonl", entry)
 
     n = len(files_to_ack)
     if n == 0:
@@ -1373,10 +1632,8 @@ def _soul_candidates_handler(args: argparse.Namespace) -> int:
             f"No persona directory at {persona_dir}. Persona {args.persona!r} does not exist."
         )
 
-    from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
-
     candidates_path = persona_dir / "soul_candidates.jsonl"
-    records = read_jsonl_skipping_corrupt(candidates_path)
+    records = read_jsonl(candidates_path, recover=Recovery.RAISE)
     pending = [r for r in records if r.get("status", "auto_pending") == "auto_pending"]
 
     limit = getattr(args, "limit", None)
@@ -1571,38 +1828,49 @@ def _initiate_d_stats_handler(args: argparse.Namespace) -> int:
 
 
 
+def _kindled_call(
+    s, path: str, *, method: str = "POST", payload: dict | None = None, timeout: float = 30.0
+) -> dict | None:
+    """One call to the persona's bridge on the loopback address, straight to it (never through an HTTP proxy, #475).
+
+    Returns the decoded JSON reply, or None after printing the error ("bridge returned <status>" or "could not reach bridge").
+    """
+    import json
+
+    from brain.bridge.loopback import direct_request
+
+    headers = {"Content-Type": "application/json"}
+    if s.auth_token:
+        headers["Authorization"] = f"Bearer {s.auth_token}"
+    body = None if method == "GET" else json.dumps(payload or {}).encode("utf-8")
+    try:
+        status, raw = direct_request(
+            method, f"http://127.0.0.1:{s.port}{path}", headers=headers, body=body, timeout=timeout
+        )
+    except OSError as exc:
+        print(f"error: could not reach bridge: {exc}", file=sys.stderr)
+        return None
+    if status >= 400:
+        print(f"error: bridge returned {status}: {raw.decode('utf-8', errors='replace')}", file=sys.stderr)
+        return None
+    return json.loads(raw)  # json-io: ok -- HTTP response from the local bridge, not a file
+
+
+def _kindled_bridge_state(args: argparse.Namespace):
+    """The running bridge's state for `nell kindled ...`, or None after printing the "not running" error."""
+    s = state_file.read(get_persona_dir(args.persona))
+    if s is None:
+        print("error: bridge is not running. Start it with `nell service start`.", file=sys.stderr)
+    return s
+
+
 def _kindled_rotate_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell kindled rotate-key` — rotate local identity key."""
-    import json
-    import urllib.error
-    import urllib.request
-
-    persona_dir = get_persona_dir(args.persona)
-    s = state_file.read(persona_dir)
+    s = _kindled_bridge_state(args)
     if s is None:
-        print(
-            "error: bridge is not running. Start it with `nell service start`.",
-            file=sys.stderr,
-        )
         return 1
-    port = s.port
-    auth_token = s.auth_token
-    url = f"http://127.0.0.1:{port}/kindled-link/identity/rotate"
-    headers = {"Content-Type": "application/json"}
-    if auth_token:
-        headers["Authorization"] = f"Bearer {auth_token}"
-    req = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        print(
-            f"error: bridge returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}",
-            file=sys.stderr,
-        )
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"error: could not reach bridge: {exc.reason}", file=sys.stderr)
+    data = _kindled_call(s, "/kindled-link/identity/rotate")
+    if data is None:
         return 1
     print(f"Key rotated. New key ID: {data['new_key_id']}")
     print(f"New fingerprint phrase: {data['fingerprint_phrase']}")
@@ -1612,31 +1880,11 @@ def _kindled_rotate_handler(args: argparse.Namespace) -> int:
 
 def _kindled_my_code_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell kindled my-code` — print this persona's connect-code."""
-    import json
-    import urllib.error
-    import urllib.request
-
-    persona_dir = get_persona_dir(args.persona)
-    s = state_file.read(persona_dir)
+    s = _kindled_bridge_state(args)
     if s is None:
-        print("error: bridge is not running. Start it with `nell service start`.", file=sys.stderr)
         return 1
-    url = f"http://127.0.0.1:{s.port}/kindled-link/my-code"
-    headers = {"Content-Type": "application/json"}
-    if s.auth_token:
-        headers["Authorization"] = f"Bearer {s.auth_token}"
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        print(
-            f"error: bridge returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}",
-            file=sys.stderr,
-        )
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"error: could not reach bridge: {exc.reason}", file=sys.stderr)
+    data = _kindled_call(s, "/kindled-link/my-code", method="GET")
+    if data is None:
         return 1
     print("Your connect-code (share it with the other person over a channel you trust):\n")
     print(data["code"])
@@ -1646,32 +1894,11 @@ def _kindled_my_code_handler(args: argparse.Namespace) -> int:
 
 def _kindled_connect_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell kindled connect <code>` — pair with a peer via their code."""
-    import json
-    import urllib.error
-    import urllib.request
-
-    persona_dir = get_persona_dir(args.persona)
-    s = state_file.read(persona_dir)
+    s = _kindled_bridge_state(args)
     if s is None:
-        print("error: bridge is not running. Start it with `nell service start`.", file=sys.stderr)
         return 1
-    url = f"http://127.0.0.1:{s.port}/kindled-link/connect"
-    headers = {"Content-Type": "application/json"}
-    if s.auth_token:
-        headers["Authorization"] = f"Bearer {s.auth_token}"
-    body = json.dumps({"code": args.code}).encode("utf-8")
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        print(
-            f"error: bridge returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}",
-            file=sys.stderr,
-        )
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"error: could not reach bridge: {exc.reason}", file=sys.stderr)
+    data = _kindled_call(s, "/kindled-link/connect", payload={"code": args.code})
+    if data is None:
         return 1
     print(f"Connected to {data['peer_id']} ({data['consent_state']}).")
     print(f"Relay: {data['relay_url']}")
@@ -1681,28 +1908,11 @@ def _kindled_connect_handler(args: argparse.Namespace) -> int:
 
 def _kindled_self_test_handler(args: argparse.Namespace) -> int:
     """Dispatch `nell kindled self-test` — run the in-process connection self-test."""
-    import json
-    import urllib.error
-    import urllib.request
-
-    persona_dir = get_persona_dir(args.persona)
-    s = state_file.read(persona_dir)
+    s = _kindled_bridge_state(args)
     if s is None:
-        print("error: bridge is not running. Start it with `nell service start`.", file=sys.stderr)
         return 1
-    url = f"http://127.0.0.1:{s.port}/kindled-link/self-test"
-    headers = {"Content-Type": "application/json"}
-    if s.auth_token:
-        headers["Authorization"] = f"Bearer {s.auth_token}"
-    req = urllib.request.Request(url, data=b"{}", headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            data = json.loads(resp.read())
-    except urllib.error.HTTPError as exc:
-        print(f"error: bridge returned {exc.code}: {exc.read().decode('utf-8', errors='replace')}", file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"error: could not reach bridge: {exc.reason}", file=sys.stderr)
+    data = _kindled_call(s, "/kindled-link/self-test", timeout=60.0)
+    if data is None:
         return 1
     for st in data.get("stages", []):
         mark = "PASS" if st["ok"] else "FAIL"
@@ -1727,6 +1937,9 @@ def _soul_review_handler(args: argparse.Namespace) -> int:
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
+        if refused is not None:
+            return refused
         provider = get_provider(provider_name)
 
         from brain.soul.review import review_pending_candidates
@@ -1832,9 +2045,9 @@ def _paths_for_persona(persona: str) -> dict[str, Path]:
         "cache": get_cache_dir(),
         "logs": get_log_dir(),
         "personas_root": home / "personas",
-        # The only ops-override surface, and it lives under the platformdirs
+        # The settings file, the only ops-settings surface, and it lives under the platformdirs
         # home — undiscoverable unless `paths` says where it is (#63).
-        "tunables": home / "tunables.json",
+        "tunables": home / "tunables.toml",
         # Code location (#179) — an updater must find the install, not just the data.
         # install_kind is a bare word wrapped in Path so the str()/exists() plumbing
         # below stays uniform; its "exists" is meaningless and always False.
@@ -1912,7 +2125,7 @@ def _personas_handler(args: argparse.Namespace) -> int:
         for n in names:
             pd = get_persona_dir(n)
             st = state_file.read(pd)
-            running = st is not None and st.pid is not None and state_file.pid_is_alive(st.pid)
+            running = st is not None and state_file.bridge_liveness(st, pd) == state_file.ALIVE
             rows.append({"name": n, "bridge_running": running})
         print(json.dumps(rows, indent=2))
         return 0
@@ -1927,10 +2140,34 @@ def _personas_handler(args: argparse.Namespace) -> int:
     for n in names:
         pd = get_persona_dir(n)
         st = state_file.read(pd)
-        running = st is not None and st.pid is not None and state_file.pid_is_alive(st.pid)
+        running = st is not None and state_file.bridge_liveness(st, pd) == state_file.ALIVE
         marker = "running" if running else "not running"
         print(f"{n:<{width}}  {marker}")
     return 0
+
+
+def _flush_cost_series_at_exit(store: MemoryStore) -> None:
+    """`nell chat --no-bridge` exit (name-recall fix S146, S164): this process
+    has no lull cadence to save the cost-series samples it buffered, so it
+    saves them here, in its own try and BEFORE the pass-2 exit drain (which can
+    run for a while and is not wrapped), so the shared series reaches the bridge
+    and later sessions whatever the drain does. Prints nothing; fail-soft."""
+    try:
+        from brain.memory import cost_series
+
+        cost_series.flush(store)
+    except Exception:  # noqa: BLE001 - never let a timing save break an exit
+        logging.getLogger(__name__).warning("cost-series flush at exit failed", exc_info=True)
+    # Name-recall fix S189: records the diagnostics append buffered while the log's
+    # lock was held (same exit, same reason; the call never waits and never raises).
+    try:
+        from brain.memory import recall_diagnostics
+
+        recall_diagnostics.flush_pending(
+            recall_diagnostics.diagnostics_path(Path(store.db_path).parent)
+        )
+    except Exception:  # noqa: BLE001 - never let a diagnostics save break an exit
+        logging.getLogger(__name__).warning("recall diagnostics flush at exit failed", exc_info=True)
 
 
 def _drain_pass2_at_exit(persona_dir: Path) -> None:
@@ -1951,11 +2188,52 @@ def _drain_pass2_at_exit(persona_dir: Path) -> None:
     def _print_progress(done: int, total: int) -> None:
         print(f"pass-2: {done} of {total} done")
 
-    pass2_queue.drain_all_locked(
-        persona_dir,
-        on_progress=_print_progress,
-        time_budget_s=dev_constants.PASS2_NOBRIDGE_DRAIN_BUDGET_S,
-    )
+    from brain.bridge.cli_throttle import ThrottleDeferred
+
+    try:
+        pass2_queue.drain_all_locked(
+            persona_dir,
+            on_progress=_print_progress,
+            time_budget_s=dev_constants.PASS2_NOBRIDGE_DRAIN_BUDGET_S,
+        )
+    except ThrottleDeferred as exc:
+        # #473: a refused call ("not now", e.g. an expired login) leaves the rest queued for a later drain.
+        print(f"pass-2: stopped early ({exc}); the rest stays queued")
+
+
+def _start_floor_bootstrap_for_direct_chat(persona_dir: Path, *, blocking: bool) -> None:
+    """`nell chat --no-bridge` session start (name-recall fix S85 revised, S91):
+    compute the COSINE bootstrap floor ONCE for this process, off the per-turn
+    path (recall only peeks the caches; there is no supervisor here to run the
+    retry job, so the rerank floor is computed on first need and a failed
+    bootstrap retried on each message, both in the background: `respond()`).
+
+    The interactive REPL starts it on a daemon thread so the prompt appears at
+    once (its first turn may be keyword-only if the thread is still running);
+    the one-shot form (`blocking`) computes before its single turn, because
+    that turn is the only one there will be. Fail-soft: never blocks or breaks
+    the chat."""
+    try:
+        from brain.bridge import cli_throttle
+        from brain.memory import floor_startup
+
+        floor_startup.set_activity_marker_provider(cli_throttle.chat_activity_marker)
+        # S201: this process has no lull cadence, so a turn that would rerank with no usable memory model
+        # measures it in the background (the REPL only: the one-shot form's single turn takes the
+        # cosine path and the process ends, a thread would be cut off mid-measurement).
+        floor_startup.enable_background_ram_figure(None if blocking else persona_dir)
+        if blocking:
+            floor_startup.compute_missing_floors(
+                persona_dir, activity_marker=cli_throttle.chat_activity_marker
+            )
+        else:
+            floor_startup.start_background(
+                persona_dir,
+                activity_marker=cli_throttle.chat_activity_marker,
+                name="floor-bootstrap-direct-chat",
+            )
+    except Exception as exc:  # noqa: BLE001 — never break the chat
+        print(f"note: floor bootstrap not started ({exc})", file=sys.stderr)
 
 
 def _chat_direct_mode(args: argparse.Namespace) -> int:
@@ -1971,10 +2249,12 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
     from brain.chat.engine import respond
     from brain.chat.session import create_session
     from brain.ingest.pipeline import close_session, extract_session_snapshot
+    from brain.memory import floor_startup
 
     # #203: default exit is a NON-destructive snapshot (matches the GUI, which
-    # only ever calls /sessions/snapshot). close_session deletes the buffer,
-    # which starves cascade-compaction / archive / rollover. --close opts in.
+    # only ever calls /sessions/snapshot). close_session archives the whole
+    # buffer and then deletes it, which starves cascade-compaction and
+    # rollover of a buffer to work on. --close opts in.
     flush_session = close_session if getattr(args, "close", False) else extract_session_snapshot
 
     persona_dir = get_persona_dir(args.persona)
@@ -1988,11 +2268,25 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
 
     provider_name, _ = _resolve_routing(persona_dir, args)
 
+    one_shot = bool(getattr(args, "message", None))
+    if one_shot:
+        # Synchronous: it finishes before the store opens, so nothing overlaps it.
+        _start_floor_bootstrap_for_direct_chat(persona_dir, blocking=True)
+
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
+        if not one_shot:
+            # The REPL's bootstrap runs on a thread that opens memories.db itself and runs the
+            # schema script. Start it only now that the main thread has created and
+            # integrity-checked the file, so the two never create the file and schema at once
+            # (#414).
+            _start_floor_bootstrap_for_direct_chat(persona_dir, blocking=False)
         from brain.emotion.persona_loader import load_persona_vocabulary
 
         load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        refused = _engine_ready_or_refuse(persona_dir, False)  # no dry run here, but the rebuild step can still refuse (1 or 2)
+        if refused is not None:
+            return refused
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
             provider = get_provider(provider_name)
@@ -2000,14 +2294,20 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
             # One-shot mode
             message = getattr(args, "message", None)
             if message:
-                result = respond(
-                    persona_dir,
-                    message,
-                    store=store,
-                    hebbian=hebbian,
-                    provider=provider,
-                )
+                try:
+                    result = respond(
+                        persona_dir,
+                        message,
+                        store=store,
+                        hebbian=hebbian,
+                        provider=provider,
+                    )
+                except BaseException:
+                    # A failed turn still saves the timings it buffered (S164).
+                    _flush_cost_series_at_exit(store)
+                    raise
                 print(result.content)
+                _drain_emotion_engine(persona_dir)  # the reply is printed: fold what it queued
                 # Flush conversation through ingest pipeline (best-effort).
                 # Mirrors the REPL's finally block — without this, every
                 # one-shot reply orphans its buffer file and no memories
@@ -2028,7 +2328,9 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                         RuntimeWarning,
                         stacklevel=1,
                     )
+                _flush_cost_series_at_exit(store)
                 _drain_pass2_at_exit(persona_dir)
+                _drain_emotion_engine(persona_dir)  # the pass-2 drain can queue changes of its own
                 return 0
 
             # Interactive REPL mode
@@ -2055,7 +2357,11 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                     )
                     print(result.content)
                     print()
+                    _drain_emotion_engine(persona_dir)  # after each reply
                     total_tool_calls += len(result.tool_invocations)
+                    # S210: the reply is finished and printed; only now may the RAM
+                    # ladder (S220) a flagged turn asked for start (its sample never spans a reply, S218).
+                    floor_startup.start_requested_ram_figure()
             finally:
                 # Flush conversation through ingest pipeline (best-effort)
                 try:
@@ -2074,7 +2380,9 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                         RuntimeWarning,
                         stacklevel=1,
                     )
+                _flush_cost_series_at_exit(store)
                 _drain_pass2_at_exit(persona_dir)
+                _drain_emotion_engine(persona_dir)  # after the pass-2 drain
                 # Summary
                 print(
                     f"\nSession ended. {session.turns} turn(s), "
@@ -2104,9 +2412,9 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path, *, readiness=N
 
     import httpx
     from websockets.exceptions import InvalidStatus
-    from websockets.sync.client import connect
 
     from brain.bridge import state_file
+    from brain.bridge.loopback import direct_ws_connect as connect  # never through a proxy (#475)
 
     if readiness is not None:
         port = readiness.port
@@ -2132,6 +2440,7 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path, *, readiness=N
             f"{base}/session/new",
             json={"client": "cli"},
             headers=http_headers,
+            trust_env=False,  # the loopback bridge is never reached through a proxy (#475)
         ).json()["session_id"]
 
     print(f"chat session {sid} (Ctrl-D to exit)")
@@ -2193,6 +2502,7 @@ def _chat_via_bridge(args: argparse.Namespace, persona_dir: Path, *, readiness=N
             json={"session_id": sid},
             headers=http_headers,
             timeout=120.0,
+            trust_env=False,  # never through a proxy (#475)
         )
     except (httpx.TimeoutException, httpx.HTTPError) as exc:
         # Bridge keeps running; ingest may still complete server-side. We
@@ -2234,6 +2544,7 @@ def _chat_handler(args: argparse.Namespace) -> int:
             persona = args.persona
             idle_shutdown = 30
             client_origin = "cli"
+            attach = True  # a bridge that appears after the check above is refused, never stopped for a rebuild (S107)
 
         rc = daemon.cmd_start(_StartArgs(), out=readiness_out)
         if rc != 0:
@@ -2246,6 +2557,7 @@ def _chat_handler(args: argparse.Namespace) -> int:
             persona = args.persona
             idle_shutdown = 30
             client_origin = "cli"
+            attach = True  # a start over a running bridge only fetches its readiness: never stops it for a rebuild (S107)
 
         daemon.cmd_start(_NoOpStartArgs(), out=readiness_out)
 
@@ -2291,6 +2603,32 @@ def _prompt_choice(label: str, choices: list[str], default: str, help: str = "")
         print(f"  (must be one of: {', '.join(choices)})", file=sys.stderr)
 
 
+def _prompt_model(current: str, help: str = "") -> str:
+    """Interactive model prompt: a word or a full model id; loops until valid.
+
+    Blank (or EOF) returns "": the model setting is left as it is. ``current`` is the id the chat job runs now,
+    shown so the user knows what blank keeps.
+    """
+    from brain.bridge.model_tier import MODEL_ID_RULE, is_valid_model
+
+    while True:
+        if help:
+            print(help)
+        raw = _prompt(f"model [sonnet/opus/haiku or a full id; blank keeps {current}]")
+        if not raw or is_valid_model(raw):
+            return raw
+        print(f"  ({MODEL_ID_RULE})", file=sys.stderr)
+
+
+def _model_arg(value: str) -> str:
+    """argparse type for --model: a word or a full model id (syntax only, no Claude CLI call)."""
+    from brain.bridge.model_tier import MODEL_ID_RULE, is_valid_model
+
+    if not is_valid_model(value):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a valid model: {MODEL_ID_RULE}")
+    return value
+
+
 def _init_handler(args: argparse.Namespace) -> int:
     """Set up a new persona — interactive wizard or flag-driven.
 
@@ -2329,6 +2667,7 @@ def _init_handler(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+    _run_model_migration()  # a saved per-persona model moves into the install-wide setting before anything changes it
 
     if user_name is None:  # explicit empty string allowed (means "leave unset")
         user_name = (
@@ -2360,17 +2699,17 @@ def _init_handler(args: argparse.Namespace) -> int:
         return 1
 
     if model is None:
-        from brain.persona_config import DEFAULT_MODEL, KNOWN_MODELS
+        from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, model_for_tier
 
         print()
-        model = _prompt_choice(
-            "model",
-            choices=sorted(KNOWN_MODELS),
-            default=DEFAULT_MODEL,
+        model = _prompt_model(
+            current=model_for_tier(TIER_INTERACTIVE_CHAT),
             help=(
                 "  sonnet — fast, smart, ~$3 per million input tokens (recommended)\n"
                 "  opus   — smartest, ~$15 per million input tokens (best for deep writing)\n"
-                "  haiku  — fastest, cheapest, less capable"
+                "  haiku  — fastest, cheapest, less capable\n"
+                "  or a full model id (a full id starts with claude-; it is checked when first used)\n"
+                "  This setting is shared by every persona on this install."
             ),
         )
 
@@ -2417,9 +2756,7 @@ def _init_handler(args: argparse.Namespace) -> int:
 
     # ----- always: write persona_config + voice.md -----
     persona_dir.mkdir(parents=True, exist_ok=True)
-    config_path = write_persona_config(
-        persona_dir, user_name=user_name, user_pronouns=user_pronouns, model=model
-    )
+    config_path = write_persona_config(persona_dir, user_name=user_name, user_pronouns=user_pronouns)
     voice_path = install_voice_template(persona_dir, voice_template)
 
     from brain import app_config as _app_config
@@ -2430,10 +2767,10 @@ def _init_handler(args: argparse.Namespace) -> int:
     # GitHub Actions Windows caught this: a leading "✓" raised
     # UnicodeEncodeError during bundled `nell init` smoke.
     print(f"OK persona '{persona}' ready at {persona_dir}")
-    print(
-        f"  - {config_path.name}: user_name={user_name!r}, "
-        f"user_pronouns={user_pronouns!r}, model={model!r}"
-    )
+    print(f"  - {config_path.name}: user_name={user_name!r}, user_pronouns={user_pronouns!r}")
+    model_saved = True
+    if model:
+        model_saved = _init_save_model(model)
     if voice_path is not None:
         print(f"  - {voice_path.name}: copied from '{voice_template}' template")
         if voice_template == "nell-example":
@@ -2446,6 +2783,207 @@ def _init_handler(args: argparse.Namespace) -> int:
         print(f"  - migrated from {migrate_from}")
     print()
     print(f"next: uv run nell chat --persona {persona}")
+    return 0 if model_saved else 1
+
+
+def _init_save_model(model: str) -> bool:
+    """`nell init --model`: write the install-wide chat model setting (no Claude call, so a full id is checked when
+    first used). The pick is written as the entry's value: a word as the id it means, a full id exactly as given (nothing
+    is written when the value already equals it). False after printing why when the settings file could not be changed."""
+    from brain.bridge.model_tier import TIER_INTERACTIVE_CHAT, model_for_tier, set_job_models
+    from brain.tunables import TunablesWriteError
+
+    try:
+        set_job_models({TIER_INTERACTIVE_CHAT: model})
+    except TunablesWriteError as exc:
+        print(f"error: the model setting could not be saved: {exc}", file=sys.stderr)
+        return False
+    print(f"  - chat model for this install: {model_for_tier(TIER_INTERACTIVE_CHAT)} (shared by every persona)")
+    return True
+
+
+def _model_tier_arg(value: str) -> str:
+    """argparse type for a job name: the job's name with dashes or underscores (``background-generative``)."""
+    from brain.bridge.model_tier import CLAUDE_TIERS
+
+    name = value.replace("_", "-")
+    if name not in CLAUDE_TIERS:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a job: choose one of {', '.join(CLAUDE_TIERS)}")
+    return name
+
+
+def _model_show_handler(args: argparse.Namespace) -> int:
+    """Read-only: the model each job is configured with, whether that is the shipped default or the user's setting."""
+    from brain.bridge.model_tier import (
+        CLAUDE_TIERS,
+        configured_job_models,
+        model_for_tier,
+        shipped_default,
+        unusable_setting_text,
+    )
+
+    configured = configured_job_models()
+    print("models by job (job: model, shipped default or your setting); one setting for every persona on this install:")
+    for tier in CLAUDE_TIERS:
+        default = shipped_default(tier)
+        source = "your setting" if configured[tier] != default else "shipped default"
+        line = f"  {tier}: {configured[tier]} ({source})"
+        running = model_for_tier(tier)
+        if running != configured[tier]:
+            line += f"; running {running} now, because Claude rejected {configured[tier]}"
+        print(line)
+        invalid = unusable_setting_text(tier)
+        if invalid is not None:
+            print(
+                f"warning: the setting {invalid!r} for {tier} in tunables.toml is not a usable model, so "
+                f"{default} is used instead"
+            )
+    print("this shows the saved settings; runtime fallbacks appear in the app (connection panel)")
+    from brain.model_migration import pending_legacy
+    from brain.paths import get_home
+    from brain.tunables_migration import LEGACY_FILE_NAME
+
+    if (get_home() / LEGACY_FILE_NAME).exists():
+        print(
+            f"note: an old {LEGACY_FILE_NAME} is still in the data folder; it is folded into tunables.toml the next time a "
+            "bridge starts or `nell model set`, `set-tier`, `clear-tier` or `init` runs"
+        )
+    if pending_legacy():
+        print(
+            "note: a persona still holds a model from before this setting was shared; it is moved into the "
+            "shared setting (where the setting still equals the shipped default) the next time `nell model set`, "
+            "`set-tier`, `clear-tier` or `init` runs, or that persona's bridge starts"
+        )
+    return 0
+
+
+def _run_model_migration() -> None:
+    """Bring older settings forward before a write command changes anything (each step is a no-op once done): the old
+    JSON settings file, if there is one, is folded into tunables.toml (all-or-nothing from here: this command registers only the keys it
+    imported, so the bridge finishes a fold this command cannot), then a persona's saved model moves into the
+    install-wide setting."""
+    from brain.model_migration import migrate_persona_models
+    from brain.paths import get_home
+    from brain.tunables_migration import migrate_legacy_json
+
+    migrate_legacy_json(get_home(), complete_registry=False)
+    migrate_persona_models(get_home(), None)
+
+
+def _model_write(updates: dict[str, str | None]) -> dict[str, str] | None:
+    """Run the migrations, then ``set_job_models``. The ids written (empty when nothing changed), or None (after
+    printing why, exit non-zero) when the file cannot be changed."""
+    from brain.bridge.model_tier import set_job_models
+    from brain.tunables import TunablesWriteError
+
+    _run_model_migration()
+    try:
+        return set_job_models(updates)
+    except TunablesWriteError as exc:
+        from brain import tunables
+
+        print(f"error: the model setting could not be saved: {exc} (file: {tunables._file_path()})", file=sys.stderr)
+        return None
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return None
+
+
+def _model_set_tier_handler(args: argparse.Namespace) -> int:
+    """Syntax-only: no Claude CLI call. A model Claude rejects shows up in the bridge log and in the app."""
+    from brain.bridge.model_tier import (
+        MODEL_ID_RULE,
+        is_valid_model,
+        model_for_tier,
+        shipped_default,
+    )
+
+    if not is_valid_model(args.model):
+        print(f"error: {args.model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
+        return 1
+    written = _model_write({args.tier: args.model})
+    if written is None:
+        return 1
+    running = model_for_tier(args.tier)
+    is_default = running == shipped_default(args.tier)
+    if args.tier in written:
+        print(f"{args.tier} now uses {running} ({'the shipped default' if is_default else 'checked when first used'})")
+    else:
+        print(f"{args.tier} already uses {running}" + (", which is already the default" if is_default else ""))
+    return 0
+
+
+def _model_set_handler(args: argparse.Namespace) -> int:
+    """`nell model set <model>`: set the chat model with the picker's rules and the picker's save-time check.
+
+    A word (sonnet, opus, haiku) or a full ``claude-`` id (64 cap). The setting is install-wide: it is written to
+    the settings file directly (no bridge round trip: every bridge reads the file on every call), after the same
+    one-call check the picker runs on a newly chosen id (``brain.bridge.server._apply_chat_model`` is the one
+    implementation of both).
+    """
+    import asyncio
+
+    from brain.bridge import server as server_mod
+    from brain.bridge.model_tier import (
+        MODEL_ID_RULE,
+        TIER_INTERACTIVE_CHAT,
+        is_valid_model,
+        setting_would_change,
+    )
+
+    if not is_valid_model(args.model):
+        print(f"error: {args.model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
+        return 1
+    _run_model_migration()
+    # Judged on what the settings file holds, not on the model that runs now: a file holding a rejected or unusable id runs
+    # the shipped default, and picking that default is still a change.
+    unchanged = not setting_would_change(TIER_INTERACTIVE_CHAT, args.model)
+    status, body = asyncio.run(server_mod._apply_chat_model(args.model, check=True, lock=asyncio.Lock()))
+    return _model_set_report(args.model, status, body, unchanged=unchanged)
+
+
+def _model_set_report(model: str, status: int, body: dict, *, unchanged: bool = False) -> int:
+    from brain.bridge.model_tier import MODEL_ID_RULE, TIER_INTERACTIVE_CHAT, shipped_default
+
+    if status != 200:
+        if status == 400 and body.get("error") == "model_unavailable":
+            print(
+                f'error: Claude rejected the model "{model}". It may not exist, or your account may not have '
+                "access to it. Nothing was changed.",
+                file=sys.stderr,
+            )
+        elif status == 400 and body.get("error") == "unknown_model":
+            print(f"error: {model!r} is not a valid model: {MODEL_ID_RULE}", file=sys.stderr)
+        else:
+            from brain import tunables
+
+            detail = body.get("detail", body.get("error", body))
+            print(f"error: the model setting could not be saved: {detail} (file: {tunables._file_path()})", file=sys.stderr)
+        return 1
+    effective = body.get("model")
+    if body.get("checked") is False:
+        print(
+            f"chat model is now {effective}. Couldn't check it right now, so it was saved unchecked; "
+            "any problem will show in the app and the bridge log."
+        )
+    elif body.get("checked") is True:
+        print(f"chat model is now {effective} (checked with Claude).")
+    elif unchanged and effective == shipped_default(TIER_INTERACTIVE_CHAT):
+        print(f"chat model is already the default ({effective}).")
+    elif unchanged:
+        print(f"chat model is already {effective}.")
+    else:
+        print(f"chat model is now {effective}.")
+    print("this is the setting for every persona on this install; running bridges use it from their next call.")
+    return 0
+
+
+def _model_clear_tier_handler(args: argparse.Namespace) -> int:
+    from brain.bridge.model_tier import model_for_tier
+
+    if _model_write({args.tier: None}) is None:
+        return 1
+    print(f"{args.tier} uses its shipped default again ({model_for_tier(args.tier)})")
     return 0
 
 
@@ -2513,10 +3051,11 @@ def _build_parser() -> argparse.ArgumentParser:
     init_sub.add_argument(
         "--model",
         default=None,
-        choices=["haiku", "opus", "sonnet"],
+        type=_model_arg,
         help=(
-            "Claude model to use (sonnet/opus/haiku). Default: sonnet. "
-            "Prompts if omitted and running interactively."
+            "Claude model for the chat (a setting shared by every persona on this install): sonnet, opus, haiku "
+            "or a full model id that starts with claude-. A full id is not checked now; it is checked when first "
+            "used. Omitted or blank keeps the current setting. Prompts if omitted and running interactively."
         ),
     )
     init_sub.add_argument(
@@ -2580,6 +3119,47 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Persona name. If omitted and exactly one is installed, that one is used.",
     )
     memory_show.set_defaults(func=_memory_show_handler)
+
+    # nell memory backfill-extraction — #523: re-extract conversation text the old extraction cut never
+    # showed the extractor. See _memory_backfill_extraction_handler's docstring.
+    memory_backfill = memory_actions.add_parser(
+        "backfill-extraction",
+        help=(
+            "Re-extract conversation text that older versions never extracted (the starts of long stretches; "
+            "--all for everything). Runs one chunk at a time during lulls; resumable; --dry-run to see the size first; "
+            "prints the number of model calls and starts only with --yes."
+        ),
+    )
+    memory_backfill.add_argument(
+        "--persona",
+        default=None,
+        help="Persona name. If omitted and exactly one is installed, that one is used.",
+    )
+    memory_backfill.add_argument(
+        "--all",
+        action="store_true",
+        help="Re-extract everything archived, not only the lost starts (more calls; no soul candidates).",
+    )
+    memory_backfill.add_argument(
+        "--restart",
+        action="store_true",
+        help="Discard the existing plan and plan afresh (the cutoff is recomputed; done targets are extracted again).",
+    )
+    memory_backfill.add_argument(
+        "--yes",
+        action="store_true",
+        help="Confirm the model calls the plan will make; without it the command prints the count and does not start.",
+    )
+    backfill_action = memory_backfill.add_mutually_exclusive_group()
+    backfill_action.add_argument(
+        "--dry-run", action="store_true", help="Print what each mode would extract; write nothing, call no model."
+    )
+    backfill_action.add_argument(
+        "--background", action="store_true", help="Arm the plan for the bridge, which runs it during lulls, and return."
+    )
+    backfill_action.add_argument("--status", action="store_true", help="Print the plan's state and counters.")
+    backfill_action.add_argument("--stop", action="store_true", help="Stop the plan; progress is kept.")
+    memory_backfill.set_defaults(func=_memory_backfill_extraction_handler)
 
     # nell embed backfill — F1 #259 increment 6: the manual one-go backfill
     # CLI (spec §5b / S12), the operator escape hatch for the idle-gated
@@ -2785,7 +3365,6 @@ def _build_parser() -> argparse.ArgumentParser:
         cmd_restart,
         cmd_run,
         cmd_start,
-        cmd_status,
         cmd_stop,
         cmd_tail,
         cmd_tail_log,
@@ -2837,12 +3416,48 @@ def _build_parser() -> argparse.ArgumentParser:
     s_stop = s_actions.add_parser("stop", help="Stop the bridge daemon.")
     _add_persona_arg(s_stop)
     s_stop.add_argument("--timeout", type=float, default=180.0)
-    s_stop.add_argument("--force", action="store_true", help="force-terminate a wedged bridge (Windows last resort; skips cleanup, recovery snapshots on next start)")
+    s_stop.add_argument("--force", action="store_true", help="end a bridge whose stop request fails (Windows last resort; uses the same kill as --kill)")
+    s_stop.add_argument(
+        "--kill",
+        action="store_true",
+        help="end the bridge and every process it started without waiting for running work (identity-checked; a "
+        "bridge run by an OS service is first asked to hard-exit and given up to --timeout seconds before its service "
+        "manager stops it; the next start picks up anything left unfinished)",
+    )
+    s_stop.add_argument(
+        "--skip-hard-exit-request",
+        action="store_true",
+        help="with --kill: do not ask a service-run bridge for a hard exit first (used after a hard exit was ignored)",
+    )
+    s_stop.add_argument(
+        "--expect-pid",
+        type=int,
+        default=None,
+        help="with --kill: end the bridge only if it is still this pid (with --expect-token); used by the desktop app",
+    )
+    s_stop.add_argument(
+        "--expect-token",
+        default=None,
+        help="with --kill and --expect-pid: the identity token the bridge must still carry",
+    )
     s_stop.set_defaults(func=cmd_stop)
 
     s_status = s_actions.add_parser("status", help="Show bridge daemon status.")
     _add_persona_arg(s_status)
-    s_status.set_defaults(func=cmd_status)
+    s_status.add_argument(
+        "--json",
+        action="store_true",
+        help="print the status as one JSON object from the state files and process checks (no HTTP); "
+        "used by the desktop app",
+    )
+    s_status.set_defaults(func=_supervisor_status_handler)
+
+    s_rebuild = s_actions.add_parser(
+        "rebuild",
+        help="Internal: run the one-shot emotion rebuild for a persona (the start runs it before the bridge).",
+    )
+    _add_persona_arg(s_rebuild)
+    s_rebuild.set_defaults(func=_supervisor_rebuild_handler)
 
     s_restart = s_actions.add_parser(
         "restart",
@@ -2852,7 +3467,7 @@ def _build_parser() -> argparse.ArgumentParser:
     s_restart.add_argument("--idle-shutdown", type=float, default=30)
     s_restart.add_argument("--client-origin", default="cli", choices=client_origin_choices)
     s_restart.add_argument("--timeout", type=float, default=180.0)
-    s_restart.add_argument("--force", action="store_true", help="force-terminate a wedged bridge (Windows last resort; skips cleanup, recovery snapshots on next start)")
+    s_restart.add_argument("--force", action="store_true", help="end a bridge whose stop request fails (Windows last resort; uses the same kill as --kill)")
     s_restart.set_defaults(func=cmd_restart)
 
     s_tail_events = s_actions.add_parser("tail-events", help="Tail /events as JSON lines.")
@@ -2861,7 +3476,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     s_tail_log = s_actions.add_parser(
         "tail-log",
-        help="Tail the bridge log file (cross-platform).",
+        help="Tail the bridge's runtime log, runtime-<persona>.log (cross-platform).",
     )
     _add_persona_arg(s_tail_log)
     s_tail_log.add_argument(
@@ -2952,6 +3567,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--keep-plist",
         action="store_true",
         help="Boot out the service but leave the plist file in place.",
+    )
+    svc_uninstall.add_argument(
+        "--timeout",
+        type=float,
+        default=180.0,
+        help="how long to wait for a running bridge to stop before giving up (no terminal) or escalating",
     )
     svc_uninstall.set_defaults(func=_service_uninstall_handler)
 
@@ -3225,9 +3846,9 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help=(
-            "On exit, finalise the session and delete its conversation buffer. "
+            "On exit, finalise the session, archive its conversation buffer and delete it. "
             "Default is a non-destructive snapshot that preserves the buffer "
-            "for compaction / archive / rollover (same as the GUI)."
+            "for compaction / rollover (same as the GUI)."
         ),
     )
     chat_sub.add_argument(
@@ -3330,6 +3951,37 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output as JSON array.",
     )
     personas_sub.set_defaults(func=_personas_handler)
+
+    # nell model: which model each job runs (one install-wide setting per job, in tunables.toml)
+    model_sub = subparsers.add_parser(
+        "model",
+        help="Show or set the model each job runs (one setting for every persona on this install).",
+    )
+    model_actions = model_sub.add_subparsers(dest="model_action", required=True)
+
+    m_show = model_actions.add_parser("show", help="Show the model each job is configured with.")
+    m_show.set_defaults(func=_model_show_handler)
+
+    m_set = model_actions.add_parser(
+        "set-tier",
+        help="Set one job's model (sonnet, opus, haiku or a full id that starts with claude-).",
+    )
+    m_set.add_argument("tier", type=_model_tier_arg, help="The job, for example background-generative.")
+    m_set.add_argument("model")
+    m_set.set_defaults(func=_model_set_tier_handler)
+
+    m_chat = model_actions.add_parser(
+        "set",
+        help="Set the chat model (sonnet, opus, haiku or a full id that starts with claude-), checked like the picker does.",
+    )
+    m_chat.add_argument("model")
+    m_chat.set_defaults(func=_model_set_handler)
+
+    m_clear = model_actions.add_parser(
+        "clear-tier", help="Put a job back on its shipped default model."
+    )
+    m_clear.add_argument("tier", type=_model_tier_arg, help="The job, for example interactive-chat.")
+    m_clear.set_defaults(func=_model_clear_tier_handler)
 
     # nell kindled — Kindled-link identity management (Task 7)
     kindled_sub = subparsers.add_parser(

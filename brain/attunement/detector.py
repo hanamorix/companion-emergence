@@ -8,20 +8,22 @@ project gotchas list). No ANTHROPIC_API_KEY references here.
 """
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
 
+from brain import dev_constants
 from brain.attunement.prompts import build_detector_system_prompt
 from brain.attunement.schemas import (
-    SCHEMA_VERSION,
     CurrentRead,
     DetectorOutput,
     Evidence,
     PatternCandidate,
 )
 from brain.attunement.store import BufferTurn
+from brain.health.json_io import append_jsonl
+from brain.health.parse_failures import record_parse_failure
+from brain.utils.llm_output import loads_json_object_ex
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +47,7 @@ def _decline_output(source_turn_id: str) -> DetectorOutput:
         mood_valence=0.0,
         mood_intensity=0.0,
         predicted_arc_shape="",
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
     return DetectorOutput(current_read=read, pattern_candidates=[])
 
@@ -87,53 +89,55 @@ def _call_haiku(
 
     Returns empty string on any failure so callers can decline cleanly.
     """
-    from brain.bridge.model_tier import TIER_ATTUNEMENT_DETECTOR, model_for_tier
+    from brain.bridge.model_tier import TIER_ATTUNEMENT_DETECTOR
     from brain.bridge.provider import ClaudeCliProvider
 
     provider = ClaudeCliProvider(
-        model=model_for_tier(TIER_ATTUNEMENT_DETECTOR),
+        TIER_ATTUNEMENT_DETECTOR,
         timeout_seconds=_DETECTOR_TIMEOUT_SECONDS,
     )
+    from brain.bridge.cli_throttle import ThrottleDeferred
+
     pd: Path | None = Path(persona_dir) if isinstance(persona_dir, str) else persona_dir
     try:
         return provider.generate(user_message, system=system_prompt, persona_dir=pd)
+    except ThrottleDeferred:
+        # #456/#473: a refusal is "not now", not a failed call: no haiku_call_failed row, no decline output.
+        raise
     except Exception as exc:  # noqa: BLE001
         log.warning("attunement detector: claude CLI call failed: %s", exc)
         if pd is not None:
             try:
                 import traceback as _tb
 
-                pd.mkdir(parents=True, exist_ok=True)
                 entry = {
                     "ts": _now_iso(),
                     "error": str(exc),
                     "kind": "haiku_call_failed",
                     "traceback": _tb.format_exc(),
                 }
-                with (pd / "attunement_errors.jsonl").open("a") as _f:
-                    _f.write(json.dumps(entry) + "\n")
+                append_jsonl(pd / "attunement_errors.jsonl", entry, on_error="log", nonfinite="null")
             except Exception:  # noqa: BLE001
                 pass  # best-effort — never mask the graceful decline
         return ""
 
 
-def _parse_output(raw: str, source_turn_id: str) -> DetectorOutput:
-    """Parse Haiku's JSON output into DetectorOutput. Drops invalid candidates."""
-    # Strip optional markdown code fence — ClaudeCliProvider returns raw text
-    # but some models wrap output in ```json ... ```
-    stripped = raw.strip()
-    if stripped.startswith("```"):
-        first_newline = stripped.find("\n")
-        if first_newline != -1:
-            stripped = stripped[first_newline + 1:]
-        if stripped.endswith("```"):
-            stripped = stripped[: -len("```")]
-        stripped = stripped.strip()
+_DETECTOR_KEYS = frozenset({"current_read", "pattern_candidates", "addressed_pattern_ids"})
 
+
+def _parse_output(raw: str, source_turn_id: str, persona_dir: Path | None = None) -> DetectorOutput:
+    """Parse Haiku's JSON output into DetectorOutput. Drops invalid candidates.
+    A reply that can't be read is kept in the parse-failure log (#364)."""
+    # One tolerance rule for every reply that should be one JSON object (#479): the whole reply, a fenced block, or an object with
+    # prose before/after it (ClaudeCliProvider returns raw text, but some models wrap or chatter).
     try:
-        payload: dict[str, Any] = json.loads(stripped)
-    except json.JSONDecodeError:
-        log.info("attunement detector: malformed JSON from Haiku")
+        payload: dict[str, Any]
+        payload, in_prose = loads_json_object_ex(raw)
+        if in_prose and payload and not (set(payload) & _DETECTOR_KEYS):
+            # An object found in a sentence is only the answer if it looks like one; an empty object is a valid empty answer.
+            raise ValueError("an object in the reply has none of the detector's keys")
+    except ValueError as exc:  # JSONDecodeError is a ValueError
+        record_parse_failure(persona_dir, site="attunement", raw=raw, error=f"non-JSON: {exc}")
         return _decline_output(source_turn_id)
 
     try:
@@ -148,10 +152,10 @@ def _parse_output(raw: str, source_turn_id: str) -> DetectorOutput:
             mood_valence=float(cr.get("mood_valence", 0.0)),
             mood_intensity=float(cr.get("mood_intensity", 0.0)),
             predicted_arc_shape=str(cr.get("predicted_arc_shape", "")),
-            schema_version=SCHEMA_VERSION,
+            schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
         )
-    except (TypeError, ValueError) as exc:
-        log.info("attunement detector: invalid current_read shape: %s", exc)
+    except (AttributeError, TypeError, ValueError) as exc:
+        record_parse_failure(persona_dir, site="attunement", raw=raw, error=f"current_read shape: {exc}")
         return _decline_output(source_turn_id)
 
     candidates: list[PatternCandidate] = []
@@ -251,4 +255,4 @@ def run_detector(
     if not raw:
         return _decline_output(source_turn_id)
 
-    return _parse_output(raw, source_turn_id)
+    return _parse_output(raw, source_turn_id, persona_dir)

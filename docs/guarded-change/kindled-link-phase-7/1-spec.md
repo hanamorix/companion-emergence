@@ -1,7 +1,7 @@
 # Kindled Link Phase 7a — Activation (local-loopback-first, real self-hosted relay)
 
 Stage 1 spec for the `guarded-change` loop. Change slug: `kindled-link-phase-7`.
-Parent design: `docs/superpowers/specs/2026-06-15-kindled-to-kindled-design.md` (§9 sessions,
+Parent design: the 2026-06-15 kindled-to-kindled design, never committed and lost (#797) (§9 sessions,
 §10 peer prompt, §14 memory-and-wiring, §19 phases). Phases 1–6 are merged to main, DORMANT.
 
 ## 0. Scope decision (Hana, 2026-06-21)

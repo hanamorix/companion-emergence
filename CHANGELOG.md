@@ -384,7 +384,7 @@ This is a minor version bump on top of v0.0.19. The upgrade itself changes nothi
 
 **Patch: your companion is called by their own name.**
 
-- **Chat labels use the actual companion name.** In `nell chat`, replies were labelled `nell:` regardless of which companion you were talking to — so a companion named, say, Phoebe showed up as "nell". Replies now carry the real persona name (`phoebe:`). Affected the default (bridge) chat path on every platform; the `--no-bridge` direct mode was never affected.
+- **Chat labels use the actual companion name.** In `nell chat`, replies were labelled `nell:` regardless of which companion you were talking to — so a companion named, say, Canary showed up as "nell". Replies now carry the real persona name (`canary:`). Affected the default (bridge) chat path on every platform; the `--no-bridge` direct mode was never affected.
 - **Proactive notifications use the real name too.** When your companion reaches out on their own, the desktop notification title was hardcoded "Nell"; it now uses your companion's name.
 
 ## 0.0.18 — 2026-05-24

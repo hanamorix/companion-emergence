@@ -17,12 +17,21 @@ deletes the old buffer + cursor, writes the ``rolled_to`` successor pointer
 (under the compaction lock, BEFORE the delete, so the old sid never resolves to
 nothing), and evicts the in-memory registry entry. The finalize tick no longer
 deletes buffers (see brain/ingest/pipeline.finalize_stale_sessions).
+
+Every raw turn of the old buffer is carried into the seed or archived: the
+cascade archives only extracted turns older than 24h, the 1c-B seed carries only
+the last 40, so the rollover archives, durably and before it creates the
+successor, the raw turns it does not carry (#556), and then drops those rows
+from the old buffer so no turn is in both. The old buffer's append lock
+(``session_append_lock``) is held from the final read to the unlink, so a row
+appended in between cannot be deleted unseen.
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -31,10 +40,12 @@ from brain.chat.compaction import (
     build_compaction_provider,
     cascade_conversation,
     compact_conversation,
+    summary_gen,
 )
 from brain.chat.session import create_session, registry_lock, remove_session
 from brain.ingest.buffer import (
     acquire_compaction_lock,
+    archive_once,
     delete_backoff,
     delete_cursor,
     delete_session_buffer,
@@ -42,6 +53,7 @@ from brain.ingest.buffer import (
     read_session,
     release_compaction_lock,
     rewrite_session_atomic,
+    session_append_lock,
     write_cursor,
     write_rolled_to,
 )
@@ -63,6 +75,108 @@ def _split_summary_and_raw(turns: list[dict]) -> tuple[dict | None, list[dict]]:
     return summary, raw
 
 
+def _extraction_allows_rollover(
+    persona_dir: Path,
+    old_sid: str,
+    *,
+    store,
+    hebbian,
+    provider,
+    config: dict | None,
+) -> bool:
+    """Run the final extraction of the old buffer; True only when the rollover may go on to fold and DELETE it (#477, #473, #523).
+
+    The extraction runs to the end of the buffer, chunk by chunk (no rollover bounds it). It may go on when that extraction
+    completed (the cursor reached the buffer's end), or when the session's extraction has failed persistently: the failing chunk
+    is set aside in ``poison/`` (kept, never lost), and the extraction then runs once more over the chunks after it, which were
+    never tried; the rollover goes on only if that pass completes. It may not, and the buffer stays for the next cycle, when:
+    * another pass is running (busy) or the model call was refused as "not now" (deferred; also when it is RAISED): neither is a
+      failure and neither is ever counted. A refusal because the bridge is stopping (``ShutdownDeferred``, #456) is
+      re-raised instead, so the caller's job ends with its cadence unchanged;
+    * the pass returned inside the backoff window without calling the provider (``backoff_skipped``): no attempt was made, so
+      nothing is counted and nothing is set aside;
+    * the extraction failed (a failed pass, or an ordinary exception out of it, which is recorded as a failure like a failed pass)
+      and the session is still below the 3-failure threshold the stale sweep uses;
+    * it is at the threshold but the failing chunk could not be set aside, or another pass holds the extraction lock;
+    * the extraction after the set-aside did not complete (deferred, failed again, busy, or raised): the remaining chunks are
+      extractable and stay in the buffer for the next cycle.
+    """
+    from brain.bridge.cli_throttle import ShutdownDeferred, ThrottleDeferred
+    from brain.ingest.pipeline import (
+        extract_session_snapshot,
+        extraction_failures_exhausted,
+        poison_unextracted_span,
+        record_extraction_failure,
+    )
+
+    try:
+        report = extract_session_snapshot(
+            persona_dir, old_sid, store=store, hebbian=hebbian, provider=provider, config=config
+        )
+    except ShutdownDeferred:
+        # #456 (C38 d): the bridge is stopping: the refusal ends the caller's job (the compaction tick re-raises it, so
+        # its cadence is not advanced); the old buffer is kept.
+        raise
+    except ThrottleDeferred:
+        logger.info("rollover: extraction deferred session=%s; keeping the old buffer", old_sid)
+        return False
+    except Exception:
+        # An ordinary exception out of the extraction (a locked store, a malformed turn) counts like a failed pass, so a
+        # persistent one reaches the same threshold instead of holding the buffer forever.
+        logger.exception("rollover: extraction raised session=%s; counted as a failure, keeping the old buffer", old_sid)
+        try:
+            record_extraction_failure(persona_dir, old_sid)
+        except Exception:
+            logger.exception("rollover: could not record the failure session=%s", old_sid)
+            return False
+    else:
+        if report.completed:
+            return True
+        if report.busy or report.deferred or report.backoff_skipped:
+            logger.info(
+                "rollover: extraction did not run to the end session=%s busy=%s deferred=%s backoff_skipped=%s; keeping the old buffer",
+                old_sid, report.busy, report.deferred, report.backoff_skipped,
+            )
+            return False
+        # a real attempt that failed: its failure is already recorded in the sidecar by the pass
+    if not extraction_failures_exhausted(persona_dir, old_sid):
+        logger.info("rollover: extraction failed session=%s below the poison threshold; keeping the old buffer", old_sid)
+        return False
+    try:
+        set_aside = poison_unextracted_span(persona_dir, old_sid)
+    except Exception:
+        logger.exception("rollover: could not set the failing chunk aside session=%s; keeping the old buffer", old_sid)
+        return False
+    if set_aside is None:
+        logger.info("rollover: another extraction holds the session session=%s; keeping the old buffer", old_sid)
+        return False
+    # #523: only the failing chunk was set aside; the chunks after it were never tried. Extract them before the fold and
+    # the delete, and go on only if that pass reaches the end.
+    try:
+        again = extract_session_snapshot(
+            persona_dir, old_sid, store=store, hebbian=hebbian, provider=provider, config=config
+        )
+    except ShutdownDeferred:
+        raise
+    except ThrottleDeferred:
+        logger.info("rollover: extraction after the set-aside deferred session=%s; keeping the old buffer", old_sid)
+        return False
+    except Exception:
+        logger.exception("rollover: extraction after the set-aside raised session=%s; counted as a failure, keeping the old buffer", old_sid)
+        try:
+            record_extraction_failure(persona_dir, old_sid)
+        except Exception:
+            logger.exception("rollover: could not record the failure session=%s", old_sid)
+        return False
+    if again.completed:
+        return True
+    logger.info(
+        "rollover: extraction after the set-aside did not reach the end session=%s busy=%s deferred=%s errors=%d; keeping the old buffer",
+        old_sid, again.busy, again.deferred, again.errors,
+    )
+    return False
+
+
 def perform_rollover(
     persona_dir: Path,
     old_sid: str,
@@ -79,26 +193,32 @@ def perform_rollover(
     None if there is nothing to seed / the session is busy.
 
     ``seed_mode`` is ``"summary_only"`` (1c-A) or ``"tiers_plus_tail"`` (1c-B).
-    Memory extraction of the old buffer runs first (best-effort) when ``store`` +
-    ``hebbian`` are supplied — the seed is the immediate recap, memory is long-term
-    recall.
+    Memory extraction of the old buffer runs first when ``store`` + ``hebbian`` are supplied: every
+    chunk after the cursor, to the end (#523; a long unextracted buffer makes one model call per
+    chunk), and the rollover goes on only if it completed (a busy, deferred or failed extraction
+    returns None with the buffer kept and the cursor after the last committed chunk). The seed is
+    the immediate recap, memory is long-term recall.
+
+    The raw turns the seed does not carry (in ``tiers_plus_tail``, those before the last 40 that the cascade
+    has not archived) are archived, fsynced, before the successor, the pointer or the delete exist. An archive
+    failure raises before any of those: the old buffer, its cursor and the session list stay as they were. Once
+    the archive is durable the archived rows are dropped from the old buffer, so a failure at any later step
+    leaves no turn in both files and a retry (whatever changed meanwhile) archives nothing twice; until a rollover
+    succeeds the still-live old session shows only its summary and the carried tail. The repeats left: a crash or
+    an error between the archive append and its commit marker, or between the marker and that buffer rewrite, may
+    archive the batch again on a later run (an immediate retry is skipped by the marker); a turn is never missing.
+    The old buffer's append lock is held from the final read to the unlink.
     """
     now = now or datetime.now(UTC)
     persona_dir = Path(persona_dir)
 
-    # 1. Final memory extraction of the old buffer (best-effort). Advances the
+    # 1. Final memory extraction of the old buffer. Advances the
     #    cursor so the carried tail's extraction state is current (C18).
     if store is not None and hebbian is not None and provider is not None:
-        try:
-            from brain.ingest.pipeline import extract_session_snapshot
-
-            extract_session_snapshot(
-                persona_dir, old_sid,
-                store=store, hebbian=hebbian, provider=provider,
-                config=config,
-            )
-        except Exception:
-            logger.exception("rollover: extraction failed session=%s (continuing)", old_sid)
+        if not _extraction_allows_rollover(
+            persona_dir, old_sid, store=store, hebbian=hebbian, provider=provider, config=config
+        ):
+            return None
 
     # 2. Fold the old conversation into its post-compaction form. NOTE: this runs
     #    AFTER step-1 extraction advanced the cursor, so it is NOT redundant with
@@ -142,68 +262,95 @@ def perform_rollover(
         # Re-read the committed row under the lock (interposition-safe; apply_budget
         # may have touched the 24h tier between fold and here — and a persist that
         # slipped in before us is now visible and captured).
-        with registry_lock():
-            turns = read_session(persona_dir, old_sid)
-            summary_row, raw = _split_summary_and_raw(turns)
-            if seed_mode == "summary_only":
-                if summary_row is None:
-                    # No summary produced (the fold folded nothing / the content is
-                    # not foldable) → nothing to seed. Abort below and leave the old
-                    # buffer INTACT — a stale session that can't be summarised is not
-                    # attach-eligible, and any turn sitting in the buffer stays there
-                    # (not lost). Preserves the pre-existing "skip stale" behaviour.
-                    seed_rows: list[dict] = []
+        with ExitStack() as buffer_guard:
+            with registry_lock():
+                # The old buffer's append lock is taken inside the registry lock (the order a live persist
+                # uses: registry lock, then the append lock) and held past the registry lock's exit, to the
+                # unlink below: a row an appender that does not go through the registry adds between this
+                # read and the unlink waits instead of being deleted unseen.
+                buffer_guard.enter_context(session_append_lock(persona_dir, old_sid))
+                turns = read_session(persona_dir, old_sid)
+                summary_row, raw = _split_summary_and_raw(turns)
+                not_carried: list[dict] = []  # raw turns the seed leaves out; archived below
+                if seed_mode == "summary_only":
+                    if summary_row is None:
+                        # No summary produced (the fold folded nothing / the content is
+                        # not foldable) → nothing to seed. Abort below and leave the old
+                        # buffer INTACT — a stale session that can't be summarised is not
+                        # attach-eligible, and any turn sitting in the buffer stays there
+                        # (not lost). Preserves the pre-existing "skip stale" behaviour.
+                        seed_rows: list[dict] = []
+                    else:
+                        # A summary EXISTS, so the rollover WILL proceed and delete the old
+                        # buffer. Carry the summary PLUS any raw turns still present after
+                        # the fold: the fold (min_keep_tail=0, older_than=0) normally
+                        # empties raw, so this is usually just [summary]; but a live turn
+                        # that raced in after the fold (before this seed re-read under the
+                        # lock) — or a turn the cursor-guarded fold left unfolded — is a
+                        # genuinely FRESH turn. Dropping it while deleting the old buffer
+                        # would lose it permanently (never folded, never archived) (r4).
+                        seed_rows = [summary_row] + raw
                 else:
-                    # A summary EXISTS, so the rollover WILL proceed and delete the old
-                    # buffer. Carry the summary PLUS any raw turns still present after
-                    # the fold: the fold (min_keep_tail=0, older_than=0) normally
-                    # empties raw, so this is usually just [summary]; but a live turn
-                    # that raced in after the fold (before this seed re-read under the
-                    # lock) — or a turn the cursor-guarded fold left unfolded — is a
-                    # genuinely FRESH turn. Dropping it while deleting the old buffer
-                    # would lose it permanently (never folded, never archived) (r4).
-                    seed_rows = [summary_row] + raw
-            else:
-                tail = raw[-_ROLLOVER_TAIL:]
-                seed_rows = ([summary_row] if summary_row else []) + tail
-            if not seed_rows:
-                # Nothing to seed → abort (nothing lost; old buffer stays).
-                return None
+                    tail = raw[-_ROLLOVER_TAIL:]
+                    seed_rows = ([summary_row] if summary_row else []) + tail
+                    # The raw turns before the tail that the cascade did not archive (it archives only
+                    # extracted turns older than 24h) are in neither the seed nor the archive, and the
+                    # delete below would be their end (#556).
+                    not_carried = raw[:-_ROLLOVER_TAIL]
+                if not seed_rows:
+                    # Nothing to seed → abort (nothing lost; old buffer stays).
+                    return None
 
-            old_cursor = read_cursor(persona_dir, old_sid)
+                # Archive what the seed does not carry BEFORE the old buffer, the successor or the pointer change:
+                # the archive write is fsynced (and de-duplicated across an immediate retry by its commit marker),
+                # so a failure here raises with the old buffer, its cursor and the session list untouched, and a
+                # crash after it leaves every turn in the buffer or the archive.
+                if not_carried:
+                    written = archive_once(persona_dir, old_sid, not_carried, new_gen=summary_gen(summary_row))
+                    if written <= 0:
+                        raise OSError("archive append wrote zero bytes")
+                    # Only now that the batch is durable, drop it from the old buffer (the append lock is held, so
+                    # `turns` is the whole buffer): a later step that raises leaves no row in both the buffer and the
+                    # archive, so a retry, or the daily tick's cascade on this still-live session, cannot archive it
+                    # again whatever changed in between.
+                    archived = {id(t) for t in not_carried}
+                    rewrite_session_atomic(persona_dir, old_sid, [t for t in turns if id(t) not in archived])
 
-            new_sess = create_session(persona_name)
-            new_sid = new_sess.session_id
-            # Re-stamp the seed rows' session_id to the new session so downstream
-            # readers see a consistent id.
-            reseeded = [{**r, "session_id": new_sid} for r in seed_rows]
-            rewrite_session_atomic(persona_dir, new_sid, reseeded)
-            # Carry the old session's extraction cursor so already-extracted carried
-            # tail messages are NOT re-extracted while unextracted ones still are (C18).
-            if old_cursor:
-                write_cursor(persona_dir, new_sid, old_cursor)
+                old_cursor = read_cursor(persona_dir, old_sid)
 
-            # Successor pointer goes down FIRST — under the lock — so from this
-            # instant any resolve OR persist of old_sid redirects to the successor
-            # (C-1 resolve-side redirect + the persist-side redirect above). Then
-            # evict the stale registry entry. get_or_hydrate_session consults the
-            # pointer before the registry regardless; evict-before-delete just clears
-            # the stale entry promptly as belt-and-braces.
-            write_rolled_to(persona_dir, old_sid, new_sid)
-            remove_session(old_sid)  # registry evict (no file delete — handled next)
+                new_sess = create_session(persona_name)
+                new_sid = new_sess.session_id
+                # Re-stamp the seed rows' session_id to the new session so downstream
+                # readers see a consistent id.
+                reseeded = [{**r, "session_id": new_sid} for r in seed_rows]
+                rewrite_session_atomic(persona_dir, new_sid, reseeded)
+                # Carry the old session's extraction cursor so already-extracted carried
+                # tail messages are NOT re-extracted while unextracted ones still are (C18).
+                if old_cursor:
+                    write_cursor(persona_dir, new_sid, old_cursor)
 
-        # Reap the old buffer/cursor/backoff OUTSIDE the registry lock: the pointer
-        # is durably in place, so every resolve/persist of old_sid already redirects
-        # to the successor and nothing can append to the old buffer anymore — the
-        # delete only reclaims the now-orphaned file. Keeping the (possibly
-        # retry-looping) unlink out of the lock avoids stalling registry ops on
-        # other sessions.
-        delete_session_buffer(persona_dir, old_sid)
-        delete_cursor(persona_dir, old_sid)
-        delete_backoff(persona_dir, old_sid)
+                # Successor pointer goes down FIRST — under the lock — so from this
+                # instant any resolve OR persist of old_sid redirects to the successor
+                # (C-1 resolve-side redirect + the persist-side redirect above). Then
+                # evict the stale registry entry. get_or_hydrate_session consults the
+                # pointer before the registry regardless; evict-before-delete just clears
+                # the stale entry promptly as belt-and-braces.
+                write_rolled_to(persona_dir, old_sid, new_sid)
+                remove_session(old_sid)  # registry evict (no file delete — handled next)
+
+            # Reap the old buffer/cursor/backoff OUTSIDE the registry lock: the pointer
+            # is durably in place, so every resolve/persist of old_sid already redirects
+            # to the successor, so no live-turn persist reaches the old buffer anymore — the
+            # delete only reclaims the now-orphaned file. Keeping the (possibly
+            # retry-looping) unlink out of the registry lock avoids stalling registry ops on
+            # other sessions; the old buffer's own append lock is still held, so an appender
+            # that bypasses the registry waits for the unlink instead of racing it.
+            delete_session_buffer(persona_dir, old_sid)
+            delete_cursor(persona_dir, old_sid)
+            delete_backoff(persona_dir, old_sid)
         logger.info(
-            "rollover: session=%s → %s mode=%s seeded=%d",
-            old_sid, new_sid, seed_mode, len(reseeded),
+            "rollover: session=%s → %s mode=%s seeded=%d archived=%d",
+            old_sid, new_sid, seed_mode, len(reseeded), len(not_carried),
         )
         return new_sid
     finally:

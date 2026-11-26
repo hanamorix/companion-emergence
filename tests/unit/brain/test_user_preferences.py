@@ -10,11 +10,12 @@ from brain.user_preferences import (
     read_raw_keys,
 )
 
-# ---- Task 9: attempt_heal wiring ----
+# ---- Task 9: json_io HEAL wiring ----
 
 
-def test_user_preferences_load_corrupt_file_quarantines_and_resets(tmp_path: Path) -> None:
-    """Corrupt JSON → defaults returned + quarantine file present."""
+def test_user_preferences_load_corrupt_file_quarantines_and_resets(tmp_path: Path, caplog) -> None:
+    """Corrupt JSON → defaults returned + quarantine file present; the public `load` returns the defaults too and
+    logs the anomaly."""
     path = tmp_path / "user_preferences.json"
     path.write_text("{not json at all", encoding="utf-8")
 
@@ -25,6 +26,14 @@ def test_user_preferences_load_corrupt_file_quarantines_and_resets(tmp_path: Pat
     assert anomaly.kind == "json_parse_error"
     corrupt_files = list(tmp_path.glob("user_preferences.json.corrupt-*"))
     assert len(corrupt_files) == 1
+
+    public = tmp_path / "public" / "user_preferences.json"
+    public.parent.mkdir()
+    public.write_text("{not json", encoding="utf-8")
+    with caplog.at_level("WARNING"):
+        loaded = UserPreferences.load(public)
+    assert loaded.dream_every_hours == DEFAULT_DREAM_EVERY_HOURS
+    assert any("UserPreferences anomaly detected" in r.getMessage() for r in caplog.records)
 
 
 def test_user_preferences_load_corrupt_file_restores_from_bak(tmp_path: Path) -> None:
@@ -53,13 +62,6 @@ def test_load_well_formed_file(tmp_path: Path) -> None:
     assert prefs.dream_every_hours == 12.0
 
 
-def test_load_corrupt_json_returns_defaults(tmp_path: Path) -> None:
-    path = tmp_path / "user_preferences.json"
-    path.write_text("{not json", encoding="utf-8")
-    prefs = UserPreferences.load(path)
-    assert prefs.dream_every_hours == DEFAULT_DREAM_EVERY_HOURS
-
-
 def test_load_non_object_payload_returns_defaults(tmp_path: Path) -> None:
     path = tmp_path / "user_preferences.json"
     path.write_text("[1, 2, 3]", encoding="utf-8")
@@ -84,7 +86,7 @@ def test_save_is_atomic(tmp_path: Path) -> None:
     path = tmp_path / "user_preferences.json"
     UserPreferences(dream_every_hours=12.0).save(path)
     assert path.exists()
-    assert not path.with_suffix(path.suffix + ".new").exists()
+    assert not list(path.parent.glob("*.new"))  # no per-save temp file left behind
 
 
 # ---- read_raw_keys ----

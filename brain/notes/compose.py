@@ -4,8 +4,10 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 from brain import prompt_strings
+from brain.health.parse_failures import record_parse_failure
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +47,14 @@ def parse_note(raw: str) -> Note:
 
 
 def make_note(provider, *, persona_name, user_name, dreams_summary, emotion_summary,
-              last_session_summary) -> Note:
+              last_session_summary, persona_dir: Path | None = None) -> Note:
     """One budgeted note call. Caller holds the throttle slot + budget."""
     prompt = build_note_prompt(persona_name=persona_name, user_name=user_name,
                                dreams_summary=dreams_summary,
                                emotion_summary=emotion_summary, last_session_summary=last_session_summary)
     raw = provider.complete(prompt)  # the real one-shot provider call (LLMProvider.complete)
-    return parse_note(raw)
+    try:
+        return parse_note(raw)
+    except ValueError as exc:
+        record_parse_failure(persona_dir, site="notes", raw=raw, error=str(exc))  # #364
+        raise

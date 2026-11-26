@@ -6,7 +6,7 @@ recall_count alone.
 
 Why this can't false-green: the recall arm's weight in the salience blend
 (``DEFAULT_WEIGHTS["recall"] == 0.20``) is capped BELOW ``FADE_THRESHOLD``
-(0.25, ``brain/forgetting/policy.py``) — even a fully clamped recall_count
+(0.25, ``brain/dev_constants.py``) — even a fully clamped recall_count
 (``recall_count/10``, capped at 1.0) can, at most, contribute 0.20 to
 salience. So a memory with no emotion, no hebbian edges, no soul link and
 stale freshness cannot be held above the fade line by recall_count alone,

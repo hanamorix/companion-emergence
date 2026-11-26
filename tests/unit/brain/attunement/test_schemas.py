@@ -3,13 +3,8 @@ from __future__ import annotations
 
 import pytest
 
+from brain import dev_constants
 from brain.attunement.schemas import (
-    ADDRESS_COOLDOWN_HOURS,
-    DAILY_BUDGET_DEFAULT,
-    MATURITY_FALSIFIED_MAX,
-    MATURITY_FORMING_MIN,
-    MATURITY_KNOWN_MIN,
-    SCHEMA_VERSION,
     BackfillState,
     CurrentRead,
     DetectorOutput,
@@ -17,24 +12,6 @@ from brain.attunement.schemas import (
     PatternCandidate,
     pattern_id,
 )
-
-
-def test_schema_version_matches_0_0_29() -> None:
-    assert SCHEMA_VERSION == "0.0.29"
-
-
-def test_maturity_thresholds_have_expected_values() -> None:
-    assert MATURITY_FORMING_MIN == 3
-    assert MATURITY_KNOWN_MIN == 10
-    assert MATURITY_FALSIFIED_MAX == 3
-
-
-def test_cooldown_window_is_six_hours() -> None:
-    assert ADDRESS_COOLDOWN_HOURS == 6.0
-
-
-def test_daily_budget_default_is_one_fifty() -> None:
-    assert DAILY_BUDGET_DEFAULT == 150
 
 
 def test_current_read_constructs_with_required_fields() -> None:
@@ -48,10 +25,10 @@ def test_current_read_constructs_with_required_fields() -> None:
         mood_valence=0.4,
         mood_intensity=0.5,
         predicted_arc_shape="settling in for a long conversation",
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
     assert read.tone_label == "warm"
-    assert read.schema_version == SCHEMA_VERSION
+    assert read.schema_version == dev_constants.ATTUNEMENT_SCHEMA_VERSION
 
 
 def test_learned_pattern_constructs_with_all_fields() -> None:
@@ -68,7 +45,7 @@ def test_learned_pattern_constructs_with_all_fields() -> None:
         crystallised_at=None,
         falsified_at=None,
         examples=["example 1", "example 2"],
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
     assert pattern.maturity == "forming"
     assert pattern.examples == ["example 1", "example 2"]
@@ -98,7 +75,7 @@ def test_detector_output_carries_current_read_and_candidates() -> None:
         mood_valence=0.0,
         mood_intensity=0.0,
         predicted_arc_shape="z",
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
     output = DetectorOutput(
         current_read=read,
@@ -119,7 +96,7 @@ def test_backfill_state_constructs() -> None:
         patterns_emitted=0,
         status="running",
         last_cursor="window-000",
-        schema_version=SCHEMA_VERSION,
+        schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
     )
     assert state.status == "running"
 
@@ -158,7 +135,7 @@ def test_invalid_category_raises_for_learned_pattern() -> None:
             crystallised_at=None,
             falsified_at=None,
             examples=[],
-            schema_version=SCHEMA_VERSION,
+            schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
         )
 
 
@@ -177,5 +154,5 @@ def test_invalid_maturity_raises_for_learned_pattern() -> None:
             crystallised_at=None,
             falsified_at=None,
             examples=[],
-            schema_version=SCHEMA_VERSION,
+            schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
         )

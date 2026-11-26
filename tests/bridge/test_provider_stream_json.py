@@ -19,6 +19,7 @@ frames are ignored — content_block_delta is the source of incremental text.
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -74,7 +75,7 @@ def _result_line(text: str, **extras) -> str:
 
 
 def test_chat_stream_yields_text_deltas():
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     lines = [
         json.dumps(
             {
@@ -101,7 +102,7 @@ def test_chat_stream_yields_text_deltas():
 
 def test_chat_stream_ignores_thinking_deltas():
     """thinking_delta is internal reasoning, not user-visible output."""
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     lines = [
         json.dumps(
             {
@@ -124,7 +125,7 @@ def test_chat_stream_ignores_thinking_deltas():
 
 
 def test_chat_stream_argv_carries_stream_json_flags():
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     lines = [_result_line("")]
     with patch("brain.bridge.provider.subprocess.Popen") as popen_mock:
         popen_mock.return_value = _fake_popen(lines)
@@ -140,7 +141,7 @@ def test_chat_stream_argv_carries_stream_json_flags():
 
 def test_chat_stream_result_carries_correct_content():
     """chat_stream yields a StreamDone whose content matches the result frame."""
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     lines = [
         _delta_line("ok"),
         _result_line("ok"),
@@ -153,7 +154,7 @@ def test_chat_stream_result_carries_correct_content():
 
 
 def test_chat_stream_error_event_on_nonzero_exit():
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     proc = _fake_popen([], exit_code=1)
     proc.stderr.read.return_value = "boom"
     with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
@@ -165,7 +166,7 @@ def test_chat_stream_error_event_on_nonzero_exit():
 
 def test_chat_stream_error_propagates_on_nonzero_exit():
     """chat_stream yields StreamError(stage='claude_cli_exit') on non-zero exit."""
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     proc = _fake_popen([], exit_code=1)
     proc.stderr.read.return_value = "auth failure"
     with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
@@ -177,19 +178,18 @@ def test_chat_stream_error_propagates_on_nonzero_exit():
 
 def test_chat_stream_idle_timeout_yields_error(monkeypatch):
     """If no stdout line arrives within the per-event budget, surface idle_timeout."""
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
 
-    # An iterator that hangs forever — the reader thread will block in
-    # stdout.readline, so the consumer-side queue.get will time out first.
+    # An iterator that hangs until the child is stopped (a real child closes its pipe when it dies): the reader thread
+    # blocks in stdout.readline, so the consumer-side queue.get will time out first.
+    closed = threading.Event()
+
     class _SlowStdout:
         def __iter__(self):
             return self
 
         def __next__(self):
-            # Block long enough that the idle-timeout fires.
-            import time
-
-            time.sleep(5)
+            closed.wait(5)  # long enough that the idle-timeout fires; ends at once when terminate/kill is called
             raise StopIteration
 
     proc = MagicMock()
@@ -198,8 +198,8 @@ def test_chat_stream_idle_timeout_yields_error(monkeypatch):
     proc.poll.return_value = None
     proc.wait.return_value = 0
     proc.returncode = 0
-    proc.terminate = MagicMock()
-    proc.kill = MagicMock()
+    proc.terminate = MagicMock(side_effect=closed.set)
+    proc.kill = MagicMock(side_effect=closed.set)
     proc.stderr = MagicMock()
     proc.stderr.read.return_value = ""
 
@@ -207,8 +207,11 @@ def test_chat_stream_idle_timeout_yields_error(monkeypatch):
     monkeypatch.setattr("brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True)
     monkeypatch.setattr("brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.1, raising=True)
 
-    with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
-        events = list(provider.chat_stream([ChatMessage(role="user", content="hi")]))
+    try:
+        with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
+            events = list(provider.chat_stream([ChatMessage(role="user", content="hi")]))
+    finally:
+        closed.set()
     errs = [e for e in events if isinstance(e, StreamError)]
     assert len(errs) == 1
     assert errs[0].stage == "claude_cli_idle_timeout"
@@ -217,7 +220,7 @@ def test_chat_stream_idle_timeout_yields_error(monkeypatch):
 
 def test_chat_stream_early_close_terminates_subprocess():
     """If the consumer abandons the generator mid-stream, Popen.terminate runs."""
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     lines = [_delta_line(str(i)) for i in range(100)] + [_result_line("done")]
     proc = _fake_popen(lines)
     with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
@@ -231,7 +234,7 @@ def test_chat_stream_early_close_terminates_subprocess():
 
 def test_chat_stream_skips_unparseable_lines():
     """Malformed NDJSON lines do not break the stream."""
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     lines = [
         "garbage not json\n",
         _delta_line("ok"),
@@ -245,7 +248,7 @@ def test_chat_stream_skips_unparseable_lines():
 
 def test_chat_stream_falls_back_to_assistant_snapshot_when_no_result():
     """If somehow the result frame is missing, fall back to assistant content."""
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     lines = [
         _delta_line("hello"),
         json.dumps(
@@ -276,7 +279,7 @@ def test_chat_stream_mcp_tools_argv():
     import tempfile
     from pathlib import Path
 
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     lines = [_result_line("ok")]
     with tempfile.TemporaryDirectory() as td:
         persona = Path(td) / "persona"
@@ -316,11 +319,12 @@ def _assistant_tool_use_line(tool_name: str) -> str:
 
 
 class _StallAfter:
-    """Yield the given lines, then block forever so the idle watchdog fires."""
+    """Yield the given lines, then block (until ``closed`` is set, at most 5 s) so the idle watchdog fires."""
 
-    def __init__(self, lines):
+    def __init__(self, lines, closed):
         self._lines = list(lines)
         self._i = 0
+        self._closed = closed
 
     def __iter__(self):
         return self
@@ -330,21 +334,22 @@ class _StallAfter:
             line = self._lines[self._i]
             self._i += 1
             return line
-        import time as _t
-
-        _t.sleep(5)
+        self._closed.wait(5)
         raise StopIteration
 
 
 def _stall_proc(lines):
+    """A fake child whose stdout stalls after ``lines``. A real child that is stopped closes its pipe, so terminate()
+    and kill() release the stalled read: the stream's cleanup does not wait out a reader that nothing will wake."""
+    closed = threading.Event()
     proc = MagicMock()
-    proc.stdout = _StallAfter(lines)
+    proc.stdout = _StallAfter(lines, closed)
     proc.stdin = MagicMock()
     proc.poll.return_value = None
     proc.wait.return_value = 0
     proc.returncode = 0
-    proc.terminate = MagicMock()
-    proc.kill = MagicMock()
+    proc.terminate = MagicMock(side_effect=closed.set)
+    proc.kill = MagicMock(side_effect=closed.set)
     proc.stderr = MagicMock()
     proc.stderr.read.return_value = ""
     return proc
@@ -355,7 +360,7 @@ def test_idle_timeout_records_tool_in_flight(tmp_path, monkeypatch):
     the per-event budget that fired."""
     persona = tmp_path / "persona"
     persona.mkdir()
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     monkeypatch.setattr("brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True)
     monkeypatch.setattr("brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.2, raising=True)
 
@@ -388,7 +393,7 @@ def test_idle_timeout_cold_start_records_no_frame(tmp_path, monkeypatch):
     frames_seen 0, tool_in_flight false."""
     persona = tmp_path / "persona"
     persona.mkdir()
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     monkeypatch.setattr("brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True)
     monkeypatch.setattr("brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.2, raising=True)
 
@@ -413,7 +418,7 @@ def test_idle_timeout_mid_generation_records_stream_event(tmp_path, monkeypatch)
     """A text delta then silence → last_frame_type 'stream_event', no tool."""
     persona = tmp_path / "persona"
     persona.mkdir()
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     monkeypatch.setattr("brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True)
     monkeypatch.setattr("brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.2, raising=True)
 
@@ -439,7 +444,7 @@ def test_idle_timeout_without_persona_dir_only_logs(monkeypatch, caplog):
     logger.warning."""
     import logging
 
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     monkeypatch.setattr("brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True)
     monkeypatch.setattr("brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.1, raising=True)
 
@@ -456,7 +461,7 @@ def test_normal_stream_writes_no_timeout_log(tmp_path):
     """A normal stream (frames then result) must not create stream_timeouts.jsonl."""
     persona = tmp_path / "persona"
     persona.mkdir()
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     lines = [_delta_line("ok"), _result_line("ok")]
     with patch("brain.bridge.provider.subprocess.Popen", return_value=_fake_popen(lines)):
         events = list(
@@ -475,7 +480,9 @@ def test_result_frame_terminates_stream_without_spurious_idle_timeout(monkeypatc
     polling for EOF and fire a spurious idle-timeout StreamError on top of an
     already-successful reply (bug-hunt finding #2). Models a subprocess that
     emits the result line then holds stdout open briefly before EOF."""
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
+
+    released = threading.Event()
 
     class _ResultThenHang:
         def __init__(self):
@@ -488,10 +495,8 @@ def test_result_frame_terminates_stream_without_spurious_idle_timeout(monkeypatc
             if not self._sent:
                 self._sent = True
                 return _result_line("done")
-            # Hold the pipe open past the (shrunk) idle budget before EOF.
-            import time
-
-            time.sleep(1.0)
+            # Hold the pipe open past the (shrunk, 0.1 s) idle budget before EOF.
+            released.wait(0.4)
             raise StopIteration
 
     proc = MagicMock()
@@ -508,8 +513,11 @@ def test_result_frame_terminates_stream_without_spurious_idle_timeout(monkeypatc
     monkeypatch.setattr("brain.bridge.provider._STREAM_FIRST_EVENT_SECONDS", 0.1, raising=True)
     monkeypatch.setattr("brain.bridge.provider._STREAM_PER_EVENT_IDLE_SECONDS", 0.1, raising=True)
 
-    with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
-        events = list(provider.chat_stream([ChatMessage(role="user", content="hi")]))
+    try:
+        with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
+            events = list(provider.chat_stream([ChatMessage(role="user", content="hi")]))
+    finally:
+        released.set()
 
     dones = [e for e in events if isinstance(e, StreamDone)]
     errs = [e for e in events if isinstance(e, StreamError)]
@@ -532,7 +540,7 @@ def test_result_frame_terminates_stream_without_spurious_idle_timeout(monkeypatc
 def test_chat_stream_with_tools_writes_session_id_into_mcp_config(tmp_path, monkeypatch):
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     captured: dict = {}
 
     def _capture_popen(cmd, **kwargs):
@@ -563,7 +571,7 @@ def test_chat_stream_with_tools_and_no_session_id_omits_session_env(tmp_path, mo
     claim one."""
     persona_dir = tmp_path / "persona"
     persona_dir.mkdir()
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     captured: dict = {}
 
     def _capture_popen(cmd, **kwargs):
@@ -589,7 +597,7 @@ def test_chat_stream_with_tools_and_no_session_id_omits_session_env(tmp_path, mo
 def test_chat_stream_empty_result_falls_back_to_streamed_text():
     """#146: a terminal result frame with empty text must not become a blank
     reply when the stream already carried the assistant's text."""
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=60)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=60)
     lines = [
         _delta_line("Hello"),
         _delta_line(" there"),

@@ -461,3 +461,86 @@ def test_service_status_not_installed_without_xml_or_task(tmp_path: Path, monkey
     assert status.installed is False
     assert status.loaded is False
     assert status.detail == "schtasks not available"
+
+
+# ---------------------------------------------------------------------------
+# nell.cmd shim on PATH must not become the Task Scheduler action (#408, F3)
+# ---------------------------------------------------------------------------
+
+SHIM_MARKER = "companion-emergence-nell-shim"
+
+
+def _fake_runtime(tmp_path: Path, *, with_bat: bool = True, with_pythonw: bool = True) -> Path:
+    runtime = tmp_path / "Companion Emergence" / "python-runtime"
+    (runtime / "Scripts").mkdir(parents=True)
+    python = runtime / "python.exe"
+    python.write_text("placeholder", encoding="utf-8")
+    if with_bat:
+        (runtime / "Scripts" / "nell.bat").write_text("@echo off\r\n", encoding="utf-8")
+    if with_pythonw:
+        (runtime / "pythonw.exe").write_text("placeholder", encoding="utf-8")
+    return python
+
+
+def _which_returning(monkeypatch, found: Path) -> None:
+    monkeypatch.setattr(
+        windows_service.shutil,
+        "which",
+        lambda name, *a, **k: str(found) if name == "nell" else None,
+    )
+
+
+def test_marker_nell_cmd_resolves_to_the_running_bundled_nell_bat(tmp_path: Path, monkeypatch) -> None:
+    import sys
+
+    python = _fake_runtime(tmp_path)
+    monkeypatch.setattr(sys, "executable", str(python))
+    shim = tmp_path / "bin" / "nell.cmd"
+    shim.parent.mkdir()
+    shim.write_text(f"@echo off\r\nrem {SHIM_MARKER} v1\r\n\"x\" %*\r\n", encoding="utf-8")
+    _which_returning(monkeypatch, shim)
+
+    resolved = windows_service.resolve_nell_path(None)
+
+    assert resolved == python.parent / "Scripts" / "nell.bat"
+    action = windows_service._task_action_for_nell_path("nell", resolved)
+    assert action.command == str(python.parent / "pythonw.exe")
+    assert "cmd.exe" not in action.command.lower()
+
+
+def test_marker_nell_cmd_without_a_bundled_bat_is_an_error(tmp_path: Path, monkeypatch) -> None:
+    import sys
+
+    python = _fake_runtime(tmp_path, with_bat=False)
+    monkeypatch.setattr(sys, "executable", str(python))
+    shim = tmp_path / "bin" / "nell.cmd"
+    shim.parent.mkdir()
+    shim.write_text(f"@echo off\r\nrem {SHIM_MARKER} v1\r\n", encoding="utf-8")
+    _which_returning(monkeypatch, shim)
+
+    with pytest.raises(windows_service.WindowsServiceConfigError, match="--nell-path"):
+        windows_service.resolve_nell_path(None)
+
+
+def test_nell_cmd_without_the_marker_is_left_alone(tmp_path: Path, monkeypatch) -> None:
+    import sys
+
+    python = _fake_runtime(tmp_path)
+    monkeypatch.setattr(sys, "executable", str(python))
+    mine = tmp_path / "bin" / "nell.cmd"
+    mine.parent.mkdir()
+    mine.write_text("@echo off\r\necho my own nell\r\n", encoding="utf-8")
+    _which_returning(monkeypatch, mine)
+
+    assert windows_service.resolve_nell_path(None) == mine.resolve()
+
+
+def test_a_plain_nell_exe_on_path_is_unchanged(tmp_path: Path, monkeypatch) -> None:
+    exe = _make_executable(tmp_path / "bin" / "nell.exe")
+    monkeypatch.setattr(
+        windows_service.shutil,
+        "which",
+        lambda name, *a, **k: str(exe) if name == "nell.exe" else None,
+    )
+
+    assert windows_service.resolve_nell_path(None) == exe.resolve()

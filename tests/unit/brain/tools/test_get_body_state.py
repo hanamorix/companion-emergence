@@ -1,6 +1,6 @@
 """Unit tests for the real get_body_state tool impl.
 
-Spec: docs/superpowers/specs/2026-04-29-body-state-design.md §3.3.
+Spec: docs/source-spec/2026-04-29-body-state-design.md §3.3.
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from brain.memory.hebbian import HebbianMatrix
-from brain.memory.store import MemoryStore
+from brain.memory.store import Memory, MemoryStore
 from brain.tools.impls import get_body_state as body_tool
 from brain.tools.impls.get_body_state import get_body_state
 
@@ -32,7 +32,14 @@ def test_returns_loaded_true(store, hebbian, tmp_path):
     assert out["loaded"] is True
 
 
-def test_returns_real_schema(store, hebbian, tmp_path):
+def test_returns_real_schema(store, hebbian, tmp_path, emotion_engine_stub):
+    from brain.emotion.engine import Reading
+
+    # The engine reads all six body emotions: each is a key of body_emotions.
+    emotion_engine_stub.readings = {
+        name: Reading(short=1.0, long=0.0, difference=0.0, shift=0)
+        for name in ("arousal", "desire", "climax", "touch_hunger", "comfort_seeking", "rest_need")
+    }
     out = get_body_state(store=store, hebbian=hebbian, persona_dir=tmp_path)
     assert set(out.keys()) == {
         "loaded",
@@ -81,14 +88,14 @@ def test_session_hours_passed_through(store, hebbian, tmp_path):
 def test_recomputes_each_call(store, hebbian, tmp_path, monkeypatch):
     """Inviolate property #8 from spec §7.1 — no cache."""
     calls = 0
-    original = body_tool.compute_body_state
+    original = body_tool.body_state_from_short
 
-    def counting_compute_body_state(**kwargs):
+    def counting_body_state_from_short(*args, **kwargs):
         nonlocal calls
         calls += 1
-        return original(**kwargs)
+        return original(*args, **kwargs)
 
-    monkeypatch.setattr(body_tool, "compute_body_state", counting_compute_body_state)
+    monkeypatch.setattr(body_tool, "body_state_from_short", counting_body_state_from_short)
 
     out1 = get_body_state(store=store, hebbian=hebbian, persona_dir=tmp_path)
     out2 = get_body_state(store=store, hebbian=hebbian, persona_dir=tmp_path)
@@ -96,3 +103,37 @@ def test_recomputes_each_call(store, hebbian, tmp_path, monkeypatch):
     assert calls == 2
     assert "computed_at" in out1
     assert "computed_at" in out2
+
+
+def test_body_state_has_no_key_for_an_absent_body_emotion(store, hebbian, tmp_path, emotion_engine_stub):
+    """The body emotions are the engine's short averages, and only those."""
+    from brain.emotion.engine import Reading
+
+    store.create(
+        Memory.create_new(
+            content="stored", memory_type="fact", domain="us", emotions={"rest_need": 9.0, "arousal": 9.0}
+        )
+    )
+    emotion_engine_stub.readings = {"arousal": Reading(short=4.0, long=0.0, difference=0.0, shift=0)}
+    out = get_body_state(store=store, hebbian=hebbian, persona_dir=tmp_path)
+    assert out["body_emotions"] == {"arousal": 4.0}
+
+
+def test_energy_and_temperature_follow_the_engines_predicate_not_a_level(
+    store, hebbian, tmp_path, emotion_engine_stub
+):
+    from brain.emotion.engine import Reading
+
+    def numbers(readings: dict[str, float], high: set[str]) -> tuple[int, int]:
+        emotion_engine_stub.high = set(high)
+        emotion_engine_stub.readings = {
+            n: Reading(short=v, long=0.0, difference=0.0, shift=0) for n, v in readings.items()
+        }
+        out = get_body_state(store=store, hebbian=hebbian, persona_dir=tmp_path)
+        return out["energy"], out["temperature"]
+
+    energy, temperature = numbers({}, set())
+    top = {"rest_need": 10.0, "desire": 10.0, "love": 10.0, "touch_hunger": 10.0}
+    assert numbers(top, set()) == (energy, temperature)
+    low = {"rest_need": 0.5, "desire": 0.5, "love": 0.5, "touch_hunger": 0.5}
+    assert numbers(low, set(low)) == (energy - 1, temperature + 1)

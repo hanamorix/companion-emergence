@@ -21,10 +21,12 @@ from brain import dev_constants
 from brain.bridge import state_file
 from brain.mcp_server.audit import log_invocation
 from brain.memory.hebbian import HebbianMatrix
+from brain.memory.known_names import note_tool_call
 from brain.memory.store import MemoryStore
 from brain.tools import NELL_TOOL_NAMES
 from brain.tools.dispatch import dispatch
-from brain.tools.schemas import build_schemas
+from brain.tools.naming import fill_tool_prefix, fill_tool_result
+from brain.tools.schemas import ADD_NAME_TOOL_NAME, build_schemas
 
 # Tools dispatched to the running bridge over its local HTTP API instead of
 # in-process (INC-4, S9/S10): the per-turn MCP tool process never builds the
@@ -32,6 +34,16 @@ from brain.tools.schemas import build_schemas
 # as long-lived singletons (S11). No fallback: a bridge failure is an error
 # result, not a local model load (S10).
 _BRIDGE_ROUTED_TOOLS = frozenset({"search_memories"})
+
+# Brain tools the CLI must never defer behind ToolSearch (#525). Chosen from
+# usage data, not taste: keep a tool up front iff the Wilson 95% lower bound of
+# its per-chat-turn use rate is at least its break-even rate (schema tokens x
+# CLI turns per chat / tokens of one lookup hop). Over nell's 168 chat turns
+# (2026-06-08..09-12) only record_monologue qualified (69.6% of turns, lower
+# bound 62.3% vs 3.7%). Re-run the rule when #417 or #418 changes the monologue
+# directive, or when read_full_memory use shows up in the logs:
+# scripts/select_always_loaded_tools.py prints the set.
+ALWAYS_LOADED_TOOLS: tuple[str, ...] = ("record_monologue",)
 
 # Must match brain.mcp_server.audit._RESULT_SUMMARY_MAX_CHARS — both
 # files truncate at the same boundary so the audit log preview length
@@ -72,6 +84,7 @@ def _search_via_bridge(persona_dir: Path, arguments: dict[str, Any]) -> dict:
             json=arguments,
             headers=headers,
             timeout=dev_constants.SEARCH_BRIDGE_TIMEOUT_S,
+            trust_env=False,  # the loopback bridge is never reached through a proxy (#475)
         )
     except httpx.TimeoutException:
         return {"error": "bridge timeout"}
@@ -88,16 +101,20 @@ def register_tools(
     persona_dir: Path,
     store: MemoryStore,
     hebbian: HebbianMatrix,
+    tool_prefix: str = "",
 ) -> None:
     """Register each brain-tool with the MCP server.
 
     Closures capture store/hebbian/persona_dir so each invocation passes
     them through dispatch unchanged. The server itself is mutated in place;
     the function returns None.
+
+    ``tool_prefix`` is what the client calls these tools (``--tool-prefix``, set by the
+    Claude CLI's spawn entry); descriptions and results name other tools with it (#417).
     """
 
     companion_name = persona_dir.name
-    schemas = build_schemas(companion_name)
+    schemas = build_schemas(companion_name, tool_prefix=tool_prefix)
 
     @server.list_tools()
     async def _list_tools() -> list[Tool]:
@@ -106,6 +123,8 @@ def register_tools(
                 name=name,
                 description=schemas[name].get("description", ""),
                 inputSchema=schemas[name].get("parameters", {"type": "object"}),
+                # claude CLI reads this per tool: True means never deferred (#525).
+                _meta={"anthropic/alwaysLoad": True} if name in ALWAYS_LOADED_TOOLS else None,
             )
             for name in NELL_TOOL_NAMES
             if name in schemas
@@ -123,6 +142,10 @@ def register_tools(
             # which is the only consumer of this kwarg.
             session_id = os.environ.get("NELL_MCP_SESSION_ID") or None
             if name in _BRIDGE_ROUTED_TOOLS:
+                # Names increment (S137, S138): the forward counts as her next tool
+                # call even when the bridge never answers (the bridge's own
+                # dispatch() runs the hook again; it is idempotent).
+                note_tool_call(persona_dir, name, arguments, add_tool_name=ADD_NAME_TOOL_NAME)
                 result = _search_via_bridge(persona_dir, arguments)
             else:
                 result = dispatch(
@@ -164,6 +187,7 @@ def register_tools(
                     stored_image_path=stored_image_path,
                 )
                 return [ImageContent(type="image", data=data_b64, mimeType=media_type)]
+            result = fill_tool_result(result, tool_prefix)
             payload = json.dumps(result, default=str, ensure_ascii=False)
             monologue_text: str | None = (
                 result.get("monologue_text") if isinstance(result, dict) else None
@@ -189,13 +213,14 @@ def register_tools(
             )
             return [TextContent(type="text", text=payload)]
         except Exception as exc:  # noqa: BLE001 — broad catch is intentional
-            err_payload = json.dumps({"error": str(exc)})
+            error = fill_tool_prefix(str(exc), tool_prefix)
+            err_payload = json.dumps({"error": error})
             log_invocation(
                 persona_dir,
                 name=name,
                 arguments=arguments,
-                result_summary=f"error: {exc}",
-                error=str(exc),
+                result_summary=f"error: {error}",
+                error=error,
                 outcome="error",
             )
             return [TextContent(type="text", text=err_payload)]

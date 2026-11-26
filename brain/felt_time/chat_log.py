@@ -11,6 +11,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
+from brain.health.log_rotation import trim_jsonl_by_age
+from brain.utils.file_lock import file_lock
 
 log = logging.getLogger(__name__)
 
@@ -30,7 +32,9 @@ def append_chat_tick(persona_dir: Path, *, ts: datetime, turns: int) -> None:
     log_path = persona_dir / CHAT_TURNS_LOG_FILENAME
     entry = {"ts": ts.astimezone(UTC).isoformat(), "turns": turns}
     try:
-        with log_path.open("a", encoding="utf-8") as f:
+        # Under the log's lock so the trim's rewrite (which replaces the file) cannot swallow
+        # a row appended while it ran (#477).
+        with file_lock(log_path), log_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
     except OSError:
         log.debug("chat_log: append failed", exc_info=True)
@@ -59,20 +63,14 @@ def load_recent_samples(
     retain_cutoff = now - timedelta(days=_RETAIN_DAYS)
     window_cutoff = now - timedelta(days=window_days)
 
-    all_entries: list[dict] = []
     try:
-        for raw in iter_jsonl_skipping_corrupt(log_path):
-            try:
-                ts = datetime.fromisoformat(raw["ts"])
-                all_entries.append({"ts": ts, "turns": float(raw.get("turns", 0))})
-            except (KeyError, ValueError, TypeError):
-                pass
+        all_entries = _read_entries(log_path)
     except OSError:
         return None
 
     kept = _trim_old_entries(all_entries, cutoff=retain_cutoff)
     if len(all_entries) - len(kept) > 10:
-        _rewrite_log(log_path, kept)
+        kept = _trim_log(log_path, retain_cutoff) or kept
 
     window = sorted(
         [(e["ts"], e["turns"]) for e in kept if e["ts"] >= window_cutoff],
@@ -112,14 +110,26 @@ def count_chat_turns_since(persona_dir: Path, since_iso: str) -> int:
     return total
 
 
-def _rewrite_log(log_path: Path, entries: list[dict]) -> None:
-    """Atomically rewrite log with trimmed entries (lazy GC)."""
+def _read_entries(log_path: Path) -> list[dict]:
+    entries: list[dict] = []
+    for raw in iter_jsonl_skipping_corrupt(log_path):
+        try:
+            entries.append({"ts": datetime.fromisoformat(raw["ts"]), "turns": float(raw.get("turns", 0))})
+        except (KeyError, ValueError, TypeError):
+            pass
+    return entries
+
+
+def _trim_log(log_path: Path, cutoff: datetime) -> list[dict] | None:
+    """Trim the log to rows at or after ``cutoff`` (lazy GC); return the rows now in it, None on failure.
+
+    The shared age trim (``brain.health.log_rotation``, #476) reads the file again under the
+    appenders' lock and rewrites it through the shared atomic writer, so a row appended since the
+    caller's read is kept and a transient Windows PermissionError is retried (#477).
+    """
     try:
-        tmp = log_path.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            for e in entries:
-                row = {"ts": e["ts"].isoformat(), "turns": int(e["turns"])}
-                f.write(json.dumps(row) + "\n")
-        tmp.replace(log_path)
+        trim_jsonl_by_age(log_path, cutoff, timestamp_field="ts")
+        return _read_entries(log_path)
     except OSError:
         log.debug("chat_log: rewrite failed", exc_info=True)
+        return None

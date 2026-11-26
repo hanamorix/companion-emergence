@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from brain.health.reconstruct import reconstruct_vocabulary_from_memories
+import logging
+from datetime import UTC, datetime
+
+from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION, reconstruct_vocabulary_from_memories
 from brain.memory.store import Memory, MemoryStore
 
 
@@ -101,6 +104,36 @@ def test_reconstructed_entry_gets_persona_typical_half_life() -> None:
         result = reconstruct_vocabulary_from_memories(store)
         body_grief = next(e for e in result["emotions"] if e["name"] == "body_grief")
         assert body_grief["decay_half_life_days"] == 14.0
+    finally:
+        store.close()
+
+
+def test_non_finite_valued_emotion_name_still_gets_a_placeholder(caplog) -> None:
+    """A stored emotion whose value is not finite (json.dumps writes NaN) still names an emotion the brain has used.
+
+    The rebuild reads names only, so it neither loses that name nor logs "dropping emotion" on every rebuild.
+    `create_new` drops non-finite values, so the memory is built the way a loaded row is.
+    """
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.from_stored_row(
+                id="nan-valued-row",
+                content="x",
+                memory_type="conversation",
+                domain="us",
+                created_at=datetime.now(UTC),
+                emotions={"nan_ache": float("nan"), "inf_ache": float("inf"), "love": 9.0},
+            ),
+            fold=False,
+        )
+        with caplog.at_level(logging.DEBUG):
+            result = reconstruct_vocabulary_from_memories(store)
+        by_name = {e["name"]: e for e in result["emotions"]}
+        assert by_name["nan_ache"]["category"] == "persona_extension"
+        assert by_name["nan_ache"]["description"] == PLACEHOLDER_DESCRIPTION
+        assert by_name["inf_ache"]["category"] == "persona_extension"
+        assert not [r for r in caplog.records if "dropping emotion" in r.getMessage()]
     finally:
         store.close()
 

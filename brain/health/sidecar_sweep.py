@@ -11,7 +11,7 @@ Two families accumulate at the persona root and nothing reaped them:
   before that change are still forensic residue with a shelf life and are
   still reaped here.
 * ``<file>.corrupt-<stamp>`` / ``<file>.bakN.corrupt-<stamp>`` — a corrupt
-  state file quarantined by ``brain.health.attempt_heal`` before the heal.
+  state file quarantined by ``brain.health.json_io`` (HEAL) before the heal.
 
 Both are forensic residue with a shelf life. Live ``<file>.lock`` sidecars
 are NOT touched: ``brain.utils.file_lock`` documents that removing them

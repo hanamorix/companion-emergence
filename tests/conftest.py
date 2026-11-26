@@ -3,17 +3,126 @@
 from __future__ import annotations
 
 import functools
+import importlib.util
+import inspect
 import os
+import subprocess
+import sys
 import tempfile
-from collections.abc import Iterator
+import threading
+import traceback
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from brain.bridge import cli_throttle, provider_auth
+from brain.bridge import cli_throttle, model_error, provider_auth
 from brain.chat import pass2_queue
+from brain.memory import pending
+from tests.claude_spawn_guard import (
+    no_real_claude_in_ci,  # noqa: F401  (autouse, J11: no real `claude` in CI)
+)
 
-pytest_plugins = ["pytester"]
+# tests.shard: `--shard i/N` splits the suite across CI runners (#746); without the option it does nothing.
+pytest_plugins = ["pytester", "tests.shard"]
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Refuse a ``no_base_failure`` or ``slow`` mark that gives no reason or sits on a module or class (tests/no_base_failure.py)."""
+    from tests.no_base_failure import marker_problems
+
+    problems = marker_problems(items) + marker_problems(items, "slow")
+    problems += marker_problems(items, "real_rebuild_step") + marker_problems(items, "real_rebuild_child")
+    if problems:
+        raise pytest.UsageError("\n".join(problems))
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Where the slow-test budget is on, import the heavy libraries up front (setup time is not budgeted).
+
+    Whichever test imports torch or onnxruntime first pays several seconds for it. With a fixed order that is one known
+    test; with random order (pytest-randomly) it is any test, and an unmarked one would fail the budget by bad luck.
+    Imported with the budget on only, so a local run of one file does not pay for it.
+    """
+    from tests import slow_budget
+
+    if not slow_budget.enabled():
+        return
+    if getattr(session.config.option, "numprocesses", None) and not hasattr(session.config, "workerinput"):
+        return  # the xdist controller runs no test; only the workers need the libraries
+    import importlib
+
+    for name in ("torch", "sentence_transformers", "onnxruntime", "fastembed"):
+        try:
+            importlib.import_module(name)
+        except Exception:  # noqa: BLE001 - an extra that is not installed is fine
+            pass
+    # the parsed source trees (tests/source_tree.py) are shared by about thirty tests; whichever is first would pay them
+    from tests import source_tree
+
+    source_tree.brain_trees()
+    source_tree.brain_sources()
+
+
+_CALL_CPU = pytest.StashKey[float]()
+# the builtin `open` as it is when the session starts, for the slow-test log (#790)
+_REAL_OPEN = open
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item: pytest.Item) -> Iterator[None]:
+    """Remember the CPU time (this process, all threads) the call phase used, for the slow-test budget."""
+    import time
+
+    start = time.process_time()
+    yield
+    item.stash[_CALL_CPU] = time.process_time() - start
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item: pytest.Item, call: pytest.CallInfo) -> Iterator[None]:
+    """The slow-test budget (tests/slow_budget.py): a passing call phase over the CPU budget, without a ``slow`` mark, fails."""
+    outcome = yield
+    from tests import slow_budget
+
+    if call.when != "call":
+        return
+    cpu = item.stash.get(_CALL_CPU, 0.0)
+    log = os.environ.get("KINDLED_SLOW_BUDGET_LOG")
+    if log and cpu > slow_budget.log_min_s():  # collected on every OS, whether or not the budget is enforced there
+        import json
+        import warnings
+
+        # the test's monkeypatch is still on here, and some tests replace `builtins.open` with a fake that raises (#790)
+        line = json.dumps({"id": item.nodeid, "cpu": round(cpu, 3), "wall": round(call.duration, 3)}) + "\n"
+        try:
+            with _REAL_OPEN(log, "a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError as exc:  # a measurement log may not end the session
+            warnings.warn(f"the slow-test CPU log {log} could not be written ({exc}), so {item.nodeid} is missing from it", stacklevel=1)
+    if not slow_budget.enabled():
+        return
+    report = outcome.get_result()
+    if report.outcome != "passed" or hasattr(report, "wasxfail"):
+        return
+    message = slow_budget.over_budget(
+        cpu,
+        slow_budget.budget_s(),
+        has_slow_mark=item.get_closest_marker("slow") is not None,
+        exempt=any(item.get_closest_marker(name) is not None for name in slow_budget.EXEMPT_MARKERS),
+    )
+    if message:
+        report.outcome = "failed"
+        report.longrepr = f"{item.nodeid}: {message}"
+
+
+def pytest_terminal_summary(terminalreporter: Any, config: pytest.Config) -> None:
+    """Print the pytest-randomly seed at the end too (the header line is hidden by -q), so a red order can be reproduced."""
+    seed = getattr(config.option, "randomly_seed", None)
+    if seed is not None and config.pluginmanager.hasplugin("randomly"):
+        terminalreporter.write_line(f"pytest-randomly seed: {seed} (reproduce serially with --randomly-seed={seed}, or switch it off with -p no:randomly)")
 
 
 @functools.cache
@@ -40,6 +149,125 @@ def requires_symlinks() -> None:
         pytest.skip("os.symlink needs an elevated shell or Developer Mode on Windows")
 
 
+@pytest.fixture(scope="module")
+def one_torch_thread() -> Iterator[None]:
+    """Run a torch-training module on one intra-op thread, then put the previous setting back.
+
+    Under pytest-xdist the worker that trains runs beside other busy workers; torch's default (one intra-op thread per
+    core) would make it compete with all of them for the CPU, including with the timing-sensitive tests. The tiny
+    models here gain nothing from more threads. Used via ``pytestmark = pytest.mark.usefixtures("one_torch_thread")``."""
+    import torch
+
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(previous)
+
+
+# The REAL per-user directories, captured at import (before any test patches the platform directories), for the #488 isolation test.
+from brain import paths as _paths_module  # noqa: E402
+
+# The XDG cache variable as the run started (None when unset), for the #488 isolation test: the fixture must leave it alone.
+REAL_XDG_CACHE_HOME = os.environ.get("XDG_CACHE_HOME")
+
+REAL_PLATFORM_DIRS = {
+    name: Path(getattr(_paths_module._dirs, name)).resolve()
+    for name in ("user_data_path", "user_cache_path", "user_log_path", "user_state_path", "user_config_path")
+}
+
+
+def _isolated_dir(root: Path, dirs: object, sub: str) -> str:
+    """One directory under the per-test root, laid out like the real thing: per app name (the harness keeps a SIBLING app dir,
+    "companion-emergence-harness", outside the guarded roots) and per app author where the platform puts it in the path (Windows,
+    macOS: an explicit author string, or on Windows no author meaning the app name), so ``PlatformDirs(app)`` and the engine's
+    ``PlatformDirs(app, author)`` stay different directories, which a harness guard test depends on."""
+    appname = getattr(dirs, "appname", None) or "app"
+    author = getattr(dirs, "appauthor", None)
+    if not (isinstance(author, str) and author):
+        author = appname if (author is None and os.name == "nt") else None
+    return str(root / author / appname / sub) if author else str(root / appname / sub)
+
+
+# The platformdirs directory properties as the platform defines them, captured before #488's fixture redirects them.
+_REAL_DIR_PROPS = {
+    prop: inspect.getattr_static(type(_paths_module._dirs), prop)
+    for prop in ("user_data_dir", "user_log_dir", "user_state_dir", "user_config_dir")
+}
+
+
+@pytest.fixture
+def real_platform_dirs(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """For a test that compares the home computed from an environment with platformdirs' own answer (#456 S15, the
+    pre-PR bridge proof): put the platform's real properties back over #488's redirect. For comparing paths ONLY.
+
+    On Linux the XDG variables #488 set still point into the test's tmp root; on macOS and Windows the restored
+    properties resolve to the REAL user directories, so the fixture fails the test if any exposed directory was
+    created, or gained or lost a top-level entry, during the test (tests/real_dirs_guard.py; names only, nothing read;
+    a developer's running bridge writing to its existing files there does not trip it)."""
+    from platformdirs import PlatformDirs
+
+    from brain import paths
+    from tests.real_dirs_guard import assert_untouched, fingerprint
+
+    for cls in {type(paths._dirs), PlatformDirs}:
+        for prop, value in _REAL_DIR_PROPS.items():
+            monkeypatch.setattr(cls, prop, value)
+    exposed = [Path(getattr(paths._dirs, prop)) for prop in _REAL_DIR_PROPS]
+    before = fingerprint(exposed)
+    yield
+    assert_untouched(before, fingerprint(exposed))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_data_home(tmp_path_factory: pytest.TempPathFactory) -> Iterator[None]:
+    """#488: no test may write into the real per-user data directory.
+
+    A test that builds the bridge app (its lifespan syncs the settings file) or calls ``get_home()`` with neither
+    ``KINDLED_HOME`` nor ``NELLBRAIN_HOME`` set resolved to the platformdirs default, the REAL ``~/.local/share/companion-emergence``
+    of whoever ran the tests, so a run could change real settings and a later test could read what an earlier one left. Every test
+    now gets its own empty root as that default. The directory properties are replaced on the platform's ``PlatformDirs`` class
+    (every OS), so ``brain.paths._dirs`` and any fresh ``PlatformDirs(...)`` (the update overlay hook builds its own, and a parity
+    test holds the two together) agree and both land in the tmp root; the XDG data and state variables point there too (so a
+    subprocess a test starts, on Linux and macOS, lands there as well). A test that sets ``KINDLED_HOME`` / ``NELLBRAIN_HOME`` still wins, as before, and the env-var resolution order is
+    unchanged.
+
+    The CACHE directory and ``XDG_CACHE_HOME`` are deliberately NOT redirected: the cache is where downloaded models live, not user
+    state. platformdirs reads ``XDG_CACHE_HOME`` on Linux and macOS and huggingface_hub derives ``HF_HOME`` from it on every OS, so
+    moving it made a subprocess a test starts (the judge release RSS job's C3a) find no cached judge, go to the network and fail.
+
+    The patches are held by this fixture's OWN ``MonkeyPatch``, not the test's: a test that calls ``monkeypatch.undo()`` reverts
+    only what it patched itself. With the test's instance, an ``undo()`` put the platform default back and the next
+    ``set_job_models`` wrote a model line into the real install's settings file (#530).
+    """
+    from platformdirs import PlatformDirs
+
+    from brain import paths
+
+    root = tmp_path_factory.mktemp("userdata")
+    monkeypatch = pytest.MonkeyPatch()
+    # Two classes when something (the update overlay hook drops platformdirs from sys.modules) made a new one after brain.paths
+    # built its instance: patch the one `brain.paths._dirs` is an instance of AND the one `from platformdirs import PlatformDirs` gives now.
+    for cls in {type(paths._dirs), PlatformDirs}:
+        for prop, sub in (
+            ("user_data_dir", "data"),
+            ("user_log_dir", "log"),
+            ("user_state_dir", "state"),
+            ("user_config_dir", "config"),
+        ):
+            monkeypatch.setattr(cls, prop, property(lambda self, _s=sub: _isolated_dir(root, self, _s)))
+    for var, sub in (
+        ("XDG_DATA_HOME", "xdg-data"),
+        ("XDG_STATE_HOME", "xdg-state"),
+    ):
+        monkeypatch.setenv(var, str(root / sub))
+    try:
+        yield
+    finally:
+        monkeypatch.undo()
+
+
 @pytest.fixture(autouse=True)
 def _reset_cli_throttle() -> Iterator[None]:
     """Reset cli_throttle global state before each test.
@@ -51,9 +279,104 @@ def _reset_cli_throttle() -> Iterator[None]:
     """
     cli_throttle.reset()
     provider_auth.reset()  # #246: the auth-expiry hooks live inside the CLI detail helpers
+    model_error.reset()  # #440: process-wide rejected-model records must not leak between tests
+    # #456: a bridge app's stop seals the process-wide task registry; a later test in this process starts fresh.
+    from brain.bridge import shutdown_progress
+
+    shutdown_progress.reset_for_tests()
     yield
     cli_throttle.reset()
     provider_auth.reset()
+    model_error.reset()
+
+
+# --- #375 / #540: the cwd-queue guard, by attribution ------------------------------------------------------------
+#
+# A test that grows ``pending_candidates.jsonl`` in the cwd it started in must error. The repo root is shared by every
+# pytest-xdist worker, so comparing the file's size before and after a test blames whichever test happens to be running
+# when ANOTHER worker's test leaks. An audit hook (PEP 578) sees only the events of its own process, so a write is
+# attributed to the test that was running in the process that wrote it. It is installed once, when this module is
+# imported, and cannot be removed; while no test has a guard registered it returns at once.
+
+_QUEUE_FILE = pending._QUEUE_FILENAME
+_QUEUE_GUARDS: list[tuple[str, list[str]]] = []  # (directory of the guarded queue, offences of the running test)
+_WRITE_FLAGS = sum(getattr(os, name, 0) for name in ("O_WRONLY", "O_RDWR", "O_APPEND", "O_CREAT", "O_TRUNC"))
+
+
+def _queue_offence(event: str, path: str) -> str:
+    """The event and the writer's call site: the five innermost frames outside conftest files, plus the innermost
+    frame of a test module when it is deeper in the stack than those (so the test's own line is never lost)."""
+    try:
+        frames = [f for f in traceback.extract_stack() if Path(f.filename).name != "conftest.py"]
+        shown = frames[-5:]
+        own = next((f for f in reversed(frames) if Path(f.filename).name.startswith("test_")), None)
+        if own is not None and own not in shown:
+            shown.insert(0, own)
+        return f"{event} {path} <- " + " <- ".join(f"{Path(f.filename).name}:{f.lineno} in {f.name}" for f in reversed(shown))
+    except Exception:  # noqa: BLE001 - the offence must be recorded even when its call site cannot be built
+        return f"{event} {path}"
+
+
+def _queue_audit_hook(event: str, args: tuple) -> None:
+    try:
+        if not _QUEUE_GUARDS:
+            return
+        if event == "open":
+            if not args[2] & _WRITE_FLAGS:
+                return
+            candidates = [(args[0], None)]
+        elif event == "os.rename":
+            # an atomic-replace writer targets the queue as the destination; moving it away is a change too
+            candidates = [(args[0], args[2]), (args[1], args[3])]
+        elif event in ("os.remove", "os.truncate"):
+            candidates = [(args[0], args[1] if event == "os.remove" else None)]
+        else:
+            return
+        for candidate, dir_fd in candidates:
+            if isinstance(candidate, int) or dir_fd not in (None, -1):
+                continue  # a descriptor, or a name relative to a directory descriptor (shutil.rmtree): not resolvable here
+            path = os.fsdecode(candidate)
+            if os.path.normcase(os.path.basename(path)) != os.path.normcase(_QUEUE_FILE):
+                continue
+            for directory, offences in tuple(_QUEUE_GUARDS):
+                try:
+                    same = os.path.samefile(os.path.dirname(path) or ".", directory)
+                except OSError:
+                    same = False
+                if same:
+                    offences.append(_queue_offence(event, path))
+    except Exception:  # noqa: BLE001 - an audit hook that raises would fail the code under test, not report it
+        return
+
+
+sys.addaudithook(_queue_audit_hook)
+
+
+@pytest.fixture(autouse=True)
+def _no_cwd_queue_leak() -> Iterator[None]:
+    """Error a test that writes ``pending_candidates.jsonl`` in the cwd it started in (#375).
+
+    An in-memory MemoryStore used to report the working directory as its persona dir, so 17
+    tests appended gated candidates to the repo root on every run, invisibly (it is gitignored)
+    and with later tests able to read the debris back. The directory is fixed at setup, so a test
+    that chdirs elsewhere still has its original cwd checked; a file that already exists is fine
+    as long as nothing writes, replaces, truncates, removes or moves it. The failure lands at
+    teardown (an immediate raise would be swallowed by code that catches errors) and names the
+    writer's call site. Only writes made by THIS process count: another xdist worker's leak is
+    that worker's test's failure, and a child process a test spawns is not observed.
+    """
+    directory = os.getcwd()
+    offences: list[str] = []
+    record = (directory, offences)
+    _QUEUE_GUARDS.append(record)
+    try:
+        yield
+    finally:
+        _QUEUE_GUARDS[:] = [guard for guard in _QUEUE_GUARDS if guard is not record]  # by identity: equal records may nest
+    assert not offences, (
+        f"this test wrote to {Path(directory) / _QUEUE_FILE}: " + "; ".join(offences) + ". A store with no persona "
+        "directory must not enqueue; give it a file-backed store (tmp_path / 'memories.db')"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -96,6 +419,139 @@ def _inhibit_bridge_background_threads(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _no_real_service_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    """#456 (D20): `supervisor start` and the kill helper ask whether the persona's OS service is installed, which reads
+    the real user's unit / plist / task. No test may route a start or a kill through a real service manager: every test
+    sees "not installed" unless it patches this itself (the service tests do, with spies)."""
+    monkeypatch.setattr("brain.bridge.kill.service_installed", lambda persona, platform=None: False, raising=False)
+
+
+class FakeRebuildChild:
+    """The handle `RebuildPopenRecorder` returns for the rebuild child: `pid`, `poll()`, `wait()`, `kill()` and `returncode`.
+
+    `poll()` answers None for the first `running_polls` calls (the child "still runs"), then `exit_code`; `kill()` ends it with -9.
+    `killed`, `waited` and `poll_calls` say what the code under test did to it.
+    """
+
+    def __init__(self, *, running_polls: int = 0, exit_code: int = 0) -> None:
+        self.pid = 424242
+        self.returncode: int | None = None
+        self.running_polls = running_polls
+        self.exit_code = exit_code
+        self.poll_calls = 0
+        self.killed = False
+        self.waited = False
+
+    def poll(self) -> int | None:
+        self.poll_calls += 1
+        if self.returncode is None and self.poll_calls > self.running_polls:
+            self.returncode = self.exit_code
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.waited = True
+        if self.returncode is None:
+            self.returncode = self.exit_code
+        return self.returncode
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+
+class RebuildPopenRecorder:
+    """Stands in for `subprocess.Popen` as `brain.bridge.daemon` sees it, in a test marked `real_rebuild_step`.
+
+    It answers only an argv that holds "supervisor" and "rebuild" (the rebuild child): the call is kept in `calls` as
+    `(argv, kwargs)` and a `FakeRebuildChild` is returned (`children`), set up from `running_polls` and `exit_code`; `error`, when
+    set, is raised instead of spawning. Any other spawn goes to `subprocess.Popen`, looked up in the real module when it is
+    called, so a test's own patch of that name takes effect.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], dict[str, Any]]] = []
+        self.children: list[FakeRebuildChild] = []
+        self.running_polls = 0
+        self.exit_code = 0
+        self.error: BaseException | None = None
+
+    def __call__(self, argv: Any, *args: Any, **kwargs: Any) -> Any:
+        if not (isinstance(argv, (list, tuple)) and "supervisor" in argv and "rebuild" in argv):
+            return subprocess.Popen(argv, *args, **kwargs)
+        self.calls.append((list(argv), dict(kwargs)))
+        if self.error is not None:
+            raise self.error
+        child = FakeRebuildChild(running_polls=self.running_polls, exit_code=self.exit_code)
+        self.children.append(child)
+        return child
+
+
+class RealPopenSpyLog:
+    """What a test marked `real_rebuild_child` gets: `popen` is `_RealPopenSpy`, a pass-through subclass of the real module's
+    `subprocess.Popen` built when the test runs, and `children` holds every handle it made (a real spawn, the handle kept)."""
+
+    def __init__(self) -> None:
+        self.children: list[subprocess.Popen] = []
+        log = self.children
+
+        class _RealPopenSpy(subprocess.Popen):
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                log.append(self)
+
+        self.popen = _RealPopenSpy
+
+
+@pytest.fixture(autouse=True)
+def _no_real_rebuild_child(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> RebuildPopenRecorder | RealPopenSpyLog | None:
+    """S107 (HS-T): no test may spawn the real rebuild child (`nell supervisor rebuild`) or leave a command run record behind.
+
+    Unless the test carries `@pytest.mark.real_rebuild_step(reason=...)`, `brain.bridge.daemon._rebuild_needed` answers False
+    (so a start, a run or a command on a temp persona has no rebuild to run) and `engine_files.register_command_run` does nothing
+    (the commands call it through the module). The patch imports `brain.emotion.engine_files` at setup, so a command that
+    imports it lazily later gets the no-op too and writes no record and registers no `atexit` hook.
+
+    For a test with the marker, the daemon module's `subprocess` name is replaced by a copy of the module (a
+    `types.SimpleNamespace` of `vars(subprocess)`) whose `Popen` alone differs, so no other module's spawn is touched: a
+    `RebuildPopenRecorder` (also returned by the `rebuild_spawns` fixture), or, for a test that also carries
+    `@pytest.mark.real_rebuild_child(reason=...)`, a `RealPopenSpyLog`'s spy class, which spawns for real. A test that patches
+    "brain.bridge.daemon.subprocess.Popen" by string path overwrites the replacement; its own patch takes effect.
+
+    Every patch is `raising=False` and string-path, so a base without these names only sets an attribute nothing reads (the
+    new-tests-fail-on-base check runs this conftest against old product code). The `daemon` patches import
+    `brain.bridge.daemon` in every test (a `sys.modules` guard would miss a lazy first import), and the `engine_files` one imports
+    `brain.emotion.engine_files` for the same reason, unless a base has no such module (`importlib.util.find_spec`).
+    (`_reset_emotion_engine_registry` keeps its own `sys.modules` guard on purpose: it must not import the engine.)
+    """
+    if request.node.get_closest_marker("real_rebuild_step") is None and request.node.get_closest_marker("real_rebuild_child") is None:
+        monkeypatch.setattr("brain.bridge.daemon._rebuild_needed", lambda *args, **kwargs: False, raising=False)
+        # The string path imports the module here, so a command that imports it later gets this no-op. A base without the module
+        # (the new-tests-fail-on-base check runs this conftest against old product code) has nothing to patch.
+        if importlib.util.find_spec("brain.emotion.engine_files") is not None:
+            monkeypatch.setattr("brain.emotion.engine_files.register_command_run", lambda persona_dir: None, raising=False)
+        return None
+    import types
+
+    spawns: RebuildPopenRecorder | RealPopenSpyLog
+    if request.node.get_closest_marker("real_rebuild_child") is not None:
+        spawns = RealPopenSpyLog()
+        popen: Any = spawns.popen
+    else:
+        spawns = popen = RebuildPopenRecorder()
+    module = types.SimpleNamespace(**vars(subprocess))
+    module.Popen = popen
+    monkeypatch.setattr("brain.bridge.daemon.subprocess", module, raising=False)
+    return spawns
+
+
+@pytest.fixture
+def rebuild_spawns(_no_real_rebuild_child: RebuildPopenRecorder | RealPopenSpyLog | None) -> RebuildPopenRecorder | RealPopenSpyLog:
+    """The recorder (or the real spy's log) of the rebuild child's spawns; the test must carry `real_rebuild_step`."""
+    assert _no_real_rebuild_child is not None, "mark the test @pytest.mark.real_rebuild_step(reason=...)"
+    return _no_real_rebuild_child
+
+
+@pytest.fixture(autouse=True)
 def _reset_pass2_queue() -> Iterator[None]:
     """Reset pass2_queue global state before and after each test.
 
@@ -108,6 +564,132 @@ def _reset_pass2_queue() -> Iterator[None]:
     pass2_queue.reset()
     yield
     pass2_queue.reset()
+
+
+@pytest.fixture(autouse=True)
+def _reset_emotion_engine_registry() -> Iterator[None]:
+    """Clear the emotion engine registry (`engine_for`) before and after each test.
+
+    Engines are one per resolved persona directory, and a store write now reaches the engine for its directory, so a
+    leaked instance (and its state cache) must not outlive its test. It acts only when `brain.emotion.engine` is already
+    imported, and imports nothing from `brain.emotion` itself: the new-tests-must-fail job runs this conftest against
+    product code that has no engine module, and an import here would fail every test there (`CANARY FAILED`).
+    """
+
+    def clear() -> None:
+        module = sys.modules.get("brain.emotion.engine")
+        if module is not None:
+            with module._engines_lock:
+                module._engines.clear()
+
+    clear()
+    yield
+    clear()
+
+
+class EmotionEngineStub:
+    """A settable stand-in for the emotion engine, for tests of the callers (see the `emotion_engine_stub` fixture).
+
+    Every public call of the engine exists. `recorded_calls` holds one entry per hook call, per `note_active` call and per
+    `ensure_ready` / `recovery_rebuild` call, `(name, *arguments in the call's own order)`, for example
+    `("on_memory_shown", memory, at)`, `("note_active", now)` or `("ensure_ready",)`; the real engine keeps no such list. The rest is
+    settable: `readings` (what `read()` returns), `live`, `recovery_needed` (what `needs_recovery()` answers), `high` (the names `feels_high` answers True for, whatever
+    `readings` holds, so a reader's test says which feelings are high independently of the numbers it feeds), `faded`
+    (`(memory_id, emotion) -> value`, else the stored value), `engine_status` and `last_fold_at` (a fixed
+    instant well before any test's "now", so a site that compares its own time with it sees a nonzero interval).
+    """
+
+    def __init__(self) -> None:
+        from datetime import UTC, datetime
+
+        from brain.emotion.engine import EngineStatus
+
+        self.recorded_calls: list[tuple[Any, ...]] = []
+        self.readings: dict[str, Any] = {}
+        self.live = False
+        self.high: set[str] = set()
+        self.faded: dict[tuple[str, str], float] = {}
+        self.engine_status = EngineStatus(True, None)
+        self.recovery_needed = False
+        self.last_fold_at = datetime(2000, 1, 1, tzinfo=UTC)
+
+    def on_memory_committed(self, memory: Any) -> None:
+        self.recorded_calls.append(("on_memory_committed", memory))
+
+    def on_emotions_assigned(self, memory: Any) -> None:
+        self.recorded_calls.append(("on_emotions_assigned", memory))
+
+    def fold_change(self, emotions: Any, at: Any, source: str) -> None:
+        self.recorded_calls.append(("fold_change", emotions, at, source))
+
+    def on_memory_shown(self, memory: Any, at: Any) -> None:
+        self.recorded_calls.append(("on_memory_shown", memory, at))
+
+    def note_active(self, now: Any) -> None:
+        self.recorded_calls.append(("note_active", now))
+
+    def batch(self) -> AbstractContextManager[None]:
+        """A context manager that does nothing (the real engine's `batch()` collects events; a caller's test needs only the call to work)."""
+        return nullcontext()
+
+    def read(self) -> dict[str, Any]:
+        return dict(self.readings)
+
+    def is_live(self) -> bool:
+        return self.live
+
+    def feels_high(self, name: str) -> bool:
+        return name in self.high
+
+    def faded_value(self, memory: Any, emotion: str) -> float:
+        """The settable faded value (else the stored one), held to 0-10 as the real `faded_value` holds its result."""
+        from brain.emotion.engine_utils import resolve_emotions
+        from brain.emotion.vocabulary import canonical_name
+
+        value = self.faded.get((memory.id, emotion), memory._stored_emotions[emotion])
+        return resolve_emotions({emotion: value}).get(canonical_name(emotion), 0.0)
+
+    def memory_feelings(self, memory: Any) -> Any:
+        """The real pure read over the memory with each emotion's value replaced by what this stub's `faded_value` answers."""
+        from dataclasses import replace
+
+        from brain.emotion.engine_utils import memory_feelings
+
+        shown = replace(
+            memory,
+            _stored_emotions={name: self.faded_value(memory, name) for name in memory._stored_emotions},
+        )
+        return memory_feelings(shown, None, None, None)
+
+    def status(self) -> Any:
+        return self.engine_status
+
+    def ensure_ready(self) -> None:
+        """What `engine.ensure_engine_ready(<directory>)` reaches through the patched `engine_for`: recorded, and nothing happens.
+
+        Only the rebuild process calls it (`nell supervisor rebuild`); the bridge and the commands do not.
+        """
+        self.recorded_calls.append(("ensure_ready",))
+
+    def needs_recovery(self) -> bool:
+        return self.recovery_needed
+
+    def recovery_rebuild(self) -> None:
+        self.recorded_calls.append(("recovery_rebuild",))
+
+
+@pytest.fixture
+def emotion_engine_stub(monkeypatch: pytest.MonkeyPatch) -> EmotionEngineStub:
+    """Make `engine.engine_for(<any directory>)` return one settable `EmotionEngineStub`.
+
+    Callers use the receiver form `engine.engine_for(persona_dir).<call>`, so patching the module attribute reaches every
+    call site. The module is imported here, in the body, so a test that does not ask for the stub never needs it.
+    """
+    from brain.emotion import engine
+
+    stub = EmotionEngineStub()
+    monkeypatch.setattr(engine, "engine_for", lambda persona_dir: stub)
+    return stub
 
 
 @pytest.fixture(autouse=True)
@@ -310,8 +892,9 @@ def _fake_reranker_provider_by_default(
 @pytest.fixture(autouse=True)
 def _reset_reranker_provider_cache() -> Iterator[None]:
     """Reset reranker.build_reranker_provider()'s process-level provider
-    cache, its warm-latency cache, its warm-memory cache (pre-flip revision
-    Change 3 — mirrors the warm-latency cache, same rationale), and
+    cache, the per-message width fit's rerank cost model (running sums and
+    warm-up state per reranker model id; name-recall fix R1, plan P-24 —
+    replaces the removed hourly warm-latency / warm-memory caches), and
     floor_calibration's bootstrap-floor cache (F2a inc8, #250 §7 UPDATED)
     before and after each test — mirrors `_reset_embedding_provider_cache`
     above for the same reason (a test that calls the REAL `build_reranker_
@@ -321,14 +904,231 @@ def _reset_reranker_provider_cache() -> Iterator[None]:
     from brain.memory import floor_calibration, reranker
 
     reranker._reset_reranker_provider_cache()
-    reranker._reset_latency_cache()
-    reranker._reset_memory_cache()
+    reranker._reset_rerank_cost_model()
     floor_calibration._reset_bootstrap_floor_cache()
+    floor_calibration._reset_cosine_bootstrap_floor_cache()
     yield
     reranker._reset_reranker_provider_cache()
-    reranker._reset_latency_cache()
-    reranker._reset_memory_cache()
+    reranker._reset_rerank_cost_model()
     floor_calibration._reset_bootstrap_floor_cache()
+    floor_calibration._reset_cosine_bootstrap_floor_cache()
+
+
+@pytest.fixture(autouse=True)
+def _paragraph_time_model_reset(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Name-recall fix R6 (plan P-24): reset the per-message budget's running
+    averages (`T_m`, `T_p`) before and after each test, and freeze the budget
+    clock (`semantic_recall._clock`) at 0 so every test sees `T_m = T_p = 0`
+    and the whole rerank budget, exactly as before R6, unless it scripts the
+    clock itself (the per-paragraph budget tests do)."""
+    from brain.memory import semantic_recall
+
+    semantic_recall._reset_paragraph_time_model()
+    monkeypatch.setattr(semantic_recall, "_clock", lambda: 0.0)
+    yield
+    semantic_recall._reset_paragraph_time_model()
+
+
+@pytest.fixture(autouse=True)
+def _keyword_budget_reset(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Long-paste increment (S103, plan P-3): reset the keyword extra-words cost
+    series and re-arm its first-sample discard before and after each test, and
+    freeze the budget clock (`keyword_budget._clock`) at 0, so an unscripted
+    test sees `left` = the whole budget and a seed rate of 0 (every extra word
+    fits), exactly as before S103, unless it scripts the clock itself."""
+    from brain.memory import keyword_budget
+
+    keyword_budget._reset_keyword_cost()
+    monkeypatch.setattr(keyword_budget, "_clock", lambda: 0.0)
+    yield
+    keyword_budget._reset_keyword_cost()
+
+
+@pytest.fixture(autouse=True)
+def _tunables_values_cache_reset() -> Iterator[None]:
+    """#462: forget the cached tunables values before and after each test.
+
+    `tunables._load_values_locked` caches the parsed values (a content failure too) keyed on the file's stat signature.
+    Only the cache is cleared: the registry that modules fill at import time is left alone.
+    """
+    from brain import tunables
+
+    tunables._reset_values_cache()
+    yield
+    tunables._reset_values_cache()
+
+
+_REAL_TUNABLE_KEYS: frozenset[str] | None = None
+
+
+def _real_tunable_keys() -> frozenset[str]:
+    """Every literal key a ``tunables.register`` call in brain/ declares (an AST scan, once per session)."""
+    global _REAL_TUNABLE_KEYS
+    if _REAL_TUNABLE_KEYS is None:
+        from tests.tunables_file import registered_literal_keys
+
+        keys = registered_literal_keys(Path(__file__).resolve().parents[1])
+        _REAL_TUNABLE_KEYS = frozenset(keys)
+    return _REAL_TUNABLE_KEYS
+
+
+@pytest.fixture(autouse=True)
+def _tunables_registry_restore() -> Iterator[None]:
+    """A test may clear the tunables registry (``_reset_for_tests``) or register throwaway keys. The registry that modules fill
+    at import time must survive for the tests after it, so restore it: the state before the test, plus any real brain key the
+    test's own imports registered (a module imported for the first time inside a test stays imported)."""
+    from brain import tunables
+
+    with tunables._lock:
+        saved = (dict(tunables._registry), dict(tunables._descriptions))
+    yield
+    real = _real_tunable_keys()
+    with tunables._lock:
+        kept = {k: v for k, v in tunables._registry.items() if k in real}
+        kept_desc = {k: v for k, v in tunables._descriptions.items() if k in real}
+        tunables._registry.clear()
+        tunables._registry.update(saved[0])
+        tunables._registry.update(kept)
+        tunables._descriptions.clear()
+        tunables._descriptions.update(saved[1])
+        tunables._descriptions.update(kept_desc)
+
+
+@pytest.fixture(autouse=True)
+def _vocabulary_registry_restore() -> Iterator[None]:
+    """A test may register an extension emotion (``vocabulary.register``, loading a persona vocabulary); that may not reach
+    the next test, whatever worker runs it (#540). Restored IN PLACE (clear + update), never rebound, like
+    ``tests/harness/sandbox.py`` does for a sandboxed run: readers hold the dict object itself."""
+    from brain.emotion import vocabulary
+
+    saved_registry = dict(vocabulary._REGISTRY)
+    yield
+    vocabulary._REGISTRY.clear()
+    vocabulary._REGISTRY.update(saved_registry)
+
+
+@pytest.fixture(autouse=True)
+def _cost_series_state_reset(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Cost-series increment (S146, S159, S163, S164): empty the in-process
+    sample buffer and the warn-once flags before and after each test, and give
+    every test a fixed machine id so no test writes `machine_id` into a real
+    home directory. The `machine_id` tests clear `_machine_override` themselves
+    and point `KINDLED_HOME` at a tmp path."""
+    from brain.memory import cost_series
+
+    cost_series._reset_pending()
+    cost_series._reset_machine_id()
+    monkeypatch.setattr(cost_series, "_machine_override", "test-machine")
+    yield
+    cost_series._reset_pending()
+    cost_series._reset_machine_id()
+
+
+@pytest.fixture(autouse=True)
+def _floor_bootstrap_background_off_by_default(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[None]:
+    """Keep the floor bootstraps' background starters (name-recall fix S91/S92:
+    the process-start thread `start_background`, the first-need rerank request
+    and the on-each-message retry) from spawning threads in unrelated tests: a
+    recall without a rerank floor or a `respond()` after a failed bootstrap
+    would otherwise leak a daemon thread that computes (and caches) a floor
+    after this test's teardown reset. The bookkeeping (need flag, failed
+    record) still happens; tests of the starters themselves flip
+    `floor_startup._background_inhibited` back. Also clears the in-flight slots
+    before and after each test."""
+    from brain.memory import floor_startup
+
+    monkeypatch.setattr(floor_startup, "_background_inhibited", True)
+    monkeypatch.setattr(floor_startup, "_marker_provider", floor_startup._no_marker)  # noqa: SLF001
+    monkeypatch.setattr(floor_startup, "_ram_figure_persona_dir", None)  # noqa: SLF001
+    monkeypatch.setattr(floor_startup, "_ram_figure_requested", False)  # noqa: SLF001
+    floor_startup._inflight.clear()  # noqa: SLF001
+    yield
+    floor_startup._inflight.clear()  # noqa: SLF001
+
+
+@pytest.fixture(autouse=True)
+def _ram_figure_not_required_by_default(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """S200: a recall on a machine with no usable memory model takes the cosine path
+    until the lull job has measured one. The suite's recall tests build reranks from
+    fakes with no seeded figure, so the requirement is off by default; the S200
+    tests set `reranker._require_ram_figure` True themselves. Also clears the
+    need flags and attempt stamps before and after each test."""
+    from brain.memory import peak_rss, reranker
+
+    monkeypatch.setattr(reranker, "_require_ram_figure", False)
+    # S253: the free-memory check before the model load reads the host's memory and the model cache:
+    # off by default so no test depends on either; its own tests restore the real function.
+    monkeypatch.setattr(reranker, "model_load_blocked_by_memory", lambda: False)
+    # S255: the memory fit's safety factor is 1.0 in the suite so the many tests that pin exact
+    # arithmetic (a headroom equal to a prediction) keep their meaning; the tests of the factor itself
+    # (test_ram_fit.py, test_ram_ladder.py, test_not_loaded_batch_check.py) set the shipped value explicitly.
+    from brain import dev_constants
+
+    monkeypatch.setattr(dev_constants, "RAM_FIT_SAFETY_FACTOR", 1.0)
+    # S220: the per-call peak reader is process-wide (on Linux it resets the kernel's peak
+    # counter; elsewhere, S248, it samples the RSS in a thread): off by default so the suite's
+    # fake rerankers neither touch /proc nor start a sampler nor record memory samples; the
+    # reader's own tests and the S200/S220 gate tests turn it on.
+    monkeypatch.setattr(peak_rss, "_disabled", True)
+    peak_rss._reset_for_tests()  # noqa: SLF001
+    reranker._ram_figure_needed.clear()  # noqa: SLF001
+    reranker._ram_figure_attempt.clear()  # noqa: SLF001
+    yield
+    reranker._ram_figure_needed.clear()  # noqa: SLF001
+    reranker._ram_figure_attempt.clear()  # noqa: SLF001
+
+
+@pytest.fixture(autouse=True)
+def _cosine_floor_never_clears_by_default(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default the COSINE bootstrap floor (name-recall fix R2, plan P-24) to a
+    value no cosine similarity can reach, mirroring
+    `_fake_reranker_provider_by_default`'s "unscripted scores never clear the
+    floor" default.
+
+    With the no-rerank path, a test whose store has fewer than 5 embedded
+    candidates (or a reranker that fails) now reaches the cosine gate instead
+    of returning `None`. Left to the real bootstrap, the offline fake
+    embedder's arbitrary cosines would fit an arbitrary floor and some
+    candidates could clear it by accident; pinning the floor above 1.0 keeps
+    every such test on its old keyword-only outcome. A test that wants the
+    cosine path to pass either persists a row (`store.write_cosine_floor`) or
+    monkeypatches `floor_calibration.get_cosine_bootstrap_floor` itself; a
+    test of the real bootstrap calls the function object it imported at
+    module load (this patch replaces only the module attribute).
+    """
+    if "requires_network" in request.keywords:
+        return
+    from brain.memory import floor_calibration
+
+    monkeypatch.setattr(
+        floor_calibration,
+        "get_cosine_bootstrap_floor",
+        lambda embedder_model_id: {
+            "embedder_model_id": embedder_model_id,
+            "floor": 2.0,
+            "raw_fit_floor": 2.0,
+            "sample_pairs": 0,
+            "is_cold_start": True,
+            "updated_at": None,
+        },
+    )
+
+
+@pytest.fixture(autouse=True)
+def _reset_known_names_cache() -> Iterator[None]:
+    """Drop brain.memory.known_names's process-level per-path list cache before
+    and after each test (name-recall fix N1, P-24): a test that reads the list
+    through the cache must not see one a prior/later test cached, and a stale
+    entry could otherwise survive a tmp_path reuse of the same signature."""
+    from brain.memory import known_names
+
+    known_names._reset_cache()
+    yield
+    known_names._reset_cache()
 
 
 @pytest.fixture(autouse=True)
@@ -417,3 +1217,208 @@ def clean_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     ]:
         monkeypatch.delenv(key, raising=False)
     yield
+
+
+_WEDGED_HOLDER = """
+import sys
+sys.path.insert(0, {root!r})
+from pathlib import Path
+from brain.utils.file_lock import file_lock
+with file_lock(Path(sys.argv[1])):
+    print("READY", flush=True)
+    sys.stdin.read()
+"""
+
+
+@pytest.fixture
+def wedged_lock(repo_root: Path) -> Callable[[Path], AbstractContextManager[None]]:
+    """Hold ``file_lock(path)`` in ANOTHER process for the length of a ``with`` block (a wedged lock holder).
+
+    The holder never releases until the block ends, so a bounded wait must give up and a caller must not write. This
+    form starts an interpreter, so only the test that needs the lock held by another PROCESS uses it
+    (``test_locked_within.py::test_timeout_raises_and_the_body_never_runs``); the rest use ``held_lock``.
+    """
+
+    @contextmanager
+    def _hold(path: Path) -> Iterator[None]:
+        code = _WEDGED_HOLDER.format(root=str(repo_root))
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code, str(path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert proc.stdout is not None
+            assert proc.stdout.readline().strip() == "READY"
+            yield
+        finally:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            proc.wait(timeout=20)
+
+    return _hold
+
+
+@pytest.fixture
+def held_lock() -> Callable[[Path], AbstractContextManager[None]]:
+    """Hold ``file_lock(path)`` on a thread of THIS process for the length of a ``with`` block (a wedged lock holder).
+
+    The cheap form of ``wedged_lock``: ``file_lock`` opens its own descriptor (``flock`` on POSIX, ``msvcrt.locking`` on its
+    own handle on Windows), so a second ``file_lock`` of the same path contends with the holder even inside one process, and
+    a test that asserts "a bounded wait gives up and nothing is written" needs no interpreter start. The holder never
+    releases until the block ends. Only a test about the lock crossing a process boundary needs ``wedged_lock``.
+    """
+    from brain.utils.file_lock import file_lock
+
+    @contextmanager
+    def _hold(path: Path) -> Iterator[None]:
+        held = threading.Event()
+        release = threading.Event()
+        failure: list[BaseException] = []
+
+        def _holder() -> None:
+            try:
+                with file_lock(path):
+                    held.set()
+                    release.wait(60)
+            except BaseException as exc:  # reported by the test thread below, not lost on a daemon thread
+                failure.append(exc)
+                held.set()
+
+        thread = threading.Thread(target=_holder, name="held-lock", daemon=True)
+        thread.start()
+        try:
+            assert held.wait(10), "the holder thread never took the lock"
+            assert not failure, f"the holder thread could not take the lock: {failure[0]!r}"
+            yield
+        finally:
+            release.set()
+            thread.join(10)
+        assert not thread.is_alive(), "the holder thread did not let go of the lock"
+        assert not failure, f"the holder thread failed: {failure[0]!r}"
+
+    return _hold
+
+
+_OK_FRAME = (
+    '{"type": "result", "subtype": "success", "is_error": false, "result": "OK", "duration_ms": 1, "num_turns": 1}\n'
+)
+
+
+def _rejection_frame(model: str) -> str:
+    import json
+
+    return (
+        json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "is_error": True,
+                "api_error_status": 404,
+                "result": f"There's an issue with the selected model ({model}). It may not exist or you may not have "
+                "access to it.",
+            }
+        )
+        + "\n"
+    )
+
+
+class ClaudeArgvCapture:
+    """Every ``claude`` argv the provider spawned, and the answer each one got (#529 test instrument).
+
+    ``reject(id)`` makes the CLI answer that model id with its real rejection frame (exit 1, status 404, the
+    "issue with the selected model" sentence); every other id gets a clean frame. The seam is the subprocess call the
+    provider tests already patch, so the argv is built by the real provider code.
+    """
+
+    def __init__(self) -> None:
+        self.argvs: list[list[str]] = []
+        self.rejected: set[str] = set()
+
+    def reject(self, *models: str) -> None:
+        self.rejected.update(models)
+
+    def accept(self, *models: str) -> None:
+        self.rejected.difference_update(models)
+
+    @staticmethod
+    def model_of(argv: list[str]) -> str:
+        return argv[argv.index("--model") + 1]
+
+    @property
+    def models(self) -> list[str]:
+        """The ``--model`` value of every spawn, in order."""
+        return [self.model_of(a) for a in self.argvs]
+
+    @property
+    def last_model(self) -> str:
+        return self.models[-1]
+
+    def _answer(self, cmd: list[str]) -> tuple[int, str]:
+        self.argvs.append(list(cmd))
+        model = self.model_of(cmd)
+        if model in self.rejected:
+            return 1, _rejection_frame(model)
+        return 0, _OK_FRAME
+
+
+@pytest.fixture
+def capture_claude_argv(monkeypatch: pytest.MonkeyPatch) -> ClaudeArgvCapture:
+    """Patch the provider's subprocess seam (run and Popen) and record every argv (see ``ClaudeArgvCapture``)."""
+    import io
+
+    from brain.bridge import provider as provider_mod
+
+    cap = ClaudeArgvCapture()
+    real_run, real_popen = subprocess.run, subprocess.Popen  # `subprocess` is one module: only `claude` is faked
+
+    def fake_run(cmd, *args, **kwargs):
+        if not (isinstance(cmd, list) and cmd and cmd[0] == "claude"):
+            return real_run(cmd, *args, **kwargs)
+        rc, out = cap._answer(cmd)
+        return subprocess.CompletedProcess(args=cmd, returncode=rc, stdout=out, stderr="")
+
+    class FakePopen(real_popen):  # type: ignore[misc, valid-type]
+        def __new__(cls, cmd, *args, **kwargs):
+            if not (isinstance(cmd, list) and cmd and cmd[0] == "claude"):
+                return real_popen(cmd, *args, **kwargs)
+            return super().__new__(cls)
+
+        def __init__(self, cmd, *args, **kwargs):
+            self._rc, out = cap._answer(cmd)
+            self.stdin = io.StringIO()
+            self.stdout = iter(out.splitlines(keepends=True))
+            self.stderr = io.StringIO("")
+            self.pid = 4242
+
+        def wait(self, timeout=None):
+            return self._rc
+
+        def poll(self):
+            return self._rc
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(provider_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(provider_mod.subprocess, "Popen", FakePopen)
+    return cap
+
+
+@pytest.fixture
+def model_override() -> Callable[[str, str | None], None]:
+    """Set (or with ``None`` clear) one job's model in the sandbox home's tunables file, through the one writer.
+
+    ``model_override(tier, value)`` is ``set_job_models({tier: value})`` under the per-test home, so the write rule
+    applies (a word that means the job's default removes the line, a full id is written as given).
+    """
+    from brain.bridge.model_tier import set_job_models
+
+    def _set(tier: str, value: str | None) -> None:
+        set_job_models({tier: value})
+
+    return _set

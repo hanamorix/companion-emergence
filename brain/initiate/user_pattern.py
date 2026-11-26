@@ -7,9 +7,11 @@ check_send_allowed to adjust gate thresholds in real time.
 jsonl and/or initiate_audit.jsonl from scratch on EVERY call. As of this
 redesign, only ignore_streak still reads initiate_audit.jsonl on every call
 — and only a small bounded tail window of it, never the whole file (see
-``_compute_ignore_streak_bounded``). silence_days and likely_active are
-derived from a small persisted sidecar (``brain.initiate.presence_state``)
-that's rebuilt from a full scan at most once/24h; response_lag_p50 is
+``_compute_ignore_streak_bounded``). likely_active is derived from a small
+persisted sidecar (``brain.initiate.presence_state``) that's rebuilt from a
+full scan at most once/24h; silence_days is read from the conversation
+files on every call through ``brain.ingest.buffer.last_user_turn_ts``
+(engine rework S6: one source with ``days_since_human``); response_lag_p50 is
 folded incrementally at the point a reply is recorded
 (``brain.initiate.audit.update_audit_state``'s reply-lag hook). The
 original from-scratch ``_compute_*`` helpers below are KEPT as reference/
@@ -20,15 +22,16 @@ check the new incremental paths against.
 """
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from brain.bridge.persisted_cadence import advance, is_due, load_cadence, save_cadence
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt, read_last_n_jsonl_lines
+from brain.health.json_io import Recovery, iter_jsonl, read_jsonl, read_jsonl_tail
 from brain.initiate import presence_state
+from brain.utils.log_throttle import warn_throttled
+from brain.utils.time import lenient_utc
 
 log = logging.getLogger(__name__)
 
@@ -42,8 +45,9 @@ _SEND_DECISIONS = frozenset({"send_notify", "send_quiet"})
 _STREAK_STATES = frozenset({"unanswered", "dismissed"})
 _RESET_STATES = frozenset({"replied_explicit", "acknowledged_unclear"})
 
-# Daily recompute cadence (silence-days last-seen bootstrap, likely-active
-# histogram rebuild, and the one-time reply-lag bootstrap) — reuses the
+# Daily recompute cadence (likely-active histogram rebuild, the one-time
+# reply-lag bootstrap, and the last-seen merge that silence_days no longer
+# reads, see compute_user_presence) — reuses the
 # generic persisted_cadence.py mechanism (#225).
 _PRESENCE_DAILY_CADENCE_FILENAME = "presence_daily_cadence.json"
 _PRESENCE_DAILY_INTERVAL_S = 86400.0
@@ -77,54 +81,6 @@ class UserPresence:
 
 
 # ---------------------------------------------------------------------------
-# silence-days — reference implementation (kept, unchanged; not used by
-# compute_user_presence anymore, which derives silence_days from
-# presence_state.last_seen_ts instead — see _daily_scan_conversations /
-# _run_daily_presence_recompute below for the incremental replacement).
-# ---------------------------------------------------------------------------
-
-
-def _compute_silence_days(persona_dir: Path, *, _now: datetime | None = None) -> float:
-    """Return days since the most recent inbound (non-companion) chat turn.
-
-    Returns 0.0 when no buffer files exist or no inbound turns are found —
-    uncertainty stays permissive.
-    """
-    conversations_dir = persona_dir / _ACTIVE_CONVERSATIONS_DIR
-    if not conversations_dir.exists():
-        return 0.0
-
-    now = _now or datetime.now(UTC)
-    companion_name = persona_dir.name.lower()
-    latest_ts: datetime | None = None
-
-    for jsonl_file in conversations_dir.glob("*.jsonl"):
-        for row in read_jsonl_skipping_corrupt(jsonl_file):
-            speaker = str(row.get("speaker", "")).lower()
-            if speaker == companion_name:
-                continue
-            # A compaction `summary` row is not a real user turn — its
-            # compaction-time ts must not corrupt the "last user message" signal.
-            if speaker == "summary":
-                continue
-            ts_str = row.get("ts")
-            if not ts_str:
-                continue
-            try:
-                ts = datetime.fromisoformat(ts_str)
-                if ts.tzinfo is None:
-                    ts = ts.replace(tzinfo=UTC)
-                if latest_ts is None or ts > latest_ts:
-                    latest_ts = ts
-            except (ValueError, TypeError):
-                continue
-
-    if latest_ts is None:
-        return 0.0
-    return max(0.0, (now - latest_ts).total_seconds() / 86400.0)
-
-
-# ---------------------------------------------------------------------------
 # ignore-streak — walk logic shared, unchanged, between the full-scan oracle
 # and the new bounded-window production path (#225 round 6/7).
 # ---------------------------------------------------------------------------
@@ -136,7 +92,7 @@ def _ignore_streak_from_rows(rows: list[dict]) -> int:
 
     Extracted verbatim from what `_compute_ignore_streak` has always done —
     byte-identical walk, operating on plain dicts (matching what
-    read_jsonl_skipping_corrupt/read_last_n_jsonl_lines produce). Shared,
+    read_jsonl/read_jsonl_tail produce). Shared,
     unchanged, between `_compute_ignore_streak`'s full-file oracle and
     `_compute_ignore_streak_bounded`'s bounded production path so exact
     parity holds by construction, not by re-derivation.
@@ -166,36 +122,8 @@ def _compute_ignore_streak(persona_dir: Path) -> int:
     if not audit_path.exists():
         return 0
 
-    rows = read_jsonl_skipping_corrupt(audit_path)
+    rows = read_jsonl(audit_path, recover=Recovery.RAISE)
     return _ignore_streak_from_rows(rows)
-
-
-def _parse_lines_skipping_corrupt(lines: list[str]) -> list[dict]:
-    """Parse raw JSONL text lines with the same skip/log/continue discipline
-    `read_jsonl_skipping_corrupt` uses, for lines already obtained via a
-    bounded tail read (so this never re-reads the file itself)."""
-    rows: list[dict] = []
-    for raw in lines:
-        stripped = raw.rstrip("\r\n")
-        if not stripped.strip():
-            continue
-        try:
-            data = json.loads(stripped)
-        except json.JSONDecodeError as exc:
-            log.warning(
-                "skipping malformed jsonl line in bounded ignore-streak read: %s | content: %r",
-                exc,
-                stripped[:201],
-            )
-            continue
-        if isinstance(data, dict):
-            rows.append(data)
-        else:
-            log.warning(
-                "skipping non-dict jsonl line in bounded ignore-streak read (value type=%s)",
-                type(data).__name__,
-            )
-    return rows
 
 
 def _read_ignore_streak_window(persona_dir: Path, n: int) -> list[dict]:
@@ -212,8 +140,7 @@ def _read_ignore_streak_window(persona_dir: Path, n: int) -> list[dict]:
     included closes that gap by construction.
     """
     path = persona_dir / _COLD_START_STREAK_AUDIT_FILENAME
-    raw_lines = read_last_n_jsonl_lines(path, n + _TIE_MARGIN)
-    rows = _parse_lines_skipping_corrupt(raw_lines)
+    rows = read_jsonl_tail(path, n + _TIE_MARGIN, recover=Recovery.RAISE)
     if len(rows) <= n:
         return rows  # whole read fits inside the nominal window; no tie risk
     # rows are in original file order (oldest first); the naive cutoff would
@@ -297,32 +224,59 @@ def _has_resolution(rows: list[dict]) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _archived_user_turn_times(persona_dir: Path, cutoff: datetime, seen: set[tuple]) -> list[datetime]:
+    """The times at or after ``cutoff`` of the archived user turns whose identity is not in ``seen`` (#804).
+
+    A closed session's buffer is archived in full and then deleted, so most of the 30 days of history is here, not in
+    ``active_conversations/``. A turn can be in more than one archive file, or twice in one: a close repeated after a crash
+    between the append and its commit marker writes the batch again, and a buffer kept because it changed during its close is
+    archived again at the next close. Each turn is counted once, by ``turn_identity``; ``seen`` holds the active rows already
+    counted and gains every archived one. Only files last written since ``cutoff`` are opened. A file that cannot be read
+    ends with a warning and the others still count."""
+    # Imported here, not at the top: brain.ingest pulls the ingest pipeline and the provider stack.
+    from brain.ingest.buffer import archived_files_written_since, turn_identity
+
+    times: list[datetime] = []
+    for path in archived_files_written_since(persona_dir, cutoff):
+        for row in iter_jsonl(path):
+            if row.get("speaker") != "user":  # the #621 rule, as in the active scan
+                continue
+            ts = lenient_utc(row.get("ts"))
+            if ts is None or ts < cutoff:
+                continue
+            identity = turn_identity(row)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            times.append(ts)
+    return times
+
+
 def _build_hour_histogram(
     persona_dir: Path, *, _now: datetime | None = None
 ) -> tuple[list[int] | None, int | None]:
-    """Scan active_conversations/*.jsonl and build the 24-bucket local-hour
-    histogram + active-percentile threshold used by likely-active-at-hour.
+    """Scan active_conversations/*.jsonl and the archived sessions and build the
+    24-bucket local-hour histogram + active-percentile threshold used by
+    likely-active-at-hour (each archived turn counted once, #804).
 
-    Returns (None, None) when there's no conversations dir or fewer than
-    _SCHEDULE_MIN_TURNS turns in the _SCHEDULE_LOOKBACK_DAYS window
-    (insufficient data -> permissive default upstream).
+    Returns (None, None) when there are fewer than _SCHEDULE_MIN_TURNS turns in
+    the _SCHEDULE_LOOKBACK_DAYS window (insufficient data -> permissive default
+    upstream).
     """
     conversations_dir = persona_dir / _ACTIVE_CONVERSATIONS_DIR
-    if not conversations_dir.exists():
-        return None, None
     now = _now or datetime.now(UTC)
     cutoff = now - timedelta(days=_SCHEDULE_LOOKBACK_DAYS)
     hour_counts: list[int] = [0] * 24
     total = 0
+    seen: set[tuple] = set()
+    # Imported here, not at the top: brain.ingest pulls the ingest pipeline and the provider stack.
+    from brain.ingest.buffer import turn_identity
+
     for jsonl_file in conversations_dir.glob("*.jsonl"):
-        for row in read_jsonl_skipping_corrupt(jsonl_file):
-            speaker = str(row.get("speaker", "")).lower()
-            if speaker == persona_dir.name.lower():
-                continue
-            # A compaction `summary` row is not a real user turn — exclude from
-            # hour-distribution so the active-window inference isn't skewed by
-            # compaction-time timestamps.
-            if speaker == "summary":
+        for row in iter_jsonl(jsonl_file, recover=Recovery.RAISE):
+            # Only the user's rows (#621): the kindled's are "assistant", plus
+            # "image" annotation rows and the compaction "summary" row.
+            if row.get("speaker") != "user":
                 continue
             ts_str = row.get("ts")
             if not ts_str:
@@ -335,8 +289,12 @@ def _build_hour_histogram(
                     continue
                 hour_counts[ts.astimezone().hour] += 1
                 total += 1
+                seen.add(turn_identity(row))
             except (ValueError, TypeError):
                 continue
+    for ts in _archived_user_turn_times(persona_dir, cutoff, seen):
+        hour_counts[ts.astimezone().hour] += 1
+        total += 1
     if total < _SCHEDULE_MIN_TURNS:
         return None, None
     sorted_counts = sorted(hour_counts)
@@ -374,7 +332,7 @@ def _read_valid_reply_lags(persona_dir: Path) -> list[float]:
         return []
 
     lags: list[float] = []
-    for row in read_jsonl_skipping_corrupt(audit_path):
+    for row in iter_jsonl(audit_path, recover=Recovery.RAISE):
         if row.get("decision") not in _SEND_DECISIONS:
             continue
         delivery = row.get("delivery") or {}
@@ -431,28 +389,31 @@ def _compute_response_lag_p50(persona_dir: Path) -> float | None:
 def _daily_scan_conversations(
     persona_dir: Path, *, _now: datetime | None = None
 ) -> tuple[list[int] | None, int | None, str | None]:
-    """One pass over active_conversations/*.jsonl for the daily recompute:
-    builds the likely-active hour histogram (30-day lookback) AND finds the
-    max inbound-turn ts across ALL history (no lookback cutoff) in the same
-    loop, so silence-days' bootstrap doesn't need a second full scan.
+    """One pass over active_conversations/*.jsonl and the archived sessions for
+    the daily recompute: builds the likely-active hour histogram (30-day
+    lookback, each archived turn counted once, #804) AND finds the max
+    inbound-turn ts across ALL of the active files' history (no lookback
+    cutoff) in the same loop, for the persisted last-seen timestamp (which
+    silence_days no longer reads: it comes from ``last_user_turn_ts``).
 
     Returns (hour_counts, active_threshold, latest_ts_iso) — any of which
-    may be None (no conversations dir, or no qualifying rows).
+    may be None (no qualifying rows).
     """
     conversations_dir = persona_dir / _ACTIVE_CONVERSATIONS_DIR
-    if not conversations_dir.exists():
-        return None, None, None
     now = _now or datetime.now(UTC)
     cutoff = now - timedelta(days=_SCHEDULE_LOOKBACK_DAYS)
-    companion_name = persona_dir.name.lower()
     hour_counts: list[int] = [0] * 24
     total = 0
     latest_ts: datetime | None = None
+    seen: set[tuple] = set()
+    # Imported here, not at the top: brain.ingest pulls the ingest pipeline and the provider stack.
+    from brain.ingest.buffer import turn_identity
 
     for jsonl_file in conversations_dir.glob("*.jsonl"):
-        for row in read_jsonl_skipping_corrupt(jsonl_file):
-            speaker = str(row.get("speaker", "")).lower()
-            if speaker == companion_name or speaker == "summary":
+        for row in iter_jsonl(jsonl_file, recover=Recovery.RAISE):
+            # Only the user's rows (#621): the kindled's are "assistant", plus
+            # "image" annotation rows and the compaction "summary" row.
+            if row.get("speaker") != "user":
                 continue
             ts_str = row.get("ts")
             if not ts_str:
@@ -469,6 +430,10 @@ def _daily_scan_conversations(
                 continue
             hour_counts[ts.astimezone().hour] += 1
             total += 1
+            seen.add(turn_identity(row))
+    for ts in _archived_user_turn_times(persona_dir, cutoff, seen):
+        hour_counts[ts.astimezone().hour] += 1
+        total += 1
 
     threshold: int | None = None
     if total >= _SCHEDULE_MIN_TURNS:
@@ -482,12 +447,12 @@ def _daily_scan_conversations(
 
 
 def _run_daily_presence_recompute(persona_dir: Path, *, _now: datetime | None = None) -> None:
-    """Run the once-daily bounded recompute: silence-days last-seen
-    discovery, likely-active histogram rebuild, and (once ever) the
-    reply-lag bootstrap.
+    """Run the once-daily bounded recompute: last-seen discovery (no
+    longer read by silence_days), likely-active histogram rebuild, and
+    (once ever) the reply-lag bootstrap.
 
     Scan phase runs UNLOCKED (matches today's un-locked full-scan reads —
-    read_jsonl_skipping_corrupt already tolerates a concurrent writer via
+    read_jsonl already tolerates a concurrent writer via
     its corrupt-line-skip discipline). Merge phase is a small,
     presence-lock-guarded, version-reconciled read-merge-write so a live
     event (record_inbound_turn/fold_reply_lag) that fires during the scan
@@ -601,15 +566,26 @@ def _run_daily_presence_recompute(persona_dir: Path, *, _now: datetime | None = 
         presence_state.save_presence_state(persona_dir, merged)
 
 
+def _note_failure(what: str) -> None:
+    """#367: these derivations fail soft (permissive defaults), but at DEBUG they
+    never reached runtime-<persona>.log (its handler is INFO). This runs about
+    twice per 15 minutes, so the warning is throttled."""
+    warn_throttled(log, f"user_pattern:{what}", "user_pattern: %s failed", what)
+
+
 def compute_user_presence(persona_dir: Path, *, _now: datetime | None = None) -> UserPresence:
-    """Compute current UserPresence from persisted presence state + audit log.
+    """Compute current UserPresence from persisted presence state, the conversation files + audit log.
 
     All four signals default to permissive values on failure — uncertainty
-    never tightens gates. The heavy full-history scans (silence-days
-    last-seen discovery, the likely-active histogram, the one-time
-    reply-lag bootstrap) run at most once/24h via the daily recompute
-    below; the normal per-call path is a cheap small-file read plus
-    arithmetic. ignore_streak is the one exception: it always uses its own
+    never tightens gates. The heavy full-history scans (the likely-active
+    histogram, the one-time reply-lag bootstrap) run at most once/24h via
+    the daily recompute below; the normal per-call path is a cheap
+    small-file read plus arithmetic. silence_days is the exception beside
+    ignore_streak: it is read on every call from the conversation files
+    through ``brain.ingest.buffer.last_user_turn_ts``, the same function
+    ``days_since_human`` uses (the later of the active files' newest user
+    turn, each holding about the newest forty raw turns, and the newest
+    archived session's); no user turn means 0.0 days. ignore_streak always uses its own
     bounded (never full-file) tail read (`_compute_ignore_streak_bounded`),
     independent of the daily cadence and of PresenceState entirely.
     """
@@ -625,30 +601,31 @@ def compute_user_presence(persona_dir: Path, *, _now: datetime | None = None) ->
                 advance(now=now, interval_s=_PRESENCE_DAILY_INTERVAL_S),
             )
     except Exception:
-        log.debug("user_pattern: daily presence recompute failed", exc_info=True)
+        _note_failure("daily presence recompute")
 
     try:
         state = presence_state.load_presence_state(persona_dir)
     except Exception:
-        log.debug("user_pattern: load_presence_state failed", exc_info=True)
+        _note_failure("load_presence_state")
         state = None
 
     try:
-        if state is None or state.last_seen_ts is None:
+        # Imported here, not at the top: brain.ingest pulls the ingest pipeline and the provider stack.
+        from brain.ingest.buffer import last_user_turn_ts
+
+        last_user_turn = last_user_turn_ts(persona_dir)
+        if last_user_turn is None:
             silence_days = 0.0
         else:
-            last_seen = datetime.fromisoformat(state.last_seen_ts)
-            if last_seen.tzinfo is None:
-                last_seen = last_seen.replace(tzinfo=UTC)
-            silence_days = max(0.0, (now - last_seen).total_seconds() / 86400.0)
+            silence_days = max(0.0, (now - last_user_turn).total_seconds() / 86400.0)
     except Exception:
-        log.debug("user_pattern: silence_days derivation failed", exc_info=True)
+        _note_failure("silence_days derivation")
         silence_days = 0.0
 
     try:
         ignore_streak = _compute_ignore_streak_bounded(persona_dir)
     except Exception:
-        log.debug("user_pattern: _compute_ignore_streak_bounded failed", exc_info=True)
+        _note_failure("_compute_ignore_streak_bounded")
         ignore_streak = 0
 
     try:
@@ -657,7 +634,7 @@ def compute_user_presence(persona_dir: Path, *, _now: datetime | None = None) ->
         else:
             likely_active = state.hour_counts[now.astimezone().hour] >= state.active_threshold
     except Exception:
-        log.debug("user_pattern: likely_active derivation failed", exc_info=True)
+        _note_failure("likely_active derivation")
         likely_active = True
 
     try:
@@ -666,7 +643,7 @@ def compute_user_presence(persona_dir: Path, *, _now: datetime | None = None) ->
         else:
             response_lag_p50 = state.reply_lag_running_mean
     except Exception:
-        log.debug("user_pattern: response_lag_p50 derivation failed", exc_info=True)
+        _note_failure("response_lag_p50 derivation")
         response_lag_p50 = None
 
     return UserPresence(

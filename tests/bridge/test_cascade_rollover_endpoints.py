@@ -19,12 +19,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import subprocess
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -41,16 +39,22 @@ from brain.ingest.buffer import (
 
 
 def _build(persona_dir: Path) -> tuple[FastAPI, TestClient]:
+    from brain.bridge import shutdown_progress
+
+    # Each app built here stands for a new bridge process (a GET is a counted stop task now, and #523's GET /sessions/active
+    # runs in a tracked worker thread): an earlier app's teardown sealed the process-wide registry, which the bridge never
+    # resets, so without this reset a second app's tracked work is refused (the derived-recheck test resets the same way).
+    shutdown_progress.reset_for_tests()
     app = build_app(persona_dir=persona_dir, client_origin="tests")
     return app, TestClient(app)
 
 
 def _patch_fake_provider(monkeypatch, reply: str = "default reply", extraction: str = "[]"):
-    """Mirrors tests/bridge/test_endpoints.py's helper — patches
+    """Mirrors tests/bridge/test_endpoints.py's helper: patches
     brain.bridge.provider.get_provider (the SOURCE module; server.py's
-    lifespan no longer imports get_provider directly since #154's completion —
-    it calls model_tier.build_interactive_chat_provider, which does its own
-    function-scoped import of get_provider from this source module) so the
+    lifespan does not import get_provider directly: it calls
+    model_tier.build_tier_provider, which does its own function-scoped import
+    of get_provider from this source module) so the
     lifespan's provider is a controllable stub. Must be called BEFORE opening
     the TestClient."""
     import brain.bridge.provider as _provider_module
@@ -466,38 +470,6 @@ def test_c21_no_raw_sid_downstream_of_resolution() -> None:
         assert name in blocks, f"handler {name!r} not found in server.py"
         ok, reason = _rebind_and_loadbearing_ok(blocks[name])
         assert ok, f"{name}: {reason}"
-
-
-def test_c21_flags_all_five_sites_on_pre_fix_base_commit() -> None:
-    """H6: run the SAME structural check against the base commit
-    (cd29bc61, before the redirect work landed) and confirm it flags EVERY
-    one of the 5 sites — the current tree passing this check is not vacuous."""
-    repo_root = Path(__file__).resolve().parents[2]
-    result = subprocess.run(
-        ["git", "show", "cd29bc61:brain/bridge/server.py"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        # #169: the base commit was dropped by a branch rewrite and is reachable
-        # from no origin ref; CI's shallow checkout never has it. Skip, don't fail.
-        pytest.skip(f"base object unavailable in this clone: {result.stderr.strip()}")
-    base_source = result.stdout
-    blocks = _handler_blocks(base_source)
-    failing = []
-    for name in _C21_HANDLER_NAMES:
-        block = blocks.get(name)
-        if block is None:
-            failing.append(name)
-            continue
-        ok, _reason = _rebind_and_loadbearing_ok(block)
-        if not ok:
-            failing.append(name)
-    assert set(failing) == set(_C21_HANDLER_NAMES), (
-        f"expected the check to flag ALL 5 pre-fix sites, only flagged {failing}"
-    )
 
 
 def test_owner_idle_gate_defers_busy_session(persona_dir: Path) -> None:

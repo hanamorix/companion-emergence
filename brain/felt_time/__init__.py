@@ -5,7 +5,7 @@ Public surface:
                         get_state() to read; persists automatically.
     TickContext       — what the supervisor passes on each tick.
 
-Spec: docs/superpowers/specs/2026-05-17-felt-time-design.md.
+Spec: the 2026-05-17 felt-time design, never committed and lost (#797).
 """
 
 from __future__ import annotations

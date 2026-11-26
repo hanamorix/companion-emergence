@@ -134,6 +134,10 @@ app/.claude/
 .claude/skills/
 skills-lock.json
 
+# Project MCP config: per-developer, with local paths. Never committed, and a
+# token must never be written into it.
+.mcp.json
+
 # Codex agent config + instruction mirror (personal, parallel to .claude/)
 .codex/
 AGENTS.md

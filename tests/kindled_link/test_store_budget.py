@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
-from brain.kindled_link import limits
+from brain import dev_constants
 from brain.kindled_link.store import KindledLinkStore
 
 
@@ -11,7 +11,7 @@ def _store(tmp_path):
 def test_unknown_peer_starts_full(tmp_path):
     s = _store(tmp_path)
     now = datetime(2026, 6, 20, 12, 0, tzinfo=UTC)
-    assert s.get_disclosure_budget("kid_a", now) == limits.BUDGET_MAX
+    assert s.get_disclosure_budget("kid_a", now) == dev_constants.KINDLED_LINK_BUDGET_MAX
 
 
 def test_debit_reduces_budget(tmp_path):
@@ -32,12 +32,12 @@ def test_refill_over_wall_time(tmp_path):
     s = _store(tmp_path)
     now = datetime(2026, 6, 20, 12, 0, tzinfo=UTC)
     s.debit_disclosure_budget("kid_a", 1.0, now)  # → 0.0
-    # after 1 day, refills by BUDGET_REFILL_PER_DAY (0.5)
+    # after 1 day, refills by KINDLED_LINK_BUDGET_REFILL_PER_DAY (0.5)
     later = now + timedelta(days=1)
-    assert abs(s.get_disclosure_budget("kid_a", later) - limits.BUDGET_REFILL_PER_DAY) < 1e-9
+    assert abs(s.get_disclosure_budget("kid_a", later) - dev_constants.KINDLED_LINK_BUDGET_REFILL_PER_DAY) < 1e-9
     # never exceeds MAX
     much_later = now + timedelta(days=10)
-    assert s.get_disclosure_budget("kid_a", much_later) == limits.BUDGET_MAX
+    assert s.get_disclosure_budget("kid_a", much_later) == dev_constants.KINDLED_LINK_BUDGET_MAX
 
 
 def test_debit_refills_to_now_before_subtracting(tmp_path):

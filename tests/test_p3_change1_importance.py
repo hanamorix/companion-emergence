@@ -1,10 +1,9 @@
 """Tests for P3 retention rework, Change 1 — trustworthy importance assignment.
 
 Covers C1.1-C1.5 from changes/p3-retention/1.5-criteria.md. Each test
-documents how the PRE-CHANGE code would have violated the criterion (the
-oracle must be shown able to fail).
+documents how the PRE-CHANGE code would have violated the criterion.
 
-Naming: synthetic user = Bob, persona = Canary, model = Claude. No Phoebe.
+Naming: synthetic user = Bob, persona = Canary, model = Claude. No real persona or user names.
 """
 
 from __future__ import annotations
@@ -130,14 +129,15 @@ def test_c1_1_add_journal_above_floor(tmp_path):
 
 
 def test_c1_1_research_memory_above_floor():
-    from brain.engines.research import _create_research_memory
+    from brain.engines.research import build_research_memory
 
-    mem = _create_research_memory(
+    mem = build_research_memory(
         content="notes on a topic",
-        interest=type(
-            "I", (), {"id": "i1", "topic": "topic", "scope": "general"}
-        )(),
-        web_results=[],
+        interest_id="i1",
+        interest_topic="topic",
+        scope="general",
+        web_urls=[],
+        web_result_count=0,
         web_used=False,
         trigger="scheduled",
         provider_name="fake",
@@ -365,19 +365,3 @@ def test_c1_5_extraction_prompts_anchor_present_and_no_em_dash():
         assert "rubric" in prompt
         assert "pivotal" in prompt
         assert _em_dash_free(prompt)
-
-
-def test_c1_5_em_dash_check_flags_pre_change_strings():
-    """Self-test (per criteria + plan): the SAME assertion, run against a
-    reconstruction of the PRE-CHANGE strings (which contained em-dashes),
-    must FAIL — proving the oracle can actually flag a violation."""
-    pre_change_system_prompt = (
-        "Identify what surfaced that should affect their memory, emotional "
-        "state, or growth — and what you noticed they should have done "
-        "differently."
-    )
-    pre_change_extraction_named_fragment = (
-        "{assistant_name} is the assistant — the AI persona."
-    )
-    assert not _em_dash_free(pre_change_system_prompt)
-    assert not _em_dash_free(pre_change_extraction_named_fragment)

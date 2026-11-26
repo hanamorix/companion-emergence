@@ -13,6 +13,9 @@ from brain.memory.store import Memory, _coerce_utc
 
 
 def _ro_connect(db: Path) -> sqlite3.Connection:
+    # memdb-single-writer reader exception: a mode=ro open of a SOURCE persona's memories.db,
+    # which must not be altered. It stays outside MemoryStore for now (owner ruling); the
+    # scanner is tests/unit/test_memories_db_single_writer.py.
     conn = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     return conn
@@ -51,7 +54,7 @@ def read_source_memories(source_dir: Path) -> dict[str, Memory]:
                 last_accessed = _coerce_utc(la)
             except ValueError:
                 last_accessed = None
-        out[mid] = Memory(
+        out[mid] = Memory.from_stored_row(
             id=mid,
             content=content,
             memory_type=d.get("memory_type") or "conversation",
@@ -63,7 +66,6 @@ def read_source_memories(source_dir: Path) -> dict[str, Memory]:
             score=float(d.get("score") or 0.0),
             last_accessed_at=last_accessed,
             active=bool(d.get("active", 1)),
-            protected=bool(d.get("protected", 0)),
             metadata=_loads_dict(d.get("metadata_json")),
             state=d.get("state") or "active",
             content_snapshot=d.get("content_snapshot"),

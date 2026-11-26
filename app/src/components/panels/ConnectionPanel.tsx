@@ -1,12 +1,20 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import type { ReactNode } from "react";
-import { installNellCliSymlink, installSupervisorService } from "../../appConfig";
-import type { PersonaState, ChatModel, PronounPreset } from "../../bridge";
-import { getClientPlatform, platformLabel, detectInstallShape } from "../../platform";
+import { installNellCliSymlink, installSupervisorService, type InitResult } from "../../appConfig";
+import { stopBridgeThen } from "../../hooks/useRestartBridge";
+import type { PersonaState, ChatModel, PronounPreset, SupervisorInfo } from "../../bridge";
+import { getClientPlatform, platformLabel, detectInstallShape, supportsNellCliShortcut } from "../../platform";
 import type { InstallShape } from "../../platform";
 import { Divider, PanelShell, SectionLabel, Toggle } from "../ui";
 import { RestartBridgeButton } from "./RestartBridgeButton";
 import { ModelPicker } from "./ModelPicker";
+import {
+  MODEL_UNCHECKED_MESSAGE,
+  modelFallbackMessage,
+  modelRejectedNowMessage,
+  modelUnsupportedMessage,
+} from "../../lib/friendlyChatError";
+import { isChatModelAlias } from "../../lib/modelId";
 import { PronounPicker } from "./PronounPicker";
 import { NotesToggle } from "./NotesToggle";
 import { KindledLinkToggle } from "./KindledLinkToggle";
@@ -19,6 +27,9 @@ import type { Update } from "@tauri-apps/plugin-updater";
 import { BrainUpdateRow } from "./BrainUpdateRow";
 
 const RELEASES_URL = "https://github.com/hanamorix/companion-emergence/releases";
+
+/** How long the pre-Apply poll guard holds when no poll ever reports a different chat model. */
+const GUARD_RELEASE_MS = 15_000;
 
 interface Props {
   state: PersonaState | null;
@@ -65,6 +76,7 @@ export function ConnectionPanel({
   const mode = state?.mode ?? "live";
   const platform = getClientPlatform();
   const supervisorSupported = platform === "macos" || platform === "linux" || platform === "windows";
+  const cliShortcutSupported = supportsNellCliShortcut(platform);
   const currentPlatformLabel = platformLabel(platform);
   const [install, setInstall] = useState<InstallState>({ kind: "idle" });
   const [cliInstall, setCliInstall] = useState<InstallState>({ kind: "idle" });
@@ -80,6 +92,57 @@ export function ConnectionPanel({
   // so the panel reflects the change without waiting for the next /state poll.
   const [localModel, setLocalModel] = useState<ChatModel | null>(null);
   const displayModel = localModel ?? (conn?.model as ChatModel | null | undefined) ?? null;
+  // Set when the last Apply saved a custom model the bridge could not confirm: shown at once, then the
+  // bridge's `model_unconfirmed` list takes over (it empties when a clean reply arrives for the model).
+  const [pendingNotice, setPendingNotice] = useState(false);
+  // Guard against a poll that left BEFORE the last Apply and lands after it: it still reports the old chat
+  // model and must not bring back the old lines. It is released by the first poll that reports any other
+  // model (the new one, or one changed elsewhere meanwhile), or after GUARD_RELEASE_MS, whichever is first;
+  // when the Apply re-saved the same model, only the timer applies.
+  const guardRef = useRef<{ before: string | null; applied: string } | null>(null);
+  const guardTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const releaseGuard = () => {
+    if (guardTimerRef.current !== null) clearTimeout(guardTimerRef.current);
+    guardTimerRef.current = null;
+    guardRef.current = null;
+    setPendingNotice(false);
+  };
+  useEffect(() => {
+    const g = guardRef.current;
+    const polled = state?.connection?.model ?? null;
+    // A re-Apply of the same model cannot tell a stale poll from a fresh one: only the timer ends its guard.
+    if (g === null || polled !== g.before) releaseGuard();
+  }, [state]);
+  useEffect(
+    () => () => {
+      if (guardTimerRef.current !== null) clearTimeout(guardTimerRef.current);
+    },
+    [],
+  );
+  const fallbacks = state?.model_fallbacks ?? [];
+  const modelNotice =
+    pendingNotice || (displayModel !== null && (state?.model_unconfirmed ?? []).includes(displayModel))
+      ? MODEL_UNCHECKED_MESSAGE
+      : null;
+  // Models the Claude CLI rejected while in use (the bridge drops a record when the model changes or a
+  // clean reply arrives). A record for the model the user has since replaced is stale until the next poll.
+  // `model_fallbacks` says which jobs run their shipped default now because of it; a record with no fallback
+  // names the shipped default itself, which keeps failing until Claude Code is updated.
+  const rejectionLines = (state?.model_rejections ?? []).flatMap((rec) => {
+    const jobs = fallbacks.filter((f) => f.configured === rec.model);
+    const chosen = rec.model === displayModel || jobs.some((f) => f.job === "interactive-chat");
+    if (rec.model !== displayModel && rec.model === conn?.model && localModel !== null) return [];
+    return [modelRejectedNowMessage(rec.model, chosen, jobs.length > 0)];
+  });
+  // #446: a hand-edited unsupported `model` value (Sonnet runs instead). Hidden at once after the user applies a
+  // model here; the bridge's next poll then reports null.
+  const unsupportedModel = localModel === null ? (state?.model_unsupported ?? null) : null;
+  const unsupportedLine = unsupportedModel ? modelUnsupportedMessage(unsupportedModel) : null;
+  const fallbackLines = fallbacks.map(modelFallbackMessage);
+  // The picker is for a Claude persona only (another provider runs its own model), and only once the model is known.
+  const claudePersona = conn?.provider === "claude-cli";
+  const pickerChoice =
+    localModel !== null ? (isChatModelAlias(localModel) ? localModel : null) : (conn?.model_choice ?? null);
   const [showPronounPicker, setShowPronounPicker] = useState(false);
   // Local pronoun override — updated optimistically after a successful apply.
   const [localPronouns, setLocalPronouns] = useState<PronounPreset | null>(null);
@@ -125,18 +188,29 @@ export function ConnectionPanel({
 
   async function onInstallSupervisor() {
     setInstall({ kind: "running" });
+    // #456 (C58 d, review M4): the install refuses a running bridge, so the bridge is stopped through the restart's
+    // stop flow first (the same display and hard-exit offer), installed while stopped, then started again (through
+    // the new service).
+    const box: { result: InitResult | null } = { result: null };
     try {
-      const result = await installSupervisorService(persona);
-      if (result.success) {
-        setInstall({
-          kind: "ok",
-          detail: result.stdout.split("\n")[0] || "service installed",
-        });
+      const outcome = await stopBridgeThen(
+        persona,
+        async () => {
+          const result = await installSupervisorService(persona);
+          box.result = result;
+          if (!result.success) throw new Error(result.stderr || `exit ${result.exit_code}`);
+        },
+        { start: true },
+      );
+      const result = box.result;
+      if (!outcome.stopped) {
+        setInstall({ kind: "error", detail: `The brain could not be stopped for the install. ${outcome.error ?? ""}`.trim() });
+      } else if (result?.success && outcome.error) {
+        setInstall({ kind: "error", detail: `Installed, but the brain did not start again: ${outcome.error}` });
+      } else if (result?.success) {
+        setInstall({ kind: "ok", detail: result.stdout.split("\n")[0] || "service installed" });
       } else {
-        setInstall({
-          kind: "error",
-          detail: result.stderr || `exit ${result.exit_code}`,
-        });
+        setInstall({ kind: "error", detail: result?.stderr || outcome.error || `exit ${result?.exit_code}` });
       }
     } catch (e) {
       setInstall({ kind: "error", detail: errString(e) });
@@ -173,7 +247,7 @@ export function ConnectionPanel({
       <Row label="Heartbeat" value={formatHeartbeat(conn?.last_heartbeat_at)} />
       <Row label="Privacy" value="Local-only" accent />
 
-      <StatusBanner mode={mode} stateError={stateError} persona={persona} />
+      <StatusBanner mode={mode} stateError={stateError} persona={persona} supervisor={state?.supervisor ?? null} />
 
       <Divider />
       <RecoverLauncher persona={persona} />
@@ -226,15 +300,16 @@ export function ConnectionPanel({
           letterSpacing: "0.01em",
         }}
       >
-        {platform === "macos"
-          ? <>Add a <code>nell</code> shortcut to ~/.local/bin so you can run commands from Terminal. Idempotent — safe to click again.</>
-          : `The bundled Terminal shortcut installer is not supported on this platform. On ${currentPlatformLabel}, use the packaged app UI; platform-specific CLI wiring can be added later without affecting chat.`}
+        {platform === "macos" && <>Add a <code>nell</code> shortcut to ~/.local/bin so you can run commands from Terminal. Idempotent — safe to click again.</>}
+        {platform === "linux" && <>Add a <code>nell</code> shortcut to ~/.local/bin so you can run commands from a terminal. Idempotent, safe to click again.</>}
+        {platform === "windows" && <>Add a <code>nell</code> shortcut and put its folder on your user PATH so you can run commands from Command Prompt or PowerShell. Idempotent, safe to click again. Open a new terminal window afterwards.</>}
+        {!cliShortcutSupported && `The bundled Terminal shortcut installer is not supported on this platform. On ${currentPlatformLabel}, use the packaged app UI; platform-specific CLI wiring can be added later without affecting chat.`}
       </div>
-      {platform === "macos" ? (
+      {cliShortcutSupported ? (
         <InstallActionButton
           state={cliInstall}
           onClick={onInstallCli}
-          idleLabel="install nell to ~/.local/bin"
+          idleLabel={platform === "windows" ? "install nell to your PATH" : "install nell to ~/.local/bin"}
           runningLabel="installing…"
           successLabel="✓ nell installed"
           errorLabel="retry install"
@@ -258,11 +333,11 @@ export function ConnectionPanel({
         onChange={onReducedMotionChange}
       />
       {/* Extended-reasoning toggle removed in v0.0.26 — monologue is always on now.
-          See docs/superpowers/specs/2026-05-30-inner-monologue-tool-call-design.md §6. */}
+          The 2026-05-30 inner-monologue tool-call design (§6) was never committed and is lost (#797). */}
 
       <Divider />
-      <SectionLabel>Model</SectionLabel>
-      {!showModelPicker ? (
+      {claudePersona && <SectionLabel>Model</SectionLabel>}
+      {claudePersona && !showModelPicker ? (
         <div
           style={{
             fontSize: 10.5,
@@ -278,6 +353,7 @@ export function ConnectionPanel({
           .{" "}
           <button
             aria-label="change model"
+            disabled={displayModel === null}
             onClick={() => setShowModelPicker(true)}
             style={{
               background: "none",
@@ -293,16 +369,52 @@ export function ConnectionPanel({
             change
           </button>
         </div>
-      ) : (
+      ) : claudePersona && displayModel !== null ? (
         <ModelPicker
-          current={displayModel ?? "sonnet"}
+          current={displayModel}
+          choice={pickerChoice}
           persona={persona}
-          onClose={(newModel) => {
-            if (newModel) setLocalModel(newModel);
+          allowReapply={unsupportedModel !== null}
+          onClose={(newModel, info) => {
+            if (newModel) {
+              setLocalModel(newModel);
+              if (guardTimerRef.current !== null) clearTimeout(guardTimerRef.current);
+              guardRef.current = { before: conn?.model ?? null, applied: newModel };
+              guardTimerRef.current = setTimeout(releaseGuard, GUARD_RELEASE_MS);
+              setPendingNotice(info?.checked === false);
+            }
             setShowModelPicker(false);
           }}
         />
+      ) : null}
+      {unsupportedLine && (
+        <div role="status" style={{ fontSize: 10.5, color: "var(--crimson)", lineHeight: 1.5, marginBottom: 6, wordBreak: "break-word" }}>
+          {unsupportedLine}
+        </div>
       )}
+      {modelNotice && (
+        <div role="status" style={{ fontSize: 10.5, color: "var(--text-mute)", lineHeight: 1.5, marginBottom: 6 }}>
+          {modelNotice}
+        </div>
+      )}
+      {fallbackLines.map((line) => (
+        <div
+          key={line}
+          role="status"
+          style={{ fontSize: 10.5, color: "var(--text-mute)", lineHeight: 1.5, marginBottom: 6, wordBreak: "break-word" }}
+        >
+          {line}
+        </div>
+      ))}
+      {rejectionLines.map((line) => (
+        <div
+          key={line}
+          role="status"
+          style={{ fontSize: 10.5, color: "var(--crimson)", lineHeight: 1.5, marginBottom: 6, wordBreak: "break-word" }}
+        >
+          {line}
+        </div>
+      ))}
 
       <Divider />
       <SectionLabel>Your pronouns</SectionLabel>
@@ -572,10 +684,13 @@ function StatusBanner({
   mode,
   stateError,
   persona,
+  supervisor = null,
 }: {
   mode: PersonaState["mode"];
   stateError: string | null;
   persona: string;
+  /** #456 (Q6): the brain's background loop restarted after an error, or stopped after repeated ones. */
+  supervisor?: SupervisorInfo | null;
 }) {
   // Pick the worst signal — bridge_down is more critical than provider_down.
   let kind: "warning" | "error" | null = null;
@@ -599,6 +714,18 @@ function StatusBanner({
     headline = "LLM provider unreachable.";
     detail =
       "Replies will fall back to a local backup voice. Check that `claude` is on PATH for the launchd agent.";
+  } else if (supervisor?.state === "failed") {
+    kind = "warning";
+    headline = "Background work stopped.";
+    detail =
+      "The brain's background work stopped after repeated errors. Chat still works; restart the brain to try again." +
+      (supervisor.last_error ? ` Last error: ${supervisor.last_error}` : "");
+  } else if (supervisor?.state === "restarted") {
+    kind = "warning";
+    headline = "Background work restarted.";
+    detail =
+      "The brain's background work hit an error and started again." +
+      (supervisor.last_error ? ` Error: ${supervisor.last_error}` : "");
   }
 
   if (kind === null) return null;

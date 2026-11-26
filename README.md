@@ -101,7 +101,7 @@ She is not waiting for you. She is living, and you join the conversation.
 
 **Persistent supervisor.** A user-scoped service (launchd on macOS, systemd-user on Linux, Task Scheduler on Windows) keeps the brain alive even when the desktop app is closed. Reboot the machine, log back in, the brain resumes.
 
-The app asks the bridge to shut down through its local `/supervisor/shutdown` endpoint before restarting it. Forced kills are reserved for wedged processes and may trigger recovery on next launch; recovery snapshots active chats without deleting the replay buffer.
+The app asks the bridge to stop through its local `/supervisor/shutdown` endpoint before restarting it, then waits while the work already running finishes, showing what is left; after three minutes it offers a hard exit. Only a bridge that answers neither `/health` nor the stop request is killed. Open conversations are saved at the first idle pass after the next start, without deleting the replay buffer.
 
 **Soul module.** Permanent memories the persona crystallises herself when something proves load-bearing across many turns. Reviewable, revokable, but never silently mutated.
 
@@ -193,14 +193,20 @@ Locally-built artefacts inherit your machine's keychain trust so they launch wit
 
 ## Quick start
 
-After install + `claude` CLI on PATH, open the desktop app. Walk through the wizard — it sets up the persona, installs the persistent supervisor under launchd / systemd-user / Task Scheduler, and (on macOS) drops a `nell` symlink into `~/.local/bin` so you can reach the CLI from Terminal.
+After install + `claude` CLI on PATH, open the desktop app. Walk through the wizard — it sets up the persona, installs the persistent supervisor under launchd / systemd-user / Task Scheduler, and puts a `nell` command on your PATH so you can reach the CLI from a terminal (a symlink in `~/.local/bin` on macOS and the Linux `.deb`, a small script in `~/.local/bin` for the Linux AppImage, and a `nell.cmd` in `%LOCALAPPDATA%\CompanionEmergence\bin` on Windows).
 
 If you skipped any step or want to retry, the **Connection** panel surfaces platform-appropriate service actions:
 - **macOS:** install/retry the launchd supervisor and install `nell` to `~/.local/bin`.
 - **Linux:** use `nell service install --persona <name>` for the systemd-user supervisor.
 - **Windows:** the supervisor installs as a per-user **Task Scheduler** task (no admin elevation). Install it from the Connection panel, or with `nell service install --persona <name>`. It starts at logon and restarts on failure, keeping the brain alive after you close the app — the same role launchd plays on macOS and systemd `--user` on Linux.
 
-The `~/.local/bin` CLI symlink button is macOS-only; Windows and Linux users should run the bundled/source `nell` command from their normal install path.
+The Connection panel's **install nell** button (Terminal section) is available on macOS, Linux and Windows:
+
+- **Linux `.deb`:** the same `~/.local/bin/nell` symlink as macOS. A `nell` you installed yourself (a file or a symlink) is never overwritten. On Debian and Ubuntu, `~/.local/bin` joins your PATH at login only if it already existed, so sign out and back in if `nell` is not found.
+- **Linux AppImage:** `~/.local/bin/nell` is a small script that runs your AppImage file in a command-line mode, which hands off to the bundled `nell`. The setup wizard creates it automatically at the end of a fresh install (or you can click the button later); from then on the app refreshes the script on every launch in case you moved the AppImage. An AppImage that is running without FUSE (extract-and-run mode) gets no shortcut: the app explains why and what to do (install FUSE, `libfuse2` on Debian and Ubuntu, or install the `.deb`).
+- **Windows:** the setup wizard (or the button) writes a small `nell.cmd` in `%LOCALAPPDATA%\CompanionEmergence\bin` that calls the bundled `nell.bat`, and adds that folder once to your user PATH in the registry (no admin rights, no symlinks). On later launches the app only rewrites that file if it moved or went stale. Open a new Command Prompt or PowerShell window afterwards. Arguments containing `&`, `^` or `%` are not passed through cmd.exe unchanged, the same limit as the bundled `nell.bat`.
+- Uninstalling the app leaves the shortcut (and its Windows PATH entry) behind. Delete `~/.local/bin/nell`, or on Windows the `CompanionEmergence` folder and its PATH entry, if you want it gone.
+- The AppImage "portable home" mode (a `<file>.home` folder) makes the app see that folder as `$HOME`, so the shortcut is written there.
 
 After that:
 
@@ -297,7 +303,7 @@ The Linux and Windows bundles are compile-clean from CI and unit-tested but have
 
 - **Stack:** Python 3.13 framework + Rust/Tauri 2 desktop app + React 18 + TypeScript frontend.
 - **Tooling:** `uv` for Python, `pnpm` for Node, `cargo` for Rust. `ruff` lints, `pytest` runs the suite, `vitest` covers the React side, `cargo test` covers the Rust bridge.
-- **CI:** GitHub Actions matrix builds on macos-14, ubuntu-22.04, windows-2022. Every release tag fires a cross-platform bundle build with sha256 verification of the bundled python-build-standalone runtime.
+- **CI:** GitHub Actions matrix builds on macos-15, ubuntu-22.04, windows-2022. Every release tag fires a cross-platform bundle build with sha256 verification of the bundled python-build-standalone runtime.
 - **Test surface:** ~2,480 unit + integration tests across the Python framework alone. Live-host tests are explicitly opt-in (gated behind `RUN_LIVE_CLAUDE_STRESS=1`).
 - **Pre-1.0 contract:** breaking changes can land in any release. APIs, file formats, and the desktop app shape are all subject to change before the first stable.
 

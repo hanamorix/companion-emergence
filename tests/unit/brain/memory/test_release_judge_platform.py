@@ -2,7 +2,7 @@
 
 Linux gets `malloc_trim(0)`; macOS gets libSystem's
 `malloc_zone_pressure_relief(NULL, 0)` (its allocator keeps freed pages
-resident otherwise); Windows gets neither. These tests fake `sys.platform` and
+resident otherwise); Windows gets neither. These tests fake the module's platform seam (`_platform`, #710) and
 `ctypes.CDLL` so every branch is checkable from any host. Whether the macOS
 call actually lowers RSS is measured only by the macOS leg of
 `judge-release-rss.yml`.
@@ -11,7 +11,6 @@ call actually lowers RSS is measured only by the macOS leg of
 from __future__ import annotations
 
 import ctypes
-import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -27,10 +26,11 @@ def _install_fake_cdll(monkeypatch: pytest.MonkeyPatch, lib: MagicMock) -> Magic
     return cdll
 
 
+@pytest.mark.slow(reason='1.5 s of CPU in its call phase on a 4-core dev VM, 1.5 s wall (serial run for #540, J12)')
 def test_darwin_calls_malloc_zone_pressure_relief_with_null_zone_and_zero_goal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(relevance_judge, "_platform", lambda: "darwin")
     lib = MagicMock()
     lib.malloc_zone_pressure_relief.return_value = 4096
     cdll = _install_fake_cdll(monkeypatch, lib)
@@ -42,6 +42,7 @@ def test_darwin_calls_malloc_zone_pressure_relief_with_null_zone_and_zero_goal(
     lib.malloc_trim.assert_not_called()
 
 
+@pytest.mark.slow(reason='1.7 s of CPU in its call phase on a 4-core dev VM, 1.7 s wall (serial run for #540, J12)')
 @pytest.mark.parametrize(
     "failure",
     [
@@ -54,7 +55,7 @@ def test_darwin_calls_malloc_zone_pressure_relief_with_null_zone_and_zero_goal(
 def test_darwin_relief_never_raises_when_unavailable(
     monkeypatch: pytest.MonkeyPatch, failure: Exception
 ) -> None:
-    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(relevance_judge, "_platform", lambda: "darwin")
     if isinstance(failure, OSError):
         monkeypatch.setattr(ctypes, "CDLL", MagicMock(side_effect=failure))
     elif isinstance(failure, AttributeError):
@@ -68,10 +69,11 @@ def test_darwin_relief_never_raises_when_unavailable(
     relevance_judge.release_judge()  # must not raise
 
 
+@pytest.mark.slow(reason='1.8 s of CPU in its call phase on a 4-core dev VM, 1.8 s wall (serial run for #540, J12)')
 def test_darwin_release_still_clears_the_provider_cache_when_relief_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(sys, "platform", "darwin")
+    monkeypatch.setattr(relevance_judge, "_platform", lambda: "darwin")
     monkeypatch.setattr(ctypes, "CDLL", MagicMock(side_effect=OSError("nope")))
     relevance_judge._provider_cache["sentinel"] = object()  # type: ignore[assignment]
     try:
@@ -81,8 +83,9 @@ def test_darwin_release_still_clears_the_provider_cache_when_relief_fails(
         relevance_judge._reset_judge_provider_cache()
 
 
+@pytest.mark.slow(reason='1.6 s of CPU in its call phase on a 4-core dev VM, 1.6 s wall (serial run for #540, J12)')
 def test_linux_uses_malloc_trim_and_not_the_macos_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(relevance_judge, "_platform", lambda: "linux")
     lib = MagicMock()
     cdll = _install_fake_cdll(monkeypatch, lib)
 
@@ -93,8 +96,9 @@ def test_linux_uses_malloc_trim_and_not_the_macos_call(monkeypatch: pytest.Monke
     lib.malloc_zone_pressure_relief.assert_not_called()
 
 
+@pytest.mark.slow(reason='1.7 s of CPU in its call phase on a 4-core dev VM, 1.8 s wall (serial run for #540, J12)')
 def test_windows_attempts_no_allocator_call(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(relevance_judge, "_platform", lambda: "win32")
     cdll = _install_fake_cdll(monkeypatch, MagicMock())
 
     relevance_judge.release_judge()

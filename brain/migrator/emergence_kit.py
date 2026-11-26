@@ -46,9 +46,7 @@ brain doesn't care which kit the data came from.
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import shutil
 import time
 from dataclasses import dataclass
@@ -56,8 +54,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from brain.health.json_io import JsonFileError, Recovery, read_json, write_json
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
+from brain.migrator.install_swap import install_over, refuse_if_in_use
 from brain.migrator.report import MigrationReport
 from brain.migrator.transform import SkippedMemory, transform_memory
 from brain.paths import get_persona_dir
@@ -93,8 +93,10 @@ def _read_emergence_kit_memories(input_dir: Path) -> list[dict[str, Any]]:
         if not path.is_file():
             continue
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
+            data = read_json(path, recover=Recovery.RAISE)
+        except JsonFileError as exc:
+            if exc.kind == "io":
+                raise  # an unreadable file propagated before; it still does
             raise ValueError(
                 f"emergence-kit memory file at {path} is not valid JSON: {exc}"
             ) from exc
@@ -112,14 +114,7 @@ def _read_emergence_kit_memories(input_dir: Path) -> list[dict[str, Any]]:
 
 def _read_emergence_kit_soul(input_dir: Path) -> dict[str, Any] | None:
     """Read ``soul_template.json`` if present."""
-    path = input_dir / "soul_template.json"
-    if not path.is_file():
-        return None
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("emergence-kit: soul_template.json unreadable: %s", exc)
-        return None
+    return read_json(input_dir / "soul_template.json", default=lambda: None)  # missing/unreadable: None
 
 
 def _import_kit_crystallizations(
@@ -217,7 +212,27 @@ def _ensure_clobber_safe(path: Path, force: bool, kind: str) -> None:
 
 
 def migrate_emergence_kit(args: EmergenceKitMigrateArgs) -> MigrationReport:
-    """Orchestrate an emergence-kit → companion-emergence migration."""
+    """Orchestrate an emergence-kit → companion-emergence migration, under the migrate lock for its target.
+
+    #754: an install builds in `<name>.new`, so a second run for the same name would delete and refill the first
+    run's build while the first swaps it in. The lock target is chosen as `run_migrate` chooses it.
+    """
+    from brain.migrator.cli import _acquire_migrate_lock, _migrate_lock_path, _release_migrate_lock
+
+    if args.output_dir is not None:
+        lock_target = args.output_dir
+    else:
+        assert args.install_as is not None
+        lock_target = get_persona_dir(args.install_as)
+    lock_path = _migrate_lock_path(lock_target)
+    lock_fd = _acquire_migrate_lock(lock_path)
+    try:
+        return _migrate_emergence_kit_locked(args)
+    finally:
+        _release_migrate_lock(lock_path, lock_fd)
+
+
+def _migrate_emergence_kit_locked(args: EmergenceKitMigrateArgs) -> MigrationReport:
     started = time.monotonic()
 
     if args.output_dir is not None:
@@ -233,6 +248,7 @@ def migrate_emergence_kit(args: EmergenceKitMigrateArgs) -> MigrationReport:
                 f"Persona directory already exists: {final_dir}. "
                 "Pass --force to back up and overwrite."
             )
+        refuse_if_in_use(final_dir)  # #754: before any work; install_over checks again at the swap
         work_dir = final_dir.with_name(f"{args.install_as}.new")
         if work_dir.exists():
             shutil.rmtree(work_dir)
@@ -262,7 +278,7 @@ def migrate_emergence_kit(args: EmergenceKitMigrateArgs) -> MigrationReport:
                 )
                 continue
             seen_ids.add(mem.id)
-            store.create(mem)
+            store.create(mem, fold=False)
             migrated_count += 1
     finally:
         store.close()
@@ -279,29 +295,22 @@ def migrate_emergence_kit(args: EmergenceKitMigrateArgs) -> MigrationReport:
 
     personality_copied = _copy_personality_file(args.input_dir, work_dir)
 
-    if finalise_target is not None:
-        if finalise_target.exists() and args.force:
-            backup = finalise_target.with_name(
-                f"{finalise_target.name}.backup-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S')}"
-            )
-            shutil.move(str(finalise_target), str(backup))
-        os.replace(work_dir, finalise_target)
-        result_dir = finalise_target
-    else:
-        result_dir = work_dir
-
     # Write a small source-manifest with which kit + input dir was
     # used. Different from the OG migrator's per-file SHA manifest;
     # emergence-kit only has ~3 files, recording them by name + size
-    # is enough forensic detail.
+    # is enough forensic detail. It goes into the build, before the swap
+    # (#754: after it, the write would land by path outside the start lock).
     _write_kit_source_manifest(
-        result_dir / "source-manifest.json",
+        work_dir / "source-manifest.json",
         input_dir=args.input_dir,
         memories_imported=migrated_count,
         memories_skipped=len(skipped),
         crystallizations_imported=crystals_imported,
         personality_copied=personality_copied,
     )
+
+    if finalise_target is not None:
+        install_over(finalise_target, work_dir)  # #754: takes the start lock; raises PersonaInUseError while it is held
 
     elapsed = time.monotonic() - started
     return MigrationReport(
@@ -357,7 +366,4 @@ def _write_kit_source_manifest(
             "personality_copied": personality_copied,
         },
     }
-    try:
-        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    except OSError as exc:
-        logger.warning("emergence-kit: source-manifest write failed: %s", exc)
+    write_json(path, payload, indent=2, fsync=False, on_error="log")

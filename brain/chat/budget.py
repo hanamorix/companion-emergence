@@ -28,6 +28,7 @@ import logging
 from pathlib import Path
 
 from brain.bridge.chat import ChatMessage
+from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider
 
 logger = logging.getLogger(__name__)
@@ -88,10 +89,14 @@ def apply_budget(
             emergency_fold_24h(
                 persona_dir,
                 session_id,
-                # Compaction always folds with COMPACTION_MODEL, not the chat model.
+                # Compaction always folds with the compaction job's model, not the chat model.
                 provider=build_compaction_provider(persona_dir),
                 min_keep_tail=preserve_tail_msgs,
             )
+        except ThrottleDeferred as exc:
+            # #456/#473: "not now" (login expired, or the bridge is stopping): skip the persisted fold; the
+            # in-prompt floor below still bounds this turn.
+            logger.info("apply_budget: persisted compaction deferred session=%s: %s", session_id, exc)
         except Exception:
             logger.exception(
                 "apply_budget: persisted compaction failed session=%s; using in-prompt floor",

@@ -1,7 +1,6 @@
 """_format_claude_context_block adds a 'Current time' preamble line, rendered
 in the companion's local time (issue #217), not UTC."""
 
-import json
 import re
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
@@ -33,19 +32,20 @@ def test_preamble_includes_current_time_in_local_zone():
     assert re.search(r"Current time: \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}", block) is None
 
 
-def test_preamble_explains_ts_field():
+def test_preamble_explains_the_line_time():
     msgs = [
         ChatMessage(role="user", content="a", ts="2026-05-20T10:00:00Z"),
         ChatMessage(role="assistant", content="b", ts="2026-05-20T10:05:00Z"),
     ]
     block = _format_claude_context_block(msgs, includes_latest_user=True)
-    assert "ts" in block  # the explanatory line about the field
+    assert "Each line's time (when present)" in block  # the explanatory line about the time clause
     assert "wall-clock" in block.lower()
+    assert "`ts`" not in block  # no field name is described to the model
 
 
 def test_per_message_ts_rendered_in_local_zone_not_utc():
     """Discriminating regression test for #217: a per-message ts stored as
-    UTC must render as local wall-clock time in the JSONL the companion
+    UTC must render as local wall-clock time in the narrative line the companion
     reads, not as the raw UTC string relabeled.
 
     The exact offset depends on the CI runner's OS timezone (unlike the
@@ -53,15 +53,17 @@ def test_per_message_ts_rendered_in_local_zone_not_utc():
     already-non-UTC-offset test double without changing what's under test —
     the conversion itself is the thing being verified). So this asserts two
     things that hold true regardless of the runner's zone: (1) the raw 'Z'
-    (UTC) suffixed string must NOT survive verbatim into the rendered JSONL
+    (UTC) suffixed string must NOT survive verbatim into the rendered line
     - fails pre-fix, where it's passed through unchanged - and (2) the
     rendered value must resolve back to the exact same instant, so the
     conversion is a true zone change and not just a stray reformat."""
     raw_ts = "2026-05-20T17:00:00Z"
     msgs = [ChatMessage(role="user", content="a", ts=raw_ts)]
     block = _format_claude_context_block(msgs, includes_latest_user=True)
-    records = [json.loads(line) for line in block.splitlines() if line.startswith("{")]
-    rendered_ts = records[0]["ts"]
+    [line] = [line for line in block.splitlines() if line.endswith(" User: a")]
+    match = re.match(r"^(\d{4}-\d{2}-\d{2}T\S+) (?:User|you): ", line)
+    assert match is not None
+    rendered_ts = match.group(1)
 
     assert rendered_ts != raw_ts
     assert not rendered_ts.endswith("Z")

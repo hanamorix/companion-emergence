@@ -17,10 +17,10 @@ no separate crash-recovery code path.
 from __future__ import annotations
 
 import contextlib
-import json
 import logging
 from pathlib import Path
 
+from brain.health.json_io import read_json, write_json
 from brain.paths import cadence_state_path
 
 logger = logging.getLogger(__name__)
@@ -37,32 +37,21 @@ def save_progress(persona_dir: Path, job: str, progress: dict) -> None:
     failed save only means the job resumes further back (or from scratch)
     on the next lull, never a crash of the caller.
     """
-    path = _progress_path(persona_dir, job)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp.write_text(json.dumps(progress), encoding="utf-8")
-        tmp.replace(path)
-    except OSError:
-        logger.warning(
-            "job_progress.save_progress: could not persist %s progress (best-effort)",
-            job,
-            exc_info=True,
-        )
-        with contextlib.suppress(OSError):
-            if tmp.exists():
-                tmp.unlink()
+    write_json(
+        _progress_path(persona_dir, job),
+        progress,
+        indent=None,
+        fsync=False,
+        on_error="log",
+        nonfinite="null",
+    )
 
 
 def load_progress(persona_dir: Path, job: str) -> dict:
     """Load ``job``'s saved progress. Missing/corrupt -> ``{}`` (fail toward
     redoing a little work from scratch, never toward silently skipping
     some)."""
-    try:
-        data = json.loads(_progress_path(persona_dir, job).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
+    return read_json(_progress_path(persona_dir, job), default=dict, expect=dict)
 
 
 def clear_progress(persona_dir: Path, job: str) -> None:

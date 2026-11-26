@@ -17,6 +17,7 @@ from brain.maker import config as _cfg
 from brain.maker.budget import consume_budget
 from brain.maker.charge import accumulate, load_charge, save_charge
 from brain.maker.sources import current_emotional_intensity, dreams_since, soul_pending_count
+from brain.utils.time import hours_since
 
 logger = logging.getLogger(__name__)
 
@@ -61,13 +62,9 @@ def run_maker_tick(
     if state.charge < threshold:
         return
     # cooldown gate
-    if state.last_fire_ts:
-        try:
-            elapsed = (now - datetime.fromisoformat(state.last_fire_ts)).total_seconds() / 3600.0
-            if elapsed < cooldown_hours:
-                return
-        except ValueError:
-            pass
+    elapsed = hours_since(state.last_fire_ts, now)  # None for an unusable stamp: it cannot hold a cooldown (#485)
+    if elapsed is not None and elapsed < cooldown_hours:
+        return
     # Pre-flight throttle gate — a defer must cost NOTHING. Check the slot BEFORE
     # consuming budget or engaging cooldown, so a transient yield doesn't burn the
     # day's making and scream a traceback (Windows v0.0.38 report). The runner's
@@ -88,6 +85,7 @@ def run_maker_tick(
         if make_fn is not None:
             make_fn(persona_dir=persona_dir, store=store, provider=provider, now=now)
         state.charge = 0.0
+        state.emotion_part = state.soul_part = state.dream_part = 0.0  # what built it goes with it (#721)
         state.last_fire_ts = now.isoformat()
     except ThrottleDeferred:
         # Lost the slot in the pre-flight→acquire race. A quiet no-op: leave the
@@ -96,6 +94,11 @@ def run_maker_tick(
         return
     except Exception:
         logger.exception("maker: making failed — partial charge, cooldown engaged")
+        # The parts shrink with the charge, keeping their proportions, so they still sum to it (#721).
+        scale = _cfg.FAILED_MAKE_CHARGE / state.charge if state.charge > 0.0 else 0.0
+        state.emotion_part *= scale
+        state.soul_part *= scale
+        state.dream_part *= scale
         state.charge = _cfg.FAILED_MAKE_CHARGE
         state.last_fire_ts = now.isoformat()  # no tight retry loop
     save_charge(persona_dir, state)

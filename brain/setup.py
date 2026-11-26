@@ -59,7 +59,6 @@ def write_persona_config(
     provider: str | None = None,
     searcher: str | None = None,
     mcp_audit_log_level: str | None = None,
-    model: str | None = None,
     user_pronouns: str | None = None,
 ) -> Path:
     """Write or update <persona_dir>/persona_config.json with user_name.
@@ -87,8 +86,6 @@ def write_persona_config(
         cfg.searcher = searcher
     if mcp_audit_log_level is not None:
         cfg.mcp_audit_log_level = mcp_audit_log_level
-    if model is not None:
-        cfg.model = model
     if user_pronouns is not None:
         from brain.pronouns import PRESETS, to_dict
 

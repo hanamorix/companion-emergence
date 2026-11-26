@@ -527,3 +527,17 @@ def test_missing_state_walk_writes_nothing(tmp_path):
     felt_time_now(persona_dir=tmp_path)
     assert snapshot() == before
     assert not (tmp_path / "felt_time_state.json").exists()
+
+
+def test_weather_shift_is_not_an_anchor_type():
+    """#785: the weather-shift anchor never fired, so it is gone everywhere an anchor type is named."""
+    from brain.felt_time.anchors import _SOURCES
+    from brain.felt_time.state import ANCHOR_TYPES, LOG_SOURCES
+    from brain.tools.schemas import SCHEMAS
+
+    assert "weather_shift" not in ANCHOR_TYPES
+    assert "weather_shifts.log.jsonl" not in LOG_SOURCES
+    assert "weather_shift" not in _SOURCES
+    enum = SCHEMAS["pressure_since"]["parameters"]["properties"]["anchor_type"]["enum"]
+    assert "weather_shift" not in enum
+    assert "weather_shift" not in SCHEMAS["felt_time_now"]["description"]

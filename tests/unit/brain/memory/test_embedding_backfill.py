@@ -22,9 +22,9 @@ from pathlib import Path
 
 import pytest
 
+from brain import dev_constants
 from brain.memory import embedding_backfill
 from brain.memory.embedding_backfill import (
-    DEFAULT_SCAN_CAP,
     MIN_CHARS_TO_EMBED,
     _load_cursor,
     delete_legacy_embeddings_db,
@@ -56,6 +56,14 @@ def _seed(persona_dir: Path, n: int, *, prefix: str = "memory content long enoug
             store.create(m)
             made.append(m)
         return made
+    finally:
+        store.close()
+
+
+def _rowid_of(persona_dir: Path, memory_id: str) -> int:
+    store = _open_store(persona_dir)
+    try:
+        return store._conn.execute("SELECT rowid FROM memories WHERE id = ?", (memory_id,)).fetchone()[0]
     finally:
         store.close()
 
@@ -259,7 +267,7 @@ def test_cursor_advances_not_resets_when_batch_cap_stops_a_tick_short_of_its_win
     # not reset to None, even though len(candidates)=10 < scan_cap=100.
     persisted = _load_cursor(tmp_path, model_id)
     assert persisted is not None
-    assert persisted[1] == made[2].id
+    assert persisted == _rowid_of(tmp_path, made[2].id)
 
     # Tick 2 continues from the persisted cursor instead of re-scanning from
     # the top — it must not re-see the 3 already-embedded rows.
@@ -324,9 +332,20 @@ def test_scan_cap_bounds_rows_examined(tmp_path: Path) -> None:
     assert result.embedded == 5
 
 
-def test_default_scan_cap_is_reasonable() -> None:
-    """Sanity: the module constant is a genuine bound, not accidentally unlimited."""
-    assert 0 < DEFAULT_SCAN_CAP < 100_000
+def test_tick_without_scan_cap_reads_the_dev_constant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Omitting scan_cap means `dev_constants.DEFAULT_SCAN_CAP`, read when the tick runs (so a patched value bites)."""
+    monkeypatch.setattr(dev_constants, "DEFAULT_SCAN_CAP", 5)
+    _seed(tmp_path, 50)
+    store = _open_store(tmp_path)
+    try:
+        result = run_embedding_backfill_tick(tmp_path, store, batch_size=100)
+    finally:
+        store.close()
+
+    assert result.scanned == 5
+    assert result.embedded == 5
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +515,7 @@ def test_kill_and_rerun_resumes_without_dupes(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Keyset pagination / tied created_at
+# Rowid walk / tied created_at
 # ---------------------------------------------------------------------------
 
 
@@ -506,8 +525,8 @@ def test_tied_created_at_row_is_reachable_and_gets_embedded_across_ticks(
     """3 memories share an IDENTICAL created_at (the shape a bulk migrator
     import produces). Under a bare-timestamp cursor, a tick that embedded 2
     of the 3 would pin the cursor at their shared created_at and the 3rd
-    memory would become permanently unreachable. With the (created_at, id)
-    keyset cursor, the 3rd memory must still be embedded."""
+    memory would become permanently unreachable. With the rowid cursor (every
+    row has its own position), the 3rd memory must still be embedded."""
     shared_ts = datetime(2020, 1, 1, tzinfo=UTC)
     store = _open_store(tmp_path)
     made = []
@@ -518,9 +537,8 @@ def test_tied_created_at_row_is_reachable_and_gets_embedded_across_ticks(
         made.append(m)
     store.close()
 
-    # Tick 1: batch_size=2 processes the first 2 (by id, since created_at
-    # ties) and, since the backlog is larger than scan_cap, pins a forward
-    # cursor at the shared timestamp + the 2nd row's id.
+    # Tick 1: batch_size=2 processes the first 2 (in insertion order) and, since
+    # the backlog is larger than scan_cap, pins a forward cursor at the 2nd row's rowid.
     store = _open_store(tmp_path)
     result1 = run_embedding_backfill_tick(tmp_path, store, batch_size=2, scan_cap=2)
     store.close()
@@ -532,8 +550,8 @@ def test_tied_created_at_row_is_reachable_and_gets_embedded_across_ticks(
     assert _is_embedded(store_check, made[2].id) is False
     store_check.close()
 
-    # Tick 2: the 3rd memory — sharing the exact created_at with the row the
-    # cursor is pinned at — must still be reachable and get embedded.
+    # Tick 2: the 3rd memory — sharing the exact created_at with the rows
+    # already done — must still be reachable and get embedded.
     store = _open_store(tmp_path)
     result2 = run_embedding_backfill_tick(tmp_path, store, batch_size=2, scan_cap=2)
     store.close()
@@ -792,7 +810,7 @@ def test_backfill_writes_land_in_the_warm_matrix(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 1)
     store = _open_store(tmp_path)
@@ -823,7 +841,7 @@ def test_warm_matrix_put_failure_is_not_counted_as_a_backfill_error(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     def _boom_put(self, memory_id: str, vector) -> None:  # noqa: ANN001, ARG001
         raise RuntimeError("simulated warm-matrix put failure")
@@ -877,7 +895,7 @@ def test_backfill_reembeds_stale_model_rows_after_a_model_swap(
     store = _open_store(tmp_path)
     # Embed both rows under the "old" model first.
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: old_provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, old_provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, old_provider.model_id())
     store.embed_row(stale_row.id, stale_row.content)
     store.embed_row(current_row.id, current_row.content)
 
@@ -887,7 +905,7 @@ def test_backfill_reembeds_stale_model_rows_after_a_model_swap(
     new_provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     assert new_provider.model_id() != old_provider.model_id()
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: new_provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, new_provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, new_provider.model_id())
     store.embed_row(current_row.id, current_row.content)
 
     result = run_embedding_backfill_tick(tmp_path, store, batch_size=10, scan_cap=10)
@@ -923,7 +941,7 @@ def test_backfill_is_a_no_op_when_all_rows_match_the_current_model(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 3)
     store = _open_store(tmp_path)
@@ -955,7 +973,7 @@ def test_drain_embeds_every_row_and_terminates_with_empty_backlog(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 11)
     store = _open_store(tmp_path)
@@ -980,6 +998,32 @@ def test_drain_embeds_every_row_and_terminates_with_empty_backlog(
         assert store2.count_unembedded(current_model_id=provider.model_id(), min_chars=1) == 0
     finally:
         store2.close()
+
+
+def test_drain_without_scan_cap_reads_the_dev_constant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The drain resolves an omitted scan_cap to `dev_constants.DEFAULT_SCAN_CAP` itself: each of its ticks is bounded by
+    it, and its own stall check compares against the same figure."""
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setattr(dev_constants, "DEFAULT_SCAN_CAP", 3)
+
+    _seed(tmp_path, 11)
+    store = _open_store(tmp_path)
+    try:
+        result = run_embedding_backfill_to_completion(tmp_path, store, batch_size=100)
+    finally:
+        store.close()
+
+    assert result.embedded == 11
+    assert result.stopped_reason == "no_more_candidates"
+    # The batch size would take all 11 rows in one tick: only a scan window of 3 forces at least four ticks that embed.
+    assert result.ticks >= 4
 
 
 def test_drain_terminates_when_a_row_permanently_fails_without_looping_forever(
@@ -1018,7 +1062,7 @@ def test_drain_terminates_when_a_row_permanently_fails_without_looping_forever(
 
     provider = _AlwaysFailsOnTwo()
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     store = _open_store(tmp_path)
     try:
@@ -1082,7 +1126,7 @@ def test_drain_scattered_failure_in_a_large_backlog_still_terminates(
 
     provider = _FailsOnOneBuried()
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     store = _open_store(tmp_path)
     try:
@@ -1118,7 +1162,7 @@ def test_drain_progress_cb_reports_cumulative_running_totals(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     _seed(tmp_path, 7)
     store = _open_store(tmp_path)
@@ -1153,7 +1197,7 @@ def test_drain_empty_backlog_returns_immediately(
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, provider.model_id())
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     store = _open_store(tmp_path)  # no memories seeded at all
     try:
@@ -1192,10 +1236,12 @@ def test_delete_legacy_embeddings_db_deletes_when_fully_embedded(
     """(a) embeddings.db exists + every active >=MIN_CHARS row already
     carries a current-model embedding -> the file AND its -wal/-shm
     sidecars are deleted."""
+    from brain.bridge import model_tier
     from brain.memory import embeddings as embeddings_mod
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 2)
     store = _open_store(tmp_path)
@@ -1221,10 +1267,12 @@ def test_delete_legacy_embeddings_db_defers_when_backlog_nonempty(
 ) -> None:
     """(b) embeddings.db exists but some active row is still un-embedded
     under the current model -> NOT deleted, deferred for the next run."""
+    from brain.bridge import model_tier
     from brain.memory import embeddings as embeddings_mod
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 2)
     store = _open_store(tmp_path)
@@ -1274,10 +1322,12 @@ def test_delete_legacy_embeddings_db_idempotent_rerun(
 ) -> None:
     """(d) a second call after the file is already gone is a clean no-op —
     does not raise, does not re-log a deletion."""
+    from brain.bridge import model_tier
     from brain.memory import embeddings as embeddings_mod
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 1)
     store = _open_store(tmp_path)
@@ -1300,10 +1350,12 @@ def test_delete_legacy_embeddings_db_delete_error_is_caught_and_logged(
 ) -> None:
     """(e) a delete failure (e.g. a permission error) is caught + logged,
     never raised — a stuck stale file must never crash a startup caller."""
+    from brain.bridge import model_tier
     from brain.memory import embeddings as embeddings_mod
 
     provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
     monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
 
     made = _seed(tmp_path, 1)
     store = _open_store(tmp_path)
@@ -1324,3 +1376,293 @@ def test_delete_legacy_embeddings_db_delete_error_is_caught_and_logged(
     assert result is False
     assert db_path.exists()  # left in place, not partially removed
     assert "failed to delete legacy embeddings.db" in caplog.text
+
+
+def _trap_provider_construction(
+    monkeypatch: pytest.MonkeyPatch, built: list[str] | None = None
+) -> list[str]:
+    """Make building any embedding provider fail the test: both the cached
+    builder and `FastEmbedProvider.__init__` (which downloads the ~2.1 GB
+    model when it is not cached). Returns the list a call would append to (the
+    given one, so several traps can share it)."""
+    from brain.memory import embeddings as embeddings_mod
+
+    built = [] if built is None else built
+
+    def _boom(*_a: object, **_k: object) -> None:
+        built.append("built")
+        raise AssertionError("an embedding provider was constructed just to read the model id")
+
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", _boom)
+    monkeypatch.setattr(embeddings_mod.FastEmbedProvider, "__init__", _boom)
+    return built
+
+
+def test_delete_legacy_embeddings_db_builds_no_provider_to_read_the_model_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file-exists path reads the current model id with
+    `resolve_embedding_model_id()`: no provider is built, both when the
+    backlog is empty (deleted) and when it is not (deferred)."""
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
+    made = _seed(tmp_path, 2)
+    store = _open_store(tmp_path)
+    try:
+        store.embed_row(made[0].id, made[0].content)  # the second row stays backlog
+        db_path = _write_dummy_embeddings_db(tmp_path)
+        built = _trap_provider_construction(monkeypatch)
+        assert delete_legacy_embeddings_db(tmp_path, store) is False  # deferred
+        assert db_path.exists()
+        monkeypatch.setattr(embeddings_mod, "build_embedding_provider", lambda: provider)
+        store.embed_row(made[1].id, made[1].content)
+        _trap_provider_construction(monkeypatch, built)
+        assert delete_legacy_embeddings_db(tmp_path, store) is True  # deleted
+    finally:
+        store.close()
+    assert built == []
+    assert not db_path.exists()
+
+
+def test_drain_final_count_builds_no_provider_of_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each tick and each embedded row look the provider up; the drain's
+    closing backlog count adds no build of its own (it reads the id only)."""
+    from brain.bridge import model_tier
+    from brain.memory import embeddings as embeddings_mod
+
+    provider = embeddings_mod.FakeEmbeddingProvider(dim=384)
+    builds: list[int] = []
+
+    def _counting() -> EmbeddingProvider:
+        builds.append(1)
+        return provider
+
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", _counting)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, provider.model_id())
+    _seed(tmp_path, 4)
+    store = _open_store(tmp_path)
+    try:
+        result = run_embedding_backfill_to_completion(tmp_path, store, batch_size=2, scan_cap=2)
+    finally:
+        store.close()
+    assert result.embedded == 4 and result.failed == 0
+    # One build per tick, one per embedded row (`MemoryStore.embed_row`), and
+    # none for the closing count.
+    assert len(builds) == result.ticks + result.embedded
+
+
+# ---------------------------------------------------------------------------
+# Insertion-order cursor (sfa S31(b), Engine 5): the persisted cursor is {"rowid": n}
+# ---------------------------------------------------------------------------
+
+
+def _model_id() -> str:
+    from brain.memory import embeddings as embeddings_mod
+
+    return embeddings_mod.build_embedding_provider().model_id()
+
+
+def _write_cursor_file(persona_dir: Path, payload: object) -> None:
+    path = cadence_state_path(persona_dir, "embedding_backfill_cursor.json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _read_cursor_file(persona_dir: Path) -> dict:
+    path = cadence_state_path(persona_dir, "embedding_backfill_cursor.json")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("cursor", "expected"),
+    [
+        pytest.param({"rowid": 0}, 0, id="zero"),
+        pytest.param({"rowid": 5}, 5, id="five"),
+        pytest.param({"rowid": 2**63 - 1}, 2**63 - 1, id="largest-bindable"),
+    ],
+)
+def test_load_cursor_reads_a_rowid(tmp_path: Path, cursor: object, expected: int) -> None:
+    _write_cursor_file(tmp_path, {"model_id": _model_id(), "cursor": cursor})
+    assert _load_cursor(tmp_path, _model_id()) == expected
+
+
+_NO_BASE_FAILURE_REASON = (
+    "a cursor of any of these shapes already read as None on the created_at cursor, so no old code can fail the cell; it pins "
+    "that the rowid cursor keeps refusing them (the bool, float, negative and over-2**63 cases are the new validator's own refusals)"
+)
+
+
+@pytest.mark.no_base_failure(reason=_NO_BASE_FAILURE_REASON)
+@pytest.mark.parametrize(
+    "cursor",
+    [
+        pytest.param("2020-01-03T00:00:00+00:00", id="bare-string"),
+        pytest.param({"rowid": True}, id="bool"),
+        pytest.param({"rowid": "5"}, id="string"),
+        pytest.param({"rowid": -1}, id="negative"),
+        pytest.param({"rowid": 1.5}, id="float"),
+        pytest.param({"rowid": 1.0}, id="whole-float"),
+        pytest.param({"rowid": 2**63}, id="one-past-bindable"),
+        pytest.param({"rowid": 10**30}, id="huge"),
+        pytest.param({"id": "abc"}, id="no-rowid-key"),
+        pytest.param(None, id="null"),
+        pytest.param([5], id="list"),
+    ],
+)
+def test_load_cursor_refuses_every_unusable_cursor(tmp_path: Path, cursor: object) -> None:
+    _write_cursor_file(tmp_path, {"model_id": _model_id(), "cursor": cursor})
+    assert _load_cursor(tmp_path, _model_id()) is None
+
+
+def test_load_cursor_refuses_the_old_created_at_form(tmp_path: Path) -> None:
+    _write_cursor_file(
+        tmp_path, {"model_id": _model_id(), "cursor": {"created_at": "2020-01-03T00:00:00+00:00", "id": "abc"}}
+    )
+    assert _load_cursor(tmp_path, _model_id()) is None
+
+
+@pytest.mark.no_base_failure(reason="the model-swap, missing-file and non-dict reads were None on the created_at cursor too; this pins they stay None")
+def test_load_cursor_of_a_model_swap_a_missing_file_and_a_non_dict_file_is_none(tmp_path: Path) -> None:
+    assert _load_cursor(tmp_path, _model_id()) is None  # no file
+    _write_cursor_file(tmp_path, {"model_id": "some-other-model", "cursor": {"rowid": 5}})
+    assert _load_cursor(tmp_path, _model_id()) is None  # a model swap
+    _write_cursor_file(tmp_path, [1, 2, 3])
+    assert _load_cursor(tmp_path, _model_id()) is None  # not a dict
+
+
+def test_the_persisted_cursor_file_holds_the_last_rowid_then_null_when_drained(tmp_path: Path) -> None:
+    made = _seed(tmp_path, 4)
+    store = _open_store(tmp_path)
+    try:
+        run_embedding_backfill_tick(tmp_path, store, batch_size=2, scan_cap=100)
+    finally:
+        store.close()
+    saved = _read_cursor_file(tmp_path)
+    assert saved["model_id"] == _model_id()
+    assert saved["cursor"] == {"rowid": _rowid_of(tmp_path, made[1].id)}
+    assert type(saved["cursor"]["rowid"]) is int
+    store = _open_store(tmp_path)
+    try:
+        run_embedding_backfill_tick(tmp_path, store, batch_size=5, scan_cap=100)  # drains the rest
+    finally:
+        store.close()
+    assert _read_cursor_file(tmp_path)["cursor"] is None
+
+
+def test_a_cursor_file_in_the_old_created_at_form_starts_over_once_and_is_rewritten(tmp_path: Path) -> None:
+    made = _seed(tmp_path, 4)
+    _write_cursor_file(
+        tmp_path,
+        {"model_id": _model_id(), "cursor": {"created_at": "2020-01-03T00:00:00+00:00", "id": made[2].id}},
+    )
+    store = _open_store(tmp_path)
+    try:
+        result = run_embedding_backfill_tick(tmp_path, store, batch_size=1, scan_cap=100)
+    finally:
+        store.close()
+    assert result.embedded == 1
+    store = _open_store(tmp_path)
+    try:
+        assert _is_embedded(store, made[0].id) is True  # from the top: the first backlog row, not the row after the old cursor
+        assert _is_embedded(store, made[3].id) is False
+    finally:
+        store.close()
+    assert _read_cursor_file(tmp_path)["cursor"] == {"rowid": _rowid_of(tmp_path, made[0].id)}  # rewritten in the new form
+
+
+def _embedded_ids_per_tick(monkeypatch, tmp_path: Path, ticks: int) -> list[list[str]]:
+    """Run `ticks` single-row ticks, recording which ids `embed_row` was called for in each."""
+    per_tick: list[list[str]] = []
+    real_embed_row = MemoryStore.embed_row
+    current: list[str] = []
+
+    def spy(self, memory_id, content):
+        current.append(memory_id)
+        return real_embed_row(self, memory_id, content)
+
+    monkeypatch.setattr(MemoryStore, "embed_row", spy)
+    for _ in range(ticks):
+        current.clear()
+        store = _open_store(tmp_path)
+        try:
+            run_embedding_backfill_tick(tmp_path, store, batch_size=1, scan_cap=100)
+        finally:
+            store.close()
+        per_tick.append(list(current))
+    monkeypatch.setattr(MemoryStore, "embed_row", real_embed_row)
+    return per_tick
+
+
+def _set_created_at(persona_dir: Path, memory_id: str, when: datetime) -> None:
+    store = _open_store(persona_dir)
+    try:
+        store._conn.execute("UPDATE memories SET created_at = ? WHERE id = ?", (when.isoformat(), memory_id))
+        store._conn.commit()
+    finally:
+        store.close()
+
+
+def test_ticks_walk_insertion_order_when_a_row_is_moved_in_time(tmp_path: Path, monkeypatch) -> None:
+    a, b, c = _seed(tmp_path, 3)
+    first = _embedded_ids_per_tick(monkeypatch, tmp_path, 1)
+    assert first == [[a.id]]
+    _set_created_at(tmp_path, b.id, datetime(2019, 1, 1, tzinfo=UTC))  # earlier than A's
+    _set_created_at(tmp_path, c.id, datetime(2040, 1, 1, tzinfo=UTC))  # far future
+    rest = _embedded_ids_per_tick(monkeypatch, tmp_path, 2)
+    assert rest == [[b.id], [c.id]]  # insertion order; a created_at cursor would give [[c], [b]]
+
+
+def test_a_row_refreshed_by_the_write_back_is_visited_once_in_insertion_order(tmp_path: Path, monkeypatch) -> None:
+    a, b, c = _seed(tmp_path, 3)
+    assert _embedded_ids_per_tick(monkeypatch, tmp_path, 1) == [[a.id]]
+    # The write-back of a recalled row B whose re-embed fails: B keeps no vector and its created_at becomes now.
+    store = _open_store(tmp_path)
+    try:
+        with monkeypatch.context() as patched:
+            patched.setattr(MemoryStore, "embed_row", lambda self, memory_id, content: (_ for _ in ()).throw(RuntimeError("no model")))
+            store.refresh_faded_emotions(b.id, {}, datetime.now(UTC))
+        assert _is_embedded(store, b.id) is False
+    finally:
+        store.close()
+    rest = _embedded_ids_per_tick(monkeypatch, tmp_path, 3)
+    assert rest == [[b.id], [c.id], []]  # each id once, in insertion order, then nothing left
+    store = _open_store(tmp_path)
+    try:
+        assert all(_is_embedded(store, m.id) for m in (a, b, c))
+    finally:
+        store.close()
+
+
+def test_a_row_that_goes_null_again_behind_the_cursor_waits_for_the_reset(tmp_path: Path, monkeypatch) -> None:
+    # The accepted bound (module docstring): a row behind a persisted cursor is offered again only after a draining tick resets it.
+    a, b, c = _seed(tmp_path, 3)
+    store = _open_store(tmp_path)
+    try:
+        run_embedding_backfill_tick(tmp_path, store, batch_size=2, scan_cap=100)  # A, B embedded; cursor at B
+        store._conn.execute("UPDATE memories SET embedding = NULL, embedding_model_id = NULL WHERE id = ?", (a.id,))
+        store._conn.commit()
+    finally:
+        store.close()
+    assert _read_cursor_file(tmp_path)["cursor"] == {"rowid": _rowid_of(tmp_path, b.id)}
+    per_tick = _embedded_ids_per_tick(monkeypatch, tmp_path, 2)
+    assert per_tick == [[c.id], [a.id]]  # C first (A is behind the cursor); the draining tick reset it, so A comes next
+
+
+def test_the_persisted_cursor_is_the_rowid_not_a_count_of_rows_scanned(tmp_path: Path) -> None:
+    # Rows 1 and 2 are already embedded, so the backlog starts at rowid 3 and a count of scanned rows (1, 2) differs from the rowid.
+    made = _seed(tmp_path, 5)
+    store = _open_store(tmp_path)
+    try:
+        for memory in made[:2]:
+            store.embed_row(memory.id, memory.content)
+        run_embedding_backfill_tick(tmp_path, store, batch_size=1, scan_cap=100)  # embeds made[2], rowid 3
+    finally:
+        store.close()
+    assert _rowid_of(tmp_path, made[2].id) == 3
+    assert _read_cursor_file(tmp_path)["cursor"] == {"rowid": 3}

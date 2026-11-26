@@ -7,7 +7,7 @@ as conversation turns; the energy formula needs the raw turn-level data.
 
 Fails-safe to 0 on any exception so chat composition never breaks.
 
-Spec: docs/superpowers/specs/2026-04-29-body-state-design.md §3.2.
+Spec: docs/source-spec/2026-04-29-body-state-design.md §3.2.
 """
 
 from __future__ import annotations
@@ -15,12 +15,10 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from brain.health.jsonl_reader import read_jsonl_skipping_corrupt
-from brain.memory.store import MemoryStore
+from brain.health.json_io import iter_jsonl
 
 
 def count_words_in_session(
-    store: MemoryStore,  # noqa: ARG001 — unused; kept for signature symmetry across body helpers
     *,
     persona_dir: Path,
     session_hours: float,
@@ -49,7 +47,7 @@ def count_words_in_session(
         if not active_dir.exists():
             return 0
         for jsonl_path in active_dir.glob("*.jsonl"):
-            for turn in read_jsonl_skipping_corrupt(jsonl_path):
+            for turn in iter_jsonl(jsonl_path):
                 if turn.get("speaker") != "assistant":
                     continue
                 ts_raw = turn.get("ts")

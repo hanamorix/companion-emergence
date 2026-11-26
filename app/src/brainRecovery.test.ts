@@ -24,6 +24,9 @@ vi.mock("./bridgeVersionCheck", () => ({ ensureBridgeCurrent: vi.fn(async () => 
 vi.mock("./hooks/useRestartBridge", () => ({
   restartBridge: vi.fn(async () => true),
   clearRestartState: vi.fn(),
+  awaitStoppingBridge: vi.fn(async () => true),
+  showEngineProgress: vi.fn(),
+  endEngineProgress: vi.fn(),
 }));
 
 const P = "nell";
@@ -68,6 +71,64 @@ afterEach(() => {
 });
 
 describe("launchBrain (#335)", () => {
+  it("(#456 C17 h, i) waits for a bridge still stopping, then calls the normal start", async () => {
+    status(NONE);
+    const order: string[] = [];
+    vi.mocked(restartModule.awaitStoppingBridge).mockImplementationOnce(async () => {
+      order.push("wait");
+      return true;
+    });
+    vi.mocked(appConfig.ensureBridgeRunning).mockImplementationOnce(async () => {
+      order.push("start");
+    });
+    expect((await launchBrain(P)).kind).toBe("ready");
+    expect(order).toEqual(["wait", "start"]);
+    expect(restartModule.awaitStoppingBridge).toHaveBeenCalledWith(P);
+    expect(restartModule.clearRestartState).toHaveBeenCalled(); // a wait nobody pressed leaves no button state
+  });
+
+  it("(HR5) the launch's start shows the engine's progress and ends it, after the stop wait's own clear", async () => {
+    status(NONE);
+    const order: string[] = [];
+    vi.mocked(restartModule.clearRestartState).mockImplementationOnce(() => void order.push("clear"));
+    vi.mocked(appConfig.ensureBridgeRunning).mockImplementationOnce(async (_persona, onProgress) => {
+      order.push(onProgress === restartModule.showEngineProgress ? "start with the display" : "start without");
+    });
+    vi.mocked(restartModule.endEngineProgress).mockImplementationOnce(() => void order.push("end"));
+    expect((await launchBrain(P)).kind).toBe("ready");
+    expect(order).toEqual(["clear", "start with the display", "end"]);
+  });
+
+  it("(HR5) the display is ended when the launch's start fails too", async () => {
+    status(NONE);
+    starts(false);
+    await launchBrain(P);
+    expect(vi.mocked(appConfig.ensureBridgeRunning).mock.calls[0]).toEqual([P, restartModule.showEngineProgress]);
+    expect(restartModule.endEngineProgress).toHaveBeenCalledTimes(1);
+  });
+
+  it("(HN7) the launch ends the display with the start's real outcome: true when it came up, false when it threw", async () => {
+    status(NONE);
+    expect((await launchBrain(P)).kind).toBe("ready");
+    expect(vi.mocked(restartModule.endEngineProgress).mock.calls).toEqual([[true]]);
+    vi.mocked(restartModule.endEngineProgress).mockClear();
+    status(NONE);
+    starts(false);
+    await launchBrain(P);
+    expect(vi.mocked(restartModule.endEngineProgress).mock.calls).toEqual([[false]]);
+  });
+
+  it("(HR5) the recovery's own starts have no screen to show progress on and pass no callback", async () => {
+    status({ active_commit: NEW, confirmed: false, undo: "rollback" }, { active_commit: OLD, confirmed: true, undo: "revert" });
+    rollsBackTo(OLD);
+    starts(false, true);
+    await launchBrain(P);
+    const calls = vi.mocked(appConfig.ensureBridgeRunning).mock.calls;
+    expect(calls.length).toBe(2);
+    expect(calls[0]).toEqual([P, restartModule.showEngineProgress]); // the launch's start
+    expect(calls[1]).toEqual([P]); // startOk inside recoverUnhealthyBrain
+  });
+
   it("no active overlay: unchanged launch", async () => {
     status(NONE);
     expect(await launchBrain(P)).toEqual({ kind: "ready", versionMismatch: false, notice: null });

@@ -51,7 +51,7 @@ def _run(rc: int, is_error: bool, text: str) -> MagicMock:
 
 def _client(persona_dir: Path, monkeypatch) -> TestClient:
     # Route every provider construction to the REAL ClaudeCliProvider; the CLI itself is faked.
-    monkeypatch.setattr("brain.bridge.provider.get_provider", lambda *a, **k: ClaudeCliProvider(model="sonnet"))
+    monkeypatch.setattr("brain.bridge.provider.get_provider", lambda *a, **k: ClaudeCliProvider(probe_model="sonnet"))
     return TestClient(build_app(persona_dir=persona_dir, client_origin="tests"))
 
 

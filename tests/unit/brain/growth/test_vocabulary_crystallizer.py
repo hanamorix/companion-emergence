@@ -22,7 +22,7 @@ def test_crystallizer_returns_empty_when_there_is_not_enough_evidence() -> None:
     try:
         store.create(_mem("one tender complicated moment", {"love": 8, "grief": 7}))
 
-        result = crystallize_vocabulary(store, current_vocabulary_names=set())
+        result = crystallize_vocabulary(store, current_vocabulary_names=set(), eng=None)
 
         assert result == []
     finally:
@@ -40,7 +40,7 @@ def test_crystallizer_proposes_recurring_unnamed_emotional_configuration() -> No
         store.create(third)
         store.create(_mem("plain joy", {"joy": 9}))
 
-        result = crystallize_vocabulary(store, current_vocabulary_names={"love", "grief", "joy"})
+        result = crystallize_vocabulary(store, current_vocabulary_names={"love", "grief", "joy"}, eng=None)
 
         assert len(result) == 1
         proposal = result[0]
@@ -65,6 +65,7 @@ def test_crystallizer_skips_configuration_when_name_already_exists() -> None:
         result = crystallize_vocabulary(
             store,
             current_vocabulary_names={"love", "grief", "love_grief_blend"},
+            eng=None,
         )
 
         assert result == []
@@ -81,7 +82,7 @@ def test_crystallizer_treats_reversed_blend_name_as_existing() -> None:
         store.create(_mem("grief softened by love", {"love": 9, "grief": 7}))
 
         result = crystallize_vocabulary(
-            store, current_vocabulary_names={"love", "grief", "grief_love_blend"}
+            store, current_vocabulary_names={"love", "grief", "grief_love_blend"}, eng=None
         )
 
         assert result == []
@@ -97,7 +98,7 @@ def test_crystallizer_mints_blend_name_in_canonical_sorted_order() -> None:
         store.create(_mem("another love-grief evening", {"love": 8, "grief": 7}))
         store.create(_mem("grief softened by love", {"love": 9, "grief": 7}))
 
-        result = crystallize_vocabulary(store, current_vocabulary_names={"love", "grief"})
+        result = crystallize_vocabulary(store, current_vocabulary_names={"love", "grief"}, eng=None)
 
         assert [p.name for p in result] == ["grief_love_blend"]
     finally:
@@ -113,7 +114,7 @@ def test_crystallizer_treats_hyphen_and_case_variants_as_existing() -> None:
         store.create(_mem("grief softened by love", {"love": 9, "grief": 7}))
 
         result = crystallize_vocabulary(
-            store, current_vocabulary_names={"love", "grief", "Love-Grief_blend"}
+            store, current_vocabulary_names={"love", "grief", "Love-Grief_blend"}, eng=None
         )
 
         assert result == []

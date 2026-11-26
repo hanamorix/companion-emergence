@@ -6,11 +6,13 @@ interface Props {
 }
 
 /**
- * Soul — one crystallization highlight. Highest resonance, ties broken
- * by recency. The framework picks; this just renders.
+ * Soul — the newest crystallization as the card, and the strongest one
+ * (highest resonance) as a quiet line beneath it when it is a different
+ * moment (#637). The framework picks; this just renders.
  */
 export function SoulPanel({ state }: Props) {
   const soul = state?.soul_highlight;
+  const strongest = state?.soul_strongest;
   return (
     <PanelShell>
       <SectionLabel>Soul</SectionLabel>
@@ -68,6 +70,24 @@ export function SoulPanel({ state }: Props) {
               }}
             >
               {soul.why_it_matters}
+            </div>
+          )}
+          {strongest && (
+            <div
+              data-testid="soul-strongest"
+              style={{
+                fontSize: 10.5,
+                color: "var(--text-mute)",
+                marginTop: 12,
+                paddingTop: 10,
+                borderTop: "1px solid color-mix(in srgb, var(--accent) 16%, transparent)",
+                lineHeight: 1.5,
+              }}
+            >
+              <span style={{ fontWeight: 700, color: "var(--text-mid)" }}>Strongest</span>
+              {" · "}
+              <span style={{ fontStyle: "italic", fontFamily: "var(--font-disp)" }}>"{strongest.moment}"</span>
+              {" · "}Resonance {strongest.resonance} · {formatDate(strongest.crystallized_at)}
             </div>
           )}
         </>

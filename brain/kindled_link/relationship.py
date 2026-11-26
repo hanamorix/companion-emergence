@@ -13,14 +13,16 @@ import json
 import logging
 import math
 import re
+import sqlite3
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from brain import prompt_strings
+from brain import dev_constants, prompt_strings
 from brain.bridge import cli_throttle as _default_throttle
-from brain.kindled_link import limits
+from brain.health.json_io import append_jsonl, read_json, write_json
+from brain.health.parse_failures import record_parse_failure
 from brain.state_compat import from_known_fields
 
 log = logging.getLogger(__name__)
@@ -32,6 +34,9 @@ _WHITESPACE_RE = re.compile(r"\s+")
 # Text externalized to prompt_strings.toml [kindled_link.relationship] (issue #129 stage 2b).
 _REFLECTION_PROMPT_SEGMENTS = prompt_strings.register_segments(
     "kindled_link.relationship.reflection_prompt_segments"
+)
+_REFLECTION_PROMPT_LAST_SEGMENT_LIVE = prompt_strings.register(
+    "kindled_link.relationship.reflection_prompt_last_segment_live"
 )
 
 
@@ -54,9 +59,27 @@ def _is_grounded(quote: str, transcript: str) -> bool:
     return q in _normalise(transcript)
 
 
-def _build_reflection_prompt(*, current_stage: str, transcript: str) -> str:
+def _live_peer_values(raw: object) -> dict[str, float]:
+    """A reflection's ``emotion`` field as 0-10 values for a live peer memory (B1 PR 3).
+
+    Numbers only (``bool`` excluded) and finite; anything else is dropped, so one bad value no longer loses the memory.
+    A negative is held to 0 (and kept, like any 0) and the rest are held to 10.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, float] = {}
+    for name, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+            continue
+        out[str(name)] = min(max(float(value), 0.0), 10.0)
+    return out
+
+
+def _build_reflection_prompt(*, current_stage: str, transcript: str, engine_scale: bool = False) -> str:
+    """The reflection prompt. ``engine_scale`` asks for emotion values from 0 to 10 (B1 PR 3; chosen by the scale rule, PR 7)."""
     seg = _REFLECTION_PROMPT_SEGMENTS
-    return seg[0] + current_stage + seg[1] + transcript + seg[2]
+    last = _REFLECTION_PROMPT_LAST_SEGMENT_LIVE if engine_scale else seg[2]
+    return seg[0] + current_stage + seg[1] + transcript + last
 
 
 @dataclass
@@ -105,6 +128,26 @@ def persist_relationship_state(store, state: PeerRelationshipState, now: datetim
     )
 
 
+def peer_trust(persona_dir: Path, peer_id: str) -> float:
+    """How far this persona trusts one peer, 0 to 1, for the emotion engine's peer modifier."""
+    from brain.kindled_link.store import KindledLinkStore, kindled_db_path
+
+    path = kindled_db_path(persona_dir)
+    if not path.exists():  # reading must never create the database
+        return 0.0
+    # shortcut: no cache, one read per peer row under the engine lock; add one if the catch-up shows it.
+    try:
+        store = KindledLinkStore(path, integrity_check=False)
+        try:
+            return get_relationship_state(store, peer_id).trust_score
+        finally:
+            store.close()
+    except (sqlite3.Error, ValueError, TypeError) as exc:
+        # This runs inside the engine's catch-up, where an exception would fail the whole catch-up.
+        log.warning("peer_trust: could not read trust for a peer: %s", exc)
+        return 0.0
+
+
 def get_stage(store, peer_id: str) -> str:
     """Thin helper for the engine/gate — the current relationship stage, or
     'stranger' for an unknown peer (the strictest default)."""
@@ -142,15 +185,12 @@ def _log_rejection(*, persona_dir, peer_id: str, rejected_quote: str,
     if persona_dir is None:
         return
     try:
-        row = json.dumps({
-            "ts": now.isoformat(),
-            "peer_id": peer_id,
-            "rejected_quote": rejected_quote[:500],
-        }, separators=(",", ":"))
-        p = Path(persona_dir) / "kindled_link" / _REFLECTION_REJECTIONS_FILE
-        p.parent.mkdir(parents=True, exist_ok=True)
-        with p.open("a", encoding="utf-8") as f:
-            f.write(row + "\n")
+        append_jsonl(
+            Path(persona_dir) / "kindled_link" / _REFLECTION_REJECTIONS_FILE,
+            {"ts": now.isoformat(), "peer_id": peer_id, "rejected_quote": rejected_quote[:500]},
+            on_error="log",
+            nonfinite="null",
+        )
     except Exception:  # noqa: BLE001 — audit; never raise into caller
         log.warning("reflection rejection log write failed", exc_info=True)
 
@@ -178,29 +218,49 @@ def run_relationship_reflection(
       <persona_dir>/kindled_link/reflection_rejections.jsonl (fail-soft).
 
     mem_store: optional MemoryStore (parent §14 wire-back). When provided
-      AND the verdict carries a non-empty `memory_summary`, the capped
-      emotion (via apply_peer_emotion) and a provenance-marked kindled_peer
-      memory (via write_kindled_peer_memory) are written after the
-      relationship state persists. Default None preserves prior behaviour
-      exactly (no write, no new caller obligations). Never fires on the
-      hard_breach early-return path — a breach must not seed warmth.
+      AND the verdict carries a non-empty `memory_summary`, a provenance-marked
+      kindled_peer memory (via write_kindled_peer_memory) is written after the
+      relationship state persists, its feelings one of three ways: live (the
+      engine reads), the model's 0-10 values; on the engine scale but not live,
+      the values put through the peer cap (apply_peer_emotion) at a tenth and
+      stored at 0-10; otherwise, the capped values on the small scale. Default
+      None preserves prior behaviour exactly (no write, no new caller
+      obligations). Never fires on the hard_breach early-return path — a
+      breach must not seed warmth.
     """
     # m9: today must agree with now's date or the cap reads the wrong day
     # (same guard the session engine enforces). Caller bug → fail-soft no-op.
     if today != now.strftime("%Y-%m-%d"):
         log.warning("relationship reflection: today disagrees with now; skipping")
         return get_relationship_state(store, peer_id)
+    from brain.emotion.engine import engine_for
+
+    live = persona_dir is not None and engine_for(Path(persona_dir)).is_live()  # B1 PR 3: off without a persona_dir
+    # Two choices (ThinkerOfThoughts' ruling on #633, B1 PR 7). The prompt's scale and the peer values stored from its
+    # answer are one: the scale rule, cut 1, as a peer memory goes straight to memories.db. Whether the peer cap
+    # (apply_peer_emotion) runs reads the engine, so it stays on `live`. With no memory store nothing is stored, so the
+    # prompt follows `live` as before. A live persona always writes the engine scale, because the `live` branch below
+    # stores the answer as 0-10: `is_live()` remembers a switch-over it has seen, so it can be True while a fresh read
+    # of an unreadable state cannot tell.
+    if persona_dir is not None and mem_store is not None:
+        from brain.emotion.write_scale import writes_engine_scale
+
+        engine_scale = live or writes_engine_scale(
+            Path(persona_dir), mem_store, cut=dev_constants.NUDGE_SCALE_FIX_PROGRESS_ROWS_DONE
+        )
+    else:
+        engine_scale = live
     state = get_relationship_state(store, peer_id)
     # Atomically reserve the provider slot up front (race-safe vs a concurrent
     # gate/reflection call for the same peer); refund if the LLM call never
     # completes so only completed calls net-count (defer ≠ failure). Mirrors the
     # privacy gate.
-    if not store.try_reserve_provider(peer_id, today, cap=limits.DAILY_PROVIDER_CAP):
+    if not store.try_reserve_provider(peer_id, today, cap=dev_constants.KINDLED_LINK_DAILY_PROVIDER_CAP):
         return state
     # Slot reserved — the try spans the prompt build too, so any raise before the
     # call releases it (no leaked reservation; fail-soft to unchanged state).
     try:
-        prompt = _build_reflection_prompt(current_stage=state.stage, transcript=transcript)
+        prompt = _build_reflection_prompt(current_stage=state.stage, transcript=transcript, engine_scale=engine_scale)
         with throttle.background_slot() as granted:
             if not granted:
                 store.release_provider_slot(peer_id, today)  # no call → refund
@@ -213,8 +273,10 @@ def run_relationship_reflection(
 
     try:
         data = json.loads(raw[raw.index("{"):raw.rindex("}") + 1])
-    except Exception:  # noqa: BLE001 — malformed → unchanged
-        log.warning("relationship reflection: malformed verdict; state unchanged", exc_info=True)
+    except Exception as exc:  # noqa: BLE001 — malformed → unchanged
+        record_parse_failure(
+            persona_dir, site="kindled_relationship", raw=raw, error=type(exc).__name__, keep_raw=False
+        )
         return state
 
     # hard breach → immediate reset to stranger (the only multi-stage move)
@@ -277,7 +339,28 @@ def run_relationship_reflection(
     if mem_store is not None:
         try:
             memory_summary = str(data.get("memory_summary", "")).strip()
-            if memory_summary:
+            if memory_summary and live:
+                from brain.chat.extractor import _filter_to_registered
+
+                write_kindled_peer_memory(
+                    mem_store, peer_id=peer_id, session_id=session_id,
+                    speaker=persona_name, stage=state.stage,
+                    content=memory_summary, emotions=_filter_to_registered(_live_peer_values(data.get("emotion"))),
+                )
+            elif memory_summary and engine_scale:
+                # 0-10 values, but the engine is not reading (a switched persona whose state cannot be read, or one the
+                # x10 fix rescaled before its switch-over), so the peer cap still holds her, as on today's path. The cap
+                # and its bucket count on today's small scale, so the values go in at a tenth and are stored at 0-10.
+                from brain.chat.extractor import _filter_to_registered
+
+                values = _filter_to_registered(_live_peer_values(data.get("emotion")))
+                applied = apply_peer_emotion(store, peer_id, {k: v / 10.0 for k, v in values.items()}, now)
+                write_kindled_peer_memory(
+                    mem_store, peer_id=peer_id, session_id=session_id,
+                    speaker=persona_name, stage=state.stage,
+                    content=memory_summary, emotions={k: v * 10.0 for k, v in applied.items()},
+                )
+            elif memory_summary:
                 emotion_raw = data.get("emotion")
                 emotion_delta = (
                     {str(k): float(v) for k, v in emotion_raw.items()}
@@ -306,12 +389,7 @@ _CADENCE_FILE = "relationship_cadence.json"
 def load_reflection_cadence(persona_dir) -> dict:
     """Load the persisted reflection cadence state. Returns {"last_run": iso|None}."""
     p = Path(persona_dir) / "kindled_link" / _CADENCE_FILE
-    if not p.exists():
-        return {"last_run": None}
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:  # noqa: BLE001 — fail-soft, treat as never-run
-        return {"last_run": None}
+    return read_json(p, default=lambda: {"last_run": None}, expect=dict)  # fail-soft: never-run
 
 
 def reflection_is_due(persona_dir, now: datetime, *, interval_hours: float = 24.0) -> bool:
@@ -328,30 +406,12 @@ def reflection_is_due(persona_dir, now: datetime, *, interval_hours: float = 24.
 
 def save_reflection_cadence(persona_dir, now: datetime) -> None:
     """Persist the reflection cadence state (last_run timestamp)."""
-    d = Path(persona_dir) / "kindled_link"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / _CADENCE_FILE).write_text(
-        json.dumps({"last_run": now.isoformat()}), encoding="utf-8")
-
-
-# base + per-source accent (mirrors the W8 / maker reach_emotion map shape)
-_EMOTION_BASE = {"tenderness": 0.08}
-_EMOTION_ACCENT = {
-    "warmth": {"tenderness": 0.06},
-    "repair": {"relief": 0.06},
-    "delight": {"joy": 0.06},
-}
-
-
-def relationship_emotion_delta(*, dominant_source: str) -> dict[str, float]:
-    """Small vocab-filtered, decay-subordinate emotion delta for a peer moment."""
-    from brain.chat.extractor import _filter_to_registered
-    raw = dict(_EMOTION_BASE)
-    for name, v in _EMOTION_ACCENT.get(dominant_source, {}).items():
-        raw[name] = raw.get(name, 0.0) + v
-    # drop any non-finite values before they can reach felt state (stage-6 review)
-    raw = {k: v for k, v in raw.items() if math.isfinite(v)}
-    return _filter_to_registered(raw)
+    write_json(
+        Path(persona_dir) / "kindled_link" / _CADENCE_FILE,
+        {"last_run": now.isoformat()},
+        indent=None,
+        fsync=False,
+    )
 
 
 def apply_peer_emotion(store, peer_id: str, delta: dict[str, float], now: datetime) -> dict[str, float]:
@@ -368,7 +428,7 @@ def apply_peer_emotion(store, peer_id: str, delta: dict[str, float], now: dateti
     if not math.isfinite(magnitude) or magnitude <= 0:
         return {}
     current = store.get_peer_emotion_accumulated(peer_id, now)
-    headroom = max(0.0, limits.PEER_EMOTION_WINDOW_CAP - current)
+    headroom = max(0.0, dev_constants.KINDLED_LINK_PEER_EMOTION_WINDOW_CAP - current)
     if headroom <= 0:
         return {}
     scale = min(1.0, headroom / magnitude)

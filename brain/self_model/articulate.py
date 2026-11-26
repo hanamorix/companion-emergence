@@ -33,7 +33,6 @@ Fail-soft: any provider error -> return None. The gap stands without a note;
 """
 from __future__ import annotations
 
-import json
 import logging
 import traceback
 from datetime import UTC, datetime
@@ -43,6 +42,7 @@ from typing import Any
 from brain import prompt_strings
 from brain.bridge import cli_throttle
 from brain.bridge.usage_log import log_usage
+from brain.health.json_io import JsonFileError, Recovery, append_jsonl, read_json, write_json
 from brain.self_model.gap import Gap
 
 log = logging.getLogger(__name__)
@@ -54,6 +54,11 @@ log = logging.getLogger(__name__)
 # Text externalized to prompt_strings.toml [self_model.articulate] (issue #129 stage 2b/2c).
 _PROMPT_SEGMENTS = prompt_strings.register_segments("self_model.articulate.prompt_segments")
 _SYSTEM = prompt_strings.register("self_model.articulate.system")
+# The label written after a channel's delta when the gap carries its direction (+1 rising, -1 fading).
+_DIRECTION_LABELS = {
+    1: prompt_strings.register("self_model.articulate.direction_rising"),
+    -1: prompt_strings.register("self_model.articulate.direction_fading"),
+}
 
 _GAP_THRESHOLD: float = 0.4          # below this magnitude → skip articulation
 _DAILY_ARTICULATE_BUDGET: int = 50   # Haiku calls / persona / day
@@ -61,17 +66,11 @@ _DAILY_ARTICULATE_BUDGET: int = 50   # Haiku calls / persona / day
 _BUDGET_FILE = "daily_articulate_budget.json"
 _ARTICULATE_ERRORS_FILE = "self_model_articulate_errors.jsonl"
 
-# The self-model tick's articulate note is cheap housekeeping — one short
-# sentence, not a chat reply — so it must not inherit the (larger, costlier)
-# persona chat model. Mirrors brain/chat/compaction.py's COMPACTION_MODEL /
-# build_compaction_provider: change this one string to swap the model; the
-# future model-agnostic refactor replaces the whole seam.
-SELF_MODEL_MODEL: str = "haiku"
-
-
 def build_self_model_provider(persona_dir: Path) -> Any:
     """The provider self-model articulation should use — the persona's
-    provider *kind* but forced to SELF_MODEL_MODEL. For a ``fake`` persona
+    provider *kind*, running the model of the self-model-articulate job (its own
+    line in the tunables; a small cheap model by default, because the articulate
+    note is cheap housekeeping, one short sentence, not a chat reply). For a ``fake`` persona
     (tests) this resolves to a FakeProvider, so no real CLI is shelled.
     Call site: brain/bridge/supervisor.py's self-model cadence block, which
     passes the result into ``_run_self_model_tick`` in place of the persona
@@ -79,9 +78,7 @@ def build_self_model_provider(persona_dir: Path) -> Any:
     that tick is this module's ``articulate()``, so scoping the whole tick to
     this provider is safe.
 
-    Thin wrapper over the centralized model-tier accessor (#154) —
-    ``TIER_SELF_MODEL_ARTICULATE``'s model is ``SELF_MODEL_MODEL`` ("haiku"),
-    so this is a routing-only change with no model-value difference."""
+    Thin wrapper over the centralized model-tier accessor (#154)."""
     from brain.bridge.model_tier import TIER_SELF_MODEL_ARTICULATE, build_tier_provider
 
     return build_tier_provider(persona_dir, TIER_SELF_MODEL_ARTICULATE)
@@ -90,13 +87,10 @@ def build_self_model_provider(persona_dir: Path) -> Any:
 def _provider_model_label(provider: Any) -> str:
     """Best-effort ACTUAL model label for the usage log.
 
-    Prefers the provider's own recorded model (``ClaudeCliProvider`` and
-    ``OllamaProvider`` both set ``._model`` from the ``model_override`` passed
-    to ``get_provider``), so the label reflects what really ran. Falls back to
-    SELF_MODEL_MODEL — the constant ``build_self_model_provider`` forces every
-    real call site to use — for providers with no such attribute (e.g.
-    ``FakeProvider`` in tests). Either way this can no longer drift from the
-    model that was actually invoked.
+    Prefers the provider's own live model (``ClaudeCliProvider`` looks it up
+    from the tunables, ``OllamaProvider`` holds its own), so the label reflects
+    what really ran. Falls back to the self-model-articulate job's model for
+    providers with neither (e.g. ``FakeProvider`` in tests).
 
     Thin wrapper over the centralized ``model_label_for_provider`` (#154) —
     kept as a named, module-local function (rather than inlined at the one
@@ -135,10 +129,7 @@ def _log_articulate_error(
             "error": str(exc) if exc is not None else None,
             "traceback": traceback.format_exc() if exc is not None else None,
         }
-        path = Path(persona_dir) / _ARTICULATE_ERRORS_FILE
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a") as f:
-            f.write(json.dumps(entry) + "\n")
+        append_jsonl(Path(persona_dir) / _ARTICULATE_ERRORS_FILE, entry, on_error="log", nonfinite="null")
     except Exception:  # noqa: BLE001 — best-effort, never mask the real failure
         pass
 
@@ -168,26 +159,40 @@ def _today_local() -> str:
 def _load_budget(persona_dir: Path) -> dict:
     """Return raw budget dict. MISSING → {}. CORRUPT → raises ValueError."""
     path = _budget_path(persona_dir)
-    if not path.exists():
-        return {}
     try:
-        return json.loads(path.read_text())
-    except (json.JSONDecodeError, ValueError) as exc:
-        tmp = path.with_suffix(".tmp")
-        if tmp.exists():
-            try:
-                return json.loads(tmp.read_text())
-            except (json.JSONDecodeError, ValueError):
-                pass
+        # RESTORE: a corrupt file is restored from the previous save (or a legacy .tmp sibling); with no good
+        # copy it raises and the caller keeps its fail-safe-permissive policy.
+        return read_json(
+            path,
+            default=dict,
+            recover=Recovery.RESTORE,
+            expect=dict,
+            fallbacks=(path.with_suffix(".tmp"),),
+        )
+    except JsonFileError as exc:
+        if exc.kind == "io":
+            # An unreadable file propagated as an OSError before; JsonFileError is also a ValueError, which
+            # the caller treats as "corrupt: allow", so re-raise the original OSError instead.
+            raise (exc.__cause__ if isinstance(exc.__cause__, OSError) else OSError(str(exc))) from exc
         raise ValueError("corrupt budget file") from exc
 
 
 def _save_budget(persona_dir: Path, state: dict) -> None:
-    path = _budget_path(persona_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state))
-    tmp.replace(path)
+    write_json(_budget_path(persona_dir), state, backups=1, indent=None, fsync=False)
+
+
+def _budget_allows(persona_dir: Path) -> bool:
+    """Read-only budget check (#473: checked before the call, charged after a call that was not refused).
+
+    Same fail-safe-permissive rule as ``_budget_check_and_consume``: a corrupt file allows.
+    """
+    try:
+        state = _load_budget(persona_dir)
+    except ValueError:
+        return True
+    if state.get("date") != _today_local():
+        return True
+    return int(state.get("count", 0)) < _DAILY_ARTICULATE_BUDGET
 
 
 def _budget_check_and_consume(persona_dir: Path) -> bool:
@@ -247,8 +252,8 @@ def articulate(gap: Gap, *, provider: Any, persona_dir: Path) -> str | None:
     if gap.magnitude < _GAP_THRESHOLD:
         return None
 
-    # 2. Daily budget gate (R-D1).
-    if not _budget_check_and_consume(persona_dir):
+    # 2. Daily budget gate (R-D1). Read-only here; the call is charged below once it was not refused (#473).
+    if not _budget_allows(persona_dir):
         log.debug("self_model articulate: daily budget exhausted — skipping")
         return None
 
@@ -257,7 +262,8 @@ def articulate(gap: Gap, *, provider: Any, persona_dir: Path) -> str | None:
     # built these only after the slot was already held — cheap string
     # formatting, no reason to do it while touching the shared throttle).
     deltas_text = ", ".join(
-        f"{ch}: {delta:+.2f}" for ch, delta in sorted(gap.per_channel.items())
+        f"{ch}: {delta:+.2f}{_DIRECTION_LABELS.get(gap.directions.get(ch), '')}"
+        for ch, delta in sorted(gap.per_channel.items())
     )
     system = _SYSTEM
     seg = _PROMPT_SEGMENTS
@@ -269,13 +275,21 @@ def articulate(gap: Gap, *, provider: Any, persona_dir: Path) -> str | None:
     #    (brain/bridge/supervisor.py's _run_self_model_tick) is what retries, via
     #    the persisted cadence, at zero cost to this function.
     if not cli_throttle.acquire_background():
+        if cli_throttle.shutdown_requested():
+            # #456: the bridge is stopping; a refusal, not a lost slot race (the caller writes nothing).
+            raise cli_throttle.ShutdownDeferred("self_model articulate: bridge is stopping")
         log_self_model_deferred(persona_dir)
         raise cli_throttle.ThrottleDeferred(
             "self_model articulate: throttle slot unavailable"
         )
     try:
         raw = provider.generate(prompt, system=system)
+    except cli_throttle.ThrottleDeferred:
+        # #456/#473: "not now" (login expired, or the bridge is stopping): not charged, nothing logged as a
+        # failure; the caller leaves the self-model state and cadence as they were.
+        raise
     except Exception as exc:  # noqa: BLE001 — fail-soft: gap stands without a note
+        _budget_check_and_consume(persona_dir)  # a call that failed still cost one
         _log_articulate_error(persona_dir, "self_model_articulate_failed", exc)
         log.warning(
             "self_model articulate: provider error — returning None (fail-soft)",
@@ -284,6 +298,7 @@ def articulate(gap: Gap, *, provider: Any, persona_dir: Path) -> str | None:
         return None
     finally:
         cli_throttle.release_background()
+    _budget_check_and_consume(persona_dir)
 
     # log_usage / isinstance / strip checks are OUTSIDE the narrowed try above -
     # a failure here is a distinct bug class (logging/parsing), not a generation

@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from brain.health.attempt_heal import save_with_backup_text
+from brain.health.json_io import write_json
 from brain.migrator.og import FileManifest
 from brain.migrator.transform import SkippedMemory
 
@@ -217,4 +217,4 @@ def write_source_manifest(
             for m in manifest
         ],
     }
-    save_with_backup_text(path, json.dumps(payload, indent=2) + "\n")
+    write_json(path, payload, backups=3)

@@ -27,7 +27,7 @@ class FakeShutdownController:
 
 
 def test_post_supervisor_shutdown_returns_202_immediately(persona_dir: Path):
-    """Endpoint returns 202 Accepted without blocking on the 30s drain."""
+    """Endpoint returns 202 Accepted at once; the stop runs in the lifespan teardown."""
     controller = FakeShutdownController()
     app = build_app(
         persona_dir=persona_dir,
@@ -38,8 +38,7 @@ def test_post_supervisor_shutdown_returns_202_immediately(persona_dir: Path):
         r = c.post("/supervisor/shutdown")
         assert r.status_code == 202
         body = r.json()
-        assert body["status"] == "shutting_down"
-        assert body["drain_seconds"] == 30
+        assert body["status"] == "shutting_down"  # #456: no drain any more (Q-B), so no drain_seconds
 
 
 def test_post_supervisor_shutdown_requires_auth(persona_dir: Path):

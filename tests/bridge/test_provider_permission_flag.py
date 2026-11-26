@@ -26,7 +26,7 @@ def _run_returns_ok(stdout='{"result": "hi"}', exit_code=0):
 
 
 def test_generate_passes_dangerously_skip_permissions():
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=5)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=5)
     with patch("brain.bridge.provider.subprocess.run", return_value=_run_returns_ok()) as run:
         provider.generate("hello", system="be brief")
     argv = run.call_args.args[0]
@@ -37,7 +37,7 @@ def test_generate_passes_dangerously_skip_permissions():
 
 
 def test_chat_text_path_passes_dangerously_skip_permissions():
-    provider = ClaudeCliProvider(model="sonnet", timeout_seconds=5)
+    provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=5)
     with patch("brain.bridge.provider.subprocess.run", return_value=_run_returns_ok()) as run:
         provider.chat([ChatMessage(role="user", content="hello")])
     argv = run.call_args.args[0]
@@ -58,7 +58,7 @@ def test_chat_with_mcp_tools_passes_dangerously_skip_permissions(tmp_path: Path)
     persona_dir.mkdir()
 
     with patch("brain.bridge.provider.subprocess.run", return_value=_run_returns_ok()) as run:
-        provider = ClaudeCliProvider(model="sonnet", timeout_seconds=5)
+        provider = ClaudeCliProvider(probe_model="sonnet", timeout_seconds=5)
         provider.chat(
             [
                 ChatMessage(role="system", content="you are nell"),

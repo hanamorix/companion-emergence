@@ -7,12 +7,23 @@ _write_gate_check — validate emotion_score + importance against the write gate
 
 from __future__ import annotations
 
+from pathlib import Path
+
+from brain.emotion import engine
+from brain.emotion.engine_utils import feelings_of
 from brain.memory.store import Memory
+from brain.tools.naming import TOOL_PREFIX_SLOT
 from brain.utils.time import format_local
 
 
-def _mem_to_result(memory: Memory) -> dict:
+def _mem_to_result(memory: Memory, persona_dir: Path | None) -> dict:
     """Slim a Memory dataclass down to the fields the LLM needs.
+
+    ``emotions`` carries the memory's feelings: this persona's emotion engine's
+    `memory_feelings` (faded values held to 0-10; the stored values held until the switch).
+    With no persona directory (None) there is no engine to ask, and the pure read gives the
+    stored values held. The argument is required: None is a value the caller states, not an
+    omitted argument.
 
     Mirrors OG nell_tools.py:_mem_to_result shape while using the new
     Memory dataclass attribute names (emotions dict, not emotional_tone).
@@ -21,12 +32,13 @@ def _mem_to_result(memory: Memory) -> dict:
     Memory row itself stays stored in UTC; only this tool-result copy is
     converted.
     """
+    emotions = dict(feelings_of(memory, None if persona_dir is None else engine.engine_for(persona_dir)).feelings)
     return {
         "id": memory.id,
         "content": memory.content,
         "memory_type": memory.memory_type,
         "domain": memory.domain,
-        "emotions": dict(memory.emotions),
+        "emotions": emotions,
         "tags": list(memory.tags),
         "importance": memory.importance,
         "created_at": format_local(memory.created_at),  # tz-local-display: search/read_full_memory result created_at
@@ -76,6 +88,6 @@ def _write_gate_check(
 
     reason = (
         f"below threshold (emotion_score={emotion_score:.0f}, importance={effective_importance}); "
-        "use add_journal for low-weight content"
+        f"use {TOOL_PREFIX_SLOT}add_journal for low-weight content"
     )
     return False, effective_importance, emotion_score, reason

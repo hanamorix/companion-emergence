@@ -65,7 +65,6 @@ reset(persona_dir=None) -> None
 """
 from __future__ import annotations
 
-import json
 import logging
 import threading
 import time
@@ -74,6 +73,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from brain.health.json_io import read_json, write_json
 from brain.utils.file_lock import file_lock
 
 log = logging.getLogger(__name__)
@@ -112,20 +112,12 @@ def _queue_path(persona_dir: Path) -> Path:
 def _load_queue_unlocked(persona_dir: Path) -> list[dict[str, Any]]:
     """Read the queue file. Missing/corrupt -> empty list (fail toward no
     backlog rather than wedging a drainer on a bad file)."""
-    try:
-        data = json.loads(_queue_path(persona_dir).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return []
-    return data if isinstance(data, list) else []
+    return read_json(_queue_path(persona_dir), default=list, expect=list)
 
 
 def _save_queue_unlocked(persona_dir: Path, items: list[dict[str, Any]]) -> None:
     """Atomic temp+replace write (never a torn read of a partial file)."""
-    path = _queue_path(persona_dir)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(items), encoding="utf-8")
-    tmp.replace(path)
+    write_json(_queue_path(persona_dir), items, indent=None, fsync=False)
 
 
 def enqueue(record: dict[str, Any], *, persona_dir: Path) -> None:
@@ -193,6 +185,7 @@ def _dispatch(record: dict[str, Any], *, persona_dir: Path) -> None:
     safe because by the time any record is dispatched ``tool_loop`` has
     already finished loading.
     """
+    from brain.bridge.cli_throttle import ThrottleDeferred
     from brain.chat import tool_loop
 
     kind = record.get("kind")
@@ -204,6 +197,8 @@ def _dispatch(record: dict[str, Any], *, persona_dir: Path) -> None:
                 recent_user_msgs=tuple(record.get("recent_user_msgs", ())),
                 persona_dir=persona_dir,
             )
+        except ThrottleDeferred:
+            raise  # #456/#473: "not now": stop the drain before the pop; the record stays at the head
         except Exception:  # noqa: BLE001 — an item failure must not kill the drain
             log.error(
                 "pass2_queue item failed (id=%s, kind=monologue); continuing",
@@ -225,6 +220,8 @@ def _dispatch(record: dict[str, Any], *, persona_dir: Path) -> None:
                 record["reply_text"],
                 buffer_slice,
             )
+        except ThrottleDeferred:
+            raise  # #456/#473: as above
         except Exception:  # noqa: BLE001 — an item failure must not kill the drain
             log.error(
                 "pass2_queue item failed (id=%s, kind=attunement); continuing",
@@ -284,6 +281,8 @@ def drain_all_locked(
             item = _peek_head_locked(persona_dir)
             if item is None:
                 break
+            # A refusal from the item ("not now", #456/#473) propagates out of _dispatch before the pop below,
+            # so the item stays at the head of the saved queue for a later drain.
             _dispatch(item, persona_dir=persona_dir)
             # PASS2-AT-LEAST-ONCE: if the process dies between _dispatch()
             # returning (the item's effects already applied) and this

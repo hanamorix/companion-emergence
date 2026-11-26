@@ -8,6 +8,7 @@ through the live `/initiate/voice-edit/accept` endpoint.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -120,15 +121,16 @@ def test_voice_edit_accept_records_audit_when_file_write_fails(
         new_text="new line",
     )
 
-    # Patch Path.replace so the atomic rename step fails AFTER the audit
-    # transition has already been written. write_text on the tmp file is
-    # allowed so we exercise the final rename failure realistically.
-    original_replace = Path.replace
+    # Patch os.replace (the shared atomic text writer's publish step, #477) so the
+    # atomic rename step fails AFTER the audit transition has already been written.
+    # The temp file is written normally so we exercise the final rename failure
+    # realistically.
+    original_replace = os.replace
 
-    def boom_replace(self: Path, target: Path | str) -> Path:  # type: ignore[override]
-        if str(self).endswith("voice.md.tmp"):
+    def boom_replace(src, dst):
+        if str(dst).endswith("voice.md"):
             raise OSError("simulated disk failure during atomic rename")
-        return original_replace(self, target)
+        return original_replace(src, dst)
 
     # raise_server_exceptions=False — TestClient otherwise re-raises the
     # OSError instead of letting Starlette surface it as a 500. We want
@@ -136,7 +138,7 @@ def test_voice_edit_accept_records_audit_when_file_write_fails(
     # bubble.
     app = build_app(persona_dir=persona_dir, client_origin="tests")
     with TestClient(app, raise_server_exceptions=False) as client:
-        with patch.object(Path, "replace", boom_replace):
+        with patch.object(os, "replace", boom_replace):
             r = client.post(
                 "/initiate/voice-edit/accept",
                 json={"audit_id": "ia_ve_002", "with_edits": None},

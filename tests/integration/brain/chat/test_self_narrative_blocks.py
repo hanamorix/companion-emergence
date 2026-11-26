@@ -360,7 +360,7 @@ def test_recent_growth_block_handles_corrupt_log_gracefully(
     soul_store: SoulStore,
     daemon_state: DaemonState,
 ):
-    """Corrupt JSONL line → skipped via read_jsonl_skipping_corrupt; block
+    """Corrupt JSONL line → skipped via json_io.iter_jsonl; block
     still renders with valid lines. Chat must NEVER break because growth
     block failed.
     """

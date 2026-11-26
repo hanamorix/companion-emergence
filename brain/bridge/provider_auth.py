@@ -27,12 +27,16 @@ import time
 from datetime import UTC, datetime
 
 from brain import tunables
+from brain.bridge import model_error
 from brain.bridge.cli_throttle import ThrottleDeferred
 
 log = logging.getLogger(__name__)
 
-_REPROBE_S_DEFAULT = tunables.register("provider_auth.reprobe_seconds", 900.0)
-REPROBE_S = _REPROBE_S_DEFAULT  # read through _reprobe_s() at call time
+_REPROBE_S_DEFAULT = tunables.register(
+    "provider_auth.reprobe_seconds", 900.0,
+    description="Seconds between checks on whether an expired Claude login works again.",
+)
+REPROBE_S = _REPROBE_S_DEFAULT  # read through reprobe_interval_s() at call time
 WEAK_CONFIRM_S = 60.0
 
 _STRONG = ("oauth session expired",)
@@ -58,7 +62,9 @@ class ProviderAuthDeferred(ThrottleDeferred):
     """
 
 
-def _reprobe_s() -> float:
+def reprobe_interval_s() -> float:
+    """Seconds between re-probes of an expired login (the tunable ``provider_auth.reprobe_seconds``, 900 s). Also
+    the cadence the bridge's start-up model re-check uses, so repeated starts do not become a probe storm."""
     return float(tunables.get_tunable("provider_auth.reprobe_seconds", _REPROBE_S_DEFAULT))
 
 
@@ -75,6 +81,8 @@ def is_auth_failure(detail: str) -> bool:
 def note_cli_failure(detail: str) -> None:
     """Record a CLI failure text. Non-auth text is a no-op."""
     global _status, _since, _detail, _failures, _last_probe_monotonic, _weak_first_at
+    # #440: this is the one funnel every CLI failure text passes through; a rejected model is recorded here.
+    model_error.note_failure(detail)
     try:
         if not is_auth_failure(detail):
             return
@@ -97,7 +105,7 @@ def note_cli_failure(detail: str) -> None:
             log.warning(
                 "provider auth EXPIRED — background LLM calls backed off to one probe per "
                 "%.0fs until a call succeeds; re-authorise from the connection panel: %s",
-                _reprobe_s(),
+                reprobe_interval_s(),
                 _detail,
             )
     except Exception:  # noqa: BLE001 — fail open
@@ -131,13 +139,19 @@ def should_skip_background() -> bool:
             if _status != "expired":
                 return False
             now = _monotonic()
-            if (now - _last_probe_monotonic) >= _reprobe_s():
+            if (now - _last_probe_monotonic) >= reprobe_interval_s():
                 _last_probe_monotonic = now
                 return False  # the probe
             return True
     except Exception:  # noqa: BLE001 — fail open
         log.warning("provider_auth.should_skip_background failed; allowing", exc_info=True)
         return False
+
+
+def login_expired() -> bool:
+    """True while the Claude login is marked expired (read-only; no probe is granted)."""
+    with _lock:
+        return _status == "expired"
 
 
 def state() -> dict:

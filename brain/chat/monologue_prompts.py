@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from brain import prompt_strings
+from brain.tools.naming import fill_tool_prefix
 
 # Text externalized to prompt_strings.toml [chat.monologue] (issue #129 stage 2a).
 _REPLY_FRAME_SEGMENTS = prompt_strings.register_segments("chat.monologue.reply_frame_segments")
@@ -25,6 +26,7 @@ def build_monologue_frame(
     voice_excerpt: str,
     soul_hints: Sequence[str],
     narrative_hints: Sequence[str],
+    tool_prefix: str = "",
 ) -> str:
     """Build the framing string injected into the thinking pass.
 
@@ -38,7 +40,7 @@ def build_monologue_frame(
     )
     lines.append(
         f"Your turn has two phases. **First**, before responding, call "
-        f"`record_monologue(monologue, feed_digest)` to capture what's actually "
+        f"`{tool_prefix}record_monologue(monologue, feed_digest)` to capture what's actually "
         f"running through {persona_name}'s head — the associative drift, "
         "half-thoughts, tangents, callbacks, idle affection or annoyance. "
         "**Then** write the reply that flows from that thinking. The monologue "
@@ -64,7 +66,7 @@ def build_monologue_frame(
     return "\n".join(lines)
 
 
-def build_reply_frame(*, persona_name: str, user_name: str = "the user") -> str:
+def build_reply_frame(*, persona_name: str, user_name: str = "the user", tool_prefix: str = "") -> str:
     """Build the framing string the visible reply is composed against.
 
     Last substantive block in the system message by design (v0.0.33 Track 2b):
@@ -74,4 +76,4 @@ def build_reply_frame(*, persona_name: str, user_name: str = "the user") -> str:
     through in the monologue pass. The reply answers what was asked, directly.
     """
     seg = _REPLY_FRAME_SEGMENTS
-    return seg[0] + persona_name + seg[1] + user_name + seg[2]
+    return seg[0] + persona_name + seg[1] + user_name + fill_tool_prefix(seg[2], tool_prefix)

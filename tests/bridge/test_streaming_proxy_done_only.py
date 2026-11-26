@@ -21,7 +21,7 @@ import asyncio
 from typing import Any
 
 from brain.bridge.chat import ChatMessage, StreamDone
-from brain.bridge.server import _StreamingProxy
+from brain.bridge.server import _end_chunk_stream, _StreamingProxy
 
 
 class _FakeDoneOnlyProvider:
@@ -63,8 +63,9 @@ async def _drive_proxy(provider: Any) -> tuple[Any, list[str]]:
                 [ChatMessage(role="user", content="hi")],
             )
         finally:
-            # Same sentinel pattern as brain/bridge/server.py:1807.
-            q.put_nowait(None)
+            # The production handler's own helper: the sentinel must queue behind chunks the
+            # worker thread pushed with call_soon_threadsafe (a direct put_nowait overtook them).
+            _end_chunk_stream(loop, q)
 
     task = asyncio.create_task(_runner())
 

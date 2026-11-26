@@ -9,7 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from brain.attunement.schemas import SCHEMA_VERSION, LearnedPattern
+from brain import dev_constants
+from brain.attunement.schemas import LearnedPattern
 from brain.attunement.store import _append_pattern, read_learned_patterns
 
 
@@ -41,7 +42,7 @@ def check_crystallisations(
                 crystallised_at=now_iso,
                 falsified_at=prev.falsified_at,
                 examples=prev.examples,
-                schema_version=SCHEMA_VERSION,
+                schema_version=dev_constants.ATTUNEMENT_SCHEMA_VERSION,
             )
             _append_pattern(persona_dir, updated)
             events.append(CrystallisationEvent(

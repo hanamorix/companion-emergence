@@ -1,13 +1,11 @@
 """F2c inc5b-2 — the re-score store extraction + the peft/datasets bundle.
 
 Covers: the accept-path re-score set (`judge_knob_refit_rescore_items`) and
-the 2B doc-having subset (`rows_with_doc_snapshot`); plus C19 (peft/datasets
-are base deps) + C20 (no residual optional-extra plumbing in brain/).
+the 2B doc-having subset (`rows_with_doc_snapshot`). (That the optional-extra plumbing, C20, stays out of
+brain/ is listed in tests/unit/test_removed_names_stay_removed.py.)
 """
 
 from __future__ import annotations
-
-from pathlib import Path
 
 from brain.memory.store import MemoryStore
 
@@ -75,28 +73,3 @@ def test_rows_with_doc_snapshot_returns_only_doc_having() -> None:
     got = store.rows_with_doc_snapshot([r_doc, r_absent])
     assert got == [r_doc]
     assert store.rows_with_doc_snapshot([]) == []
-
-
-# --- C19 / C20: the peft/datasets bundle reversal (now base deps) -----------
-
-
-def test_peft_and_datasets_are_base_deps_importable() -> None:
-    # C19: base deps (not an optional f2c-training extra) -> importable in the
-    # plain env (no --extra needed). A missing one is now a broken install.
-    import datasets  # noqa: F401
-    import peft  # noqa: F401
-
-
-def test_no_residual_optional_extra_plumbing_in_brain() -> None:
-    # C20: the inc5a optional-extra plumbing is fully removed from brain/.
-    # Positive absence sweep (would fire on the pre-change tree, which had
-    # `lora_available` / `_downgrade_for_missing_lora_extra` / the extra hint).
-    brain_root = Path(__file__).resolve().parents[4] / "brain"
-    banned = ["lora_available", "_downgrade_for_missing_lora_extra", "_F2C_TRAINING_EXTRA_HINT"]
-    offenders: list[str] = []
-    for py in brain_root.rglob("*.py"):
-        text = py.read_text(encoding="utf-8")
-        for token in banned:
-            if token in text:
-                offenders.append(f"{py}: {token}")
-    assert not offenders, f"residual optional-extra plumbing: {offenders}"

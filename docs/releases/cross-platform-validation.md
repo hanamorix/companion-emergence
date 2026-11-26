@@ -9,9 +9,12 @@ reconciles this list each release.
 
 ## Standing gates (run before every tag)
 
-- `bash scripts/release_preflight.sh <tag>` — the CI validate gate locally.
-- `python scripts/lint_windows_pitfalls.py` — static check for the known Windows
-  subprocess/kill footguns. Review each finding against the gotchas below.
+- `bash scripts/release_preflight.sh <tag>` — the CI validate gate locally. It judges pytest by exit
+  status and `FAILED`/`ERROR` lines (`scripts/pytest_verdict.sh`) and runs the lint below.
+- `python scripts/lint_windows_pitfalls.py --strict` — static check for the known Windows
+  subprocess/kill footguns. Blocking: both the preflight and `tests/unit/scripts/test_lint_windows_pitfalls.py`
+  fail on a finding. A reviewed, safe site carries `# windows-lint: ok -- <reason>`; anything else needs
+  a fix. Review each finding against the gotchas below.
 
 ## Open validation gaps (from the deferred ledger)
 

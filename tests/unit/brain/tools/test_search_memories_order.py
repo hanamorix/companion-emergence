@@ -142,7 +142,7 @@ def _patch_provider(monkeypatch: pytest.MonkeyPatch, vectors: dict[str, np.ndarr
     # stamped on the rows; otherwise the first matrix read reloads from disk
     # filtered to the real production model id, finds nothing, and silently
     # discards the seeded vectors.
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
 
 
 def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -> None:
@@ -154,12 +154,32 @@ def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -
     calibrated floor), so a test that wants a CONCLUSIVE semantic result
     must script the specific memory contents it expects to clear the
     floor."""
-    from brain.memory.reranker import FakeRerankerProvider
+    from brain.memory.reranker import ANCHOR_POOL, FakeRerankerProvider
 
+    # Name-recall fix R1: anchors come on top of every rerank; scored at 0.0
+    # so each scripted score's normalized value equals the scripted value.
+    scripted = {**dict.fromkeys(ANCHOR_POOL, 0.0), **scores}
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores=scores),
+        lambda **kwargs: FakeRerankerProvider(scores=scripted),
     )
+
+
+def _pad_semantic_pool(store: MemoryStore, have: int) -> None:
+    """Name-recall fix R1 (S5/S23): a rerank runs only with at least
+    RERANK_MIN_REAL_CANDIDATES candidates, so a semantic-mode test with a
+    smaller pool adds filler memories: low cosine, no word shared with any
+    query here, and unscripted for the fake reranker (its far-below-floor
+    default), so they never surface."""
+    from brain.dev_constants import RERANK_MIN_REAL_CANDIDATES
+
+    for i in range(RERANK_MIN_REAL_CANDIDATES - have):
+        filler = _seed(store, f"zzfiller{i} qqpadding", created_at=_OLD)
+        store._conn.execute(  # noqa: SLF001
+            "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+            (_unit_vec_with_cosine(0.05).tobytes(), _SCRIPTED_MODEL_ID, filler.id),
+        )
+    store._conn.commit()  # noqa: SLF001
 
 
 def _seed_floor(
@@ -183,32 +203,12 @@ _RECENT = _NOW - timedelta(minutes=1)
 
 
 def test_default_order_is_relevance_and_matches_omitted_order(tmp_path: Path) -> None:
-    # Bump-free + read-only: safe to issue both calls against the SAME store,
-    # so the two results are directly comparable (no re-created, re-uuid'd
-    # rows to account for).
-    ctx = _ctx(tmp_path)
-    _seed(ctx["store"], "workshop workshop workshop notes from the sunrise workshop", created_at=_OLD, importance=9.0)
-    _seed(ctx["store"], "a fleeting workshop mention, nothing more", created_at=_RECENT, importance=0.0)
-
-    res_omitted = dispatch("search_memories", {"query": "workshop", "mode": "lexical", "limit": 1}, **ctx)
-    assert res_omitted["resolved_order"] == "relevance"
-
-    res_explicit = dispatch(
-        "search_memories", {"query": "workshop", "mode": "lexical", "limit": 1, "order": "relevance"}, **ctx
-    )
-
-    # Explicitly requesting "relevance" must produce the exact same result as
-    # omitting `order` entirely — purely additive, no behavior change.
-    assert res_omitted["memories"] == res_explicit["memories"]
-    assert res_omitted["mode"] == res_explicit["mode"] == "lexical"
-
-
-# ---------------------------------------------------------------------------
-# order="age" widens the fetch + age-sorts — LEXICAL mode.
-# ---------------------------------------------------------------------------
-
-
-def test_order_age_lexical_widens_and_surfaces_a_recent_low_rank_match(tmp_path: Path) -> None:
+    """One store, two memories (a strong old `workshop` note and a weak recent one), `limit=1`:
+    - `order` omitted is relevance, and explicit `order="relevance"` gives the exact same result (purely additive,
+      no behaviour change when unused). The relevance calls are bump-free and read-only, so they can share the store (the age dispatch strengthens a hebbian edge between the two memories, so it stays last);
+    - a garbage `order` normalizes to "relevance": never echoed back, never silently behaves like "age";
+    - `order="age"` widens the fetch to CANDIDATE_POOL (both memories are still matches), sorts by created_at DESC,
+      THEN slices to the limit, so the recent-but-weak match surfaces instead of the strong old one."""
     ctx = _ctx(tmp_path)
     strong_old = _seed(
         ctx["store"],
@@ -223,20 +223,37 @@ def test_order_age_lexical_widens_and_surfaces_a_recent_low_rank_match(tmp_path:
         importance=0.0,
     )
 
-    # Under default relevance ordering with limit=1, the strong/old match
-    # wins — the weak/recent match ranks outside the top-1 by BM25+importance.
-    relevance_res = dispatch("search_memories", {"query": "workshop", "mode": "lexical", "limit": 1}, **ctx)
-    assert [m["id"] for m in relevance_res["memories"]] == [strong_old.id]
+    res_omitted = dispatch("search_memories", {"query": "workshop", "mode": "lexical", "limit": 1}, **ctx)
+    assert res_omitted["resolved_order"] == "relevance"
+    # Under relevance ordering with limit=1 the strong/old match wins: the weak/recent match ranks outside the
+    # top-1 by BM25+importance.
+    assert [m["id"] for m in res_omitted["memories"]] == [strong_old.id]
 
-    # order="age" widens the fetch to CANDIDATE_POOL (both memories are still
-    # matches — matching is unchanged), sorts by created_at DESC, THEN slices
-    # to limit=1 — so the recent-but-weak match now surfaces instead.
+    res_explicit = dispatch(
+        "search_memories", {"query": "workshop", "mode": "lexical", "limit": 1, "order": "relevance"}, **ctx
+    )
+    assert res_omitted["memories"] == res_explicit["memories"]
+    assert res_omitted["mode"] == res_explicit["mode"] == "lexical"
+
+    garbage_res = dispatch(
+        "search_memories", {"query": "workshop", "mode": "lexical", "limit": 1, "order": "garbage"}, **ctx
+    )
+    assert garbage_res["resolved_order"] == "relevance"
+    assert garbage_res["resolved_order"] != "garbage"
+    assert [m["id"] for m in garbage_res["memories"]] == [strong_old.id]
+
     age_res = dispatch(
         "search_memories", {"query": "workshop", "mode": "lexical", "limit": 1, "order": "age"}, **ctx
     )
     assert age_res["resolved_order"] == "age"
     assert age_res["mode"] == "lexical"
     assert [m["id"] for m in age_res["memories"]] == [weak_recent.id]
+
+
+
+# ---------------------------------------------------------------------------
+# order="age" widens the fetch + age-sorts — LEXICAL mode.
+# ---------------------------------------------------------------------------
 
 
 def test_order_age_lexical_still_matches_by_mode_first(tmp_path: Path) -> None:
@@ -282,6 +299,7 @@ def test_order_age_semantic_widens_and_age_sorts_over_top_k_cosine(
         vectors,
         contents_by_id={strong_old.id: strong_old_text, weak_recent.id: weak_recent_text},
     )
+    _pad_semantic_pool(ctx["store"], 2)
     _patch_provider(monkeypatch, vectors, dim=dim)
     _seed_floor(ctx["store"])
     # Both clear the calibrated floor (order="age" widens the fetch, it
@@ -324,28 +342,3 @@ def test_resolved_order_reports_age_and_relevance_correctly(tmp_path: Path) -> N
     res_age = dispatch("search_memories", {"query": "workshop", "mode": "lexical", "order": "age"}, **ctx)
     assert res_age["resolved_order"] == "age"
 
-
-def test_order_garbage_value_normalizes_to_relevance(tmp_path: Path) -> None:
-    ctx = _ctx(tmp_path)
-    strong_old = _seed(
-        ctx["store"],
-        "workshop workshop workshop notes from the sunrise workshop",
-        created_at=_OLD,
-        importance=9.0,
-    )
-    _seed(
-        ctx["store"],
-        "a fleeting workshop mention, nothing more",
-        created_at=_RECENT,
-        importance=0.0,
-    )
-
-    res = dispatch(
-        "search_memories", {"query": "workshop", "mode": "lexical", "limit": 1, "order": "garbage"}, **ctx
-    )
-
-    # Garbage `order` must normalize to "relevance", never echo the invalid
-    # value and never silently behave like "age" (no widening).
-    assert res["resolved_order"] == "relevance"
-    assert res["resolved_order"] != "garbage"
-    assert [m["id"] for m in res["memories"]] == [strong_old.id]

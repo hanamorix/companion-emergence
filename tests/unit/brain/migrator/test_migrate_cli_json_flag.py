@@ -32,7 +32,7 @@ def test_json_flag_emits_machine_readable_report(tmp_path: Path, monkeypatch, ca
 
     monkeypatch.setattr(sys, "argv", [
         "nell", "migrate", "--source", "emergence-kit",
-        "--input", str(fixture), "--install-as", "phoebe", "--json",
+        "--input", str(fixture), "--install-as", "canary", "--json",
     ])
     main()
 

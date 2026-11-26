@@ -7,7 +7,7 @@ Guards that every ClaudeCliProvider argv builder:
    the list decides what she can reach (#71).
 2. Adds ``--strict-mcp-config`` to pin the session to the configured MCP server.
 
-Since #329 all four ``claude -p`` spawn sites apply the posture through
+Since #329 every ``claude -p`` spawn site (five argv builders plus the save-time probe) apply the posture through
 ``_apply_lean_flags``: the CLI's exclusive ``--tools=`` allowlist (WebSearch,WebFetch
 for chat; nothing for background ``generate()``) when the CLI supports it, then the
 disallow list and ``--strict-mcp-config``.
@@ -15,9 +15,12 @@ disallow list and ``--strict-mcp-config``.
 
 from __future__ import annotations
 
+import io
+
 import pytest
 
 from brain.bridge.provider import _BUILTIN_TOOLS_DISALLOWED
+from tests.thread_support import finish_threads
 
 
 def test_builtin_disallow_list_covers_the_costly_tools():
@@ -62,7 +65,7 @@ def test_apply_lean_flags_adds_disallowed_and_strict():
 # ---------------------------------------------------------------------------
 
 _RESULT_JSON = '{"type": "result", "subtype": "success", "is_error": false, "result": "ok"}'
-_CHAT_TOOLS = "--tools=WebSearch,WebFetch"
+_CHAT_TOOLS = "--tools=WebSearch,WebFetch,ToolSearch"
 
 
 def _fake_popen(stdout_lines: list[str], exit_code: int = 0):
@@ -88,7 +91,7 @@ def _capture_argv(site: str, tmp_path) -> list[str]:
     from brain.bridge.chat import ChatMessage
     from brain.bridge.provider import ClaudeCliProvider
 
-    provider = ClaudeCliProvider(model="haiku", timeout_seconds=30)
+    provider = ClaudeCliProvider(probe_model="haiku", timeout_seconds=30)
     msgs = [ChatMessage(role="user", content="hi")]
     persona = tmp_path / "persona"
     persona.mkdir(exist_ok=True)
@@ -112,6 +115,8 @@ def _capture_argv(site: str, tmp_path) -> list[str]:
     with patch("brain.bridge.provider.subprocess.run", return_value=done) as run:
         if site == "generate":
             provider.generate("hi")
+        elif site == "probe":  # the save-time model check (#448): stream-json, background posture
+            provider.probe("hi")
         elif site == "chat_text":
             provider.chat(msgs, tools=None)
         else:  # chat_mcp_tools
@@ -119,16 +124,16 @@ def _capture_argv(site: str, tmp_path) -> list[str]:
     return list(run.call_args.args[0])
 
 
-_SITES = ["generate", "chat_text", "chat_stream_tools", "chat_stream_no_tools", "chat_mcp_tools"]
+_SITES = ["generate", "probe", "chat_text", "chat_stream_tools", "chat_stream_no_tools", "chat_mcp_tools"]
 
 
 @pytest.mark.parametrize("site", _SITES)
 def test_every_site_applies_the_posture(site, tmp_path):
-    """C1: background calls get no built-ins at all; every chat path gets
+    """C1: background calls (generate and the save-time probe) get no built-ins at all; every chat path gets
     exactly the web tools. The disallow list and --strict-mcp-config stay on
     as the second layer."""
     argv = _capture_argv(site, tmp_path)
-    expected = "--tools=" if site == "generate" else _CHAT_TOOLS
+    expected = "--tools=" if site in ("generate", "probe") else _CHAT_TOOLS
     assert [a for a in argv if a.startswith("--tools")] == [expected], argv
     assert "--disallowedTools" in argv, argv
     assert "--strict-mcp-config" in argv, argv
@@ -309,7 +314,7 @@ def test_probe_is_thread_safe(monkeypatch):
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=5)
+        finish_threads(t)
     assert results == [True] * 8
     assert calls == [["claude", "--help"]]
 
@@ -348,7 +353,7 @@ def _failing_generate(stdout: str, stderr: str) -> None:
     done = subprocess.CompletedProcess(args=[], returncode=1, stdout=stdout, stderr=stderr)
     with patch("brain.bridge.provider.subprocess.run", return_value=done):
         with pytest.raises(RuntimeError, match="exit 1"):
-            ClaudeCliProvider(model="haiku", timeout_seconds=30).generate("hi")
+            ClaudeCliProvider(probe_model="haiku", timeout_seconds=30).generate("hi")
 
 
 def _failing_stream(stdout_lines: list[str], stderr: str, tmp_path) -> None:
@@ -358,10 +363,12 @@ def _failing_stream(stdout_lines: list[str], stderr: str, tmp_path) -> None:
     from brain.bridge.provider import ClaudeCliProvider
 
     proc = _fake_popen(stdout_lines, exit_code=1)
-    proc.stderr.read.return_value = stderr
+    # stderr is drained incrementally while the process runs (#482), so the fake is a real stream that reaches EOF
+    # (a Mock whose read() returns the text forever never ends).
+    proc.stderr = io.StringIO(stderr)
     with patch("brain.bridge.provider.subprocess.Popen", return_value=proc):
         list(
-            ClaudeCliProvider(model="haiku", timeout_seconds=30).chat_stream(
+            ClaudeCliProvider(probe_model="haiku", timeout_seconds=30).chat_stream(
                 [ChatMessage(role="user", content="hi")],
                 tools=None,
                 options={"persona_dir": str(tmp_path)},
@@ -450,3 +457,24 @@ def test_unexpected_confirmation_is_indeterminate(monkeypatch, confirm):
     provider._reset_tools_flag_cache()
     assert provider._cli_supports_tools_flag() is False
     assert provider._TOOLS_FLAG_SUPPORTED is None
+
+
+def test_toolsearch_not_disallowed():
+    """ToolSearch must stay off the disallow list (#525).
+
+    On claude CLI 2.1.303 the CLI defers tool schemas behind ToolSearch only when
+    ToolSearch is in the request's tool set; without it every chat request carries
+    all ~32 schemas up front. Chat names it in the --tools allowlist, but a CLI
+    without --tools falls back to the disallow list alone, and a ToolSearch entry
+    there would silently switch deferral off again.
+    """
+    assert "ToolSearch" not in _BUILTIN_TOOLS_DISALLOWED, (
+        "ToolSearch is disallowed — tool deferral is off again (#525)"
+    )
+
+
+def test_chat_allowlist_names_toolsearch():
+    """The chat allowlist carries ToolSearch, so the CLI keeps deferral on (#525)."""
+    from brain.bridge.provider import _CHAT_BUILTIN_TOOLS
+
+    assert _CHAT_BUILTIN_TOOLS == ("WebSearch", "WebFetch", "ToolSearch")

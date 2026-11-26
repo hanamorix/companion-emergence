@@ -193,10 +193,10 @@ Validates the companion-emergence → companion-emergence migration path:
 a persona from an older install of the same app migrates intact into a
 fresh `KINDLED_HOME`.
 
-The fixture lives at `wizard-validation/fixtures/v0.0.12-persona/phoebe/`.
+The fixture lives at `wizard-validation/fixtures/v0.0.12-persona/canary/`.
 It contains 10 seeded memories (varied types, realistic content), empty
 `hebbian.db` and `crystallizations.db`, and a `persona_config.json` with
-`persona_name: "phoebe"` and `user_name: "zero"`.
+`persona_name: "canary"` and `user_name: "bob"`.
 
 1. Set a temp KINDLED_HOME (or back up the real one):
 
@@ -215,37 +215,37 @@ It contains 10 seeded memories (varied types, realistic content), empty
 5. On the Migrate page, pick **An existing companion-emergence install**.
 
 6. Paste the absolute path to
-   `wizard-validation/fixtures/v0.0.12-persona/phoebe` into the input
+   `wizard-validation/fixtures/v0.0.12-persona/canary` into the input
    field and continue.
 
 7. Preflight panel should show:
    - memories: **10**
    - crystallizations: **0**
    - Hebbian edges: **0**
-   - user: **zero**
+   - user: **bob**
    - No errors or warnings
 
 8. Continue → Review confirms source as "companion-emergence" with the
-   counts above and install target `phoebe` → click Install.
+   counts above and install target `canary` → click Install.
 
 9. StepInstalling: shows the MigrationReport summary card.
    - Expected: "copy migration, no skips" — 10 memories migrated,
      0 skipped, `source_kind: companion-emergence`.
 
-10. StepReady → app routes to the main NellFace UI with `phoebe` loaded
+10. StepReady → app routes to the main NellFace UI with `canary` loaded
     (avatar idle, 5 panels visible).
 
 11. Open chat; send "can you recall what you remember about me?"
     The seeded memories should surface through `/persona/state` —
-    you won't see literal memory rows in the UI but Phoebe's reply
-    should reflect the context (Zero's name, coffee preference, etc.).
+    you won't see literal memory rows in the UI but Canary's reply
+    should reflect the context (Bob's name, coffee preference, etc.).
 
 12. Verify on disc:
     ```
-    ls "$KINDLED_HOME/personas/phoebe/"
+    ls "$KINDLED_HOME/personas/canary/"
     # expect: memories.db  persona_config.json  source-manifest.json  ...
     cat "$KINDLED_HOME/app_config.json"
-    # expect: {"selected_persona": "phoebe"}
+    # expect: {"selected_persona": "canary"}
     ```
 
 13. Cleanup:

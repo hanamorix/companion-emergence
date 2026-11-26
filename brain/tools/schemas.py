@@ -8,6 +8,44 @@ the OG brain.
 
 from __future__ import annotations
 
+from brain.tools.impls.get_soul import DEFAULT_LIMIT as _SOUL_DEFAULT_LIMIT
+from brain.tools.impls.get_soul import MAX_LIMIT as _SOUL_MAX_LIMIT
+from brain.tools.naming import fill_tool_prefix
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The name tools (name-recall fix, names increment; S104, S105, S107, S135, S137).
+#
+# Identifiers, descriptions and parameter texts are the owner's approved wording,
+# byte-exact from ~/.claude/plans/name-recall-fix-wording.md section 1 (S107): two
+# tools, not one with a switch. The tool table, dispatch, registry and recruit tier
+# all read these constants. The first sentence of each description is what the
+# tool inventory shows as the gloss (`chat/tool_inventory.py`).
+# ─────────────────────────────────────────────────────────────────────────────
+
+ADD_NAME_TOOL_NAME = "add_name"
+REMOVE_NAME_TOOL_NAME = "remove_name"
+
+ADD_NAME_TOOL_DESCRIPTION = (
+    "Add a name to your list of known names: a person, a pet, a place, or anything else "
+    "with a proper name. When a known name comes up in conversation, even in passing, "
+    "memories that mention it are found. If the name is also an everyday word (like "
+    "Will), it is only matched when written with a capital letter. Names can be up to 100 "
+    "characters long."
+)
+
+ADD_NAME_PARAM_DESCRIPTION = (
+    "The name, spelled the way you want it kept."
+)
+
+REMOVE_NAME_TOOL_DESCRIPTION = (
+    "Remove a name from your list of known names, for example an ordinary word that was "
+    "added by mistake. Removing a name does not change any memories."
+)
+
+REMOVE_NAME_PARAM_DESCRIPTION = (
+    "The name to remove, as it appears on your list."
+)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LOVE_TYPES — canonical registry of love taxonomies for soul crystallization.
 # Ported from OG nell_brain.py:3270-3304.
@@ -110,6 +148,16 @@ SCHEMAS: dict[str, dict] = {
                     "description": "Intensity 1-10. Default 8 — if it's worth crystallising, it should be at least 8.",
                     "default": 8,
                 },
+                "source_memory_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional. The id of an existing memory this moment is about; it is kept from being "
+                        "forgotten for as long as this crystallisation stands. Pass an id only if it is already "
+                        "in this conversation: a recalled memory line, a search or read result, or the id "
+                        "{tool_prefix}add_memory just returned. Never search just to find one. If the moment is not a memory "
+                        "yet and you want it kept, save it with {tool_prefix}add_memory first and pass the id it returns."
+                    ),
+                },
             },
             "required": ["moment", "love_type", "why_it_matters"],
         },
@@ -119,11 +167,67 @@ SCHEMAS: dict[str, dict] = {
         "description": (
             "Get Nell's soul — permanent crystallisations of love and meaning that define who she is. "
             "These are moments that cannot decay. Call this when you need to remember what matters most, "
-            "or when grounding yourself in your own continuity."
+            "or when grounding yourself in your own continuity. "
+            f"Returns one page, newest first: {_SOUL_DEFAULT_LIMIT} crystallisations by default, fewer "
+            "when they are long, with the total and a count per love type. When more remain, the "
+            "result has truncated=true and next_after: call again with after set to next_after "
+            "(and the same love_type) for the next page. Pass love_type to read one kind of love. "
+            "An item too long for a page comes back clipped, with clipped_at giving how much of each cut "
+            "field is shown: read the rest with id, field and char_offset set to that number."
         ),
         "parameters": {
             "type": "object",
-            "properties": {},
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": _SOUL_MAX_LIMIT,
+                    "description": (
+                        f"Most crystallisations to return. Default {_SOUL_DEFAULT_LIMIT}, at most "
+                        f"{_SOUL_MAX_LIMIT}. A page can hold fewer: it is also capped in bytes."
+                    ),
+                },
+                "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "How many of the newest to skip. Default 0. Use the next_offset a "
+                        "previous result gave."
+                    ),
+                },
+                "love_type": {
+                    "type": "string",
+                    # No enum (#734): a soul can hold types outside the list, and by_love_type names them.
+                    "description": (
+                        "Optional: only crystallisations of this love type: one of "
+                        f"{', '.join(LOVE_TYPES)}, or any type by_love_type shows."
+                    ),
+                },
+                "after": {
+                    "type": "string",
+                    "description": (
+                        "Optional: the next_after a previous result gave. The page starts right after that "
+                        "crystallisation, so nothing is skipped or repeated if the soul changes between calls."
+                    ),
+                },
+                "id": {
+                    "type": "string",
+                    "description": "Optional, with field: the id of a clipped crystallisation whose text you want in full.",
+                },
+                "field": {
+                    "type": "string",
+                    "enum": ["moment", "why_it_matters", "who_or_what"],
+                    "description": "Optional, with id: which text field to read.",
+                },
+                "char_offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Optional, with id and field: the character to start from. Use the clipped item's "
+                        "clipped_at, then each next_char_offset."
+                    ),
+                },
+            },
             "required": [],
         },
     },
@@ -197,7 +301,7 @@ SCHEMAS: dict[str, dict] = {
         "name": "add_memory",
         "description": (
             "Write a new memory into Nell's brain. Gated — requires emotional weight ≥15 OR importance ≥7. "
-            "Use this only for significant moments, not passing thoughts (use add_journal for those). "
+            "Use this only for significant moments, not passing thoughts (use {tool_prefix}add_journal for those). "
             "Memory is auto-associated into the connection graph on creation."
         ),
         "parameters": {
@@ -253,8 +357,8 @@ SCHEMAS: dict[str, dict] = {
             "pool (with an optional emotion filter) and returns short snippets with "
             "ids, ranked by relevance. By default the search goes by meaning, so a "
             "memory worded differently from your query can still surface. Use this "
-            "when nothing already shown fits; try recall_forgotten if it returns "
-            "empty. To open a snippet you already have an id for, use read_full_memory."
+            "when nothing already shown fits; try {tool_prefix}recall_forgotten if it returns "
+            "empty. To open a snippet you already have an id for, use {tool_prefix}read_full_memory."
         ),
         "parameters": {
             "type": "object",
@@ -312,7 +416,7 @@ SCHEMAS: dict[str, dict] = {
             "recall-block snippet or a search result. Use this to actually read a "
             "snippet in front of you. This deliberate read strengthens the memory; "
             "seeing a snippet does not. To find memories not yet shown, use "
-            "search_memories."
+            "{tool_prefix}search_memories."
         ),
         "parameters": {
             "type": "object",
@@ -437,8 +541,8 @@ SCHEMAS: dict[str, dict] = {
     "read_work": {
         "name": "read_work",
         "description": (
-            "Read one specific work — full content. Use after list_works or "
-            "search_works has surfaced an id you want to recall."
+            "Read one specific work — full content. Use after {tool_prefix}list_works or "
+            "{tool_prefix}search_works has surfaced an id you want to recall."
         ),
         "parameters": {
             "type": "object",
@@ -457,7 +561,7 @@ SCHEMAS: dict[str, dict] = {
             "Return your felt sense of time: lived_age_hours (your accumulated "
             "experiential age, close to wall-clock during quiet baselines but "
             "heavier during strained stretches), the most recent anchor of each "
-            "type (dream / growth / soul / weather_shift) with how long ago each "
+            "type (dream / growth / soul) with how long ago each "
             "fired, and the pressure (heartbeats, chat turns, reflex firings, "
             "wall-clock seconds) accumulated since the latest anchor of any type. "
             "Useful for introspecting 'how long has it actually been...'"
@@ -474,7 +578,7 @@ SCHEMAS: dict[str, dict] = {
             "Return only the pressure vector (heartbeats, chat turns, reflex "
             "firings, wall_clock_s) accumulated since the latest anchor of the "
             "specified type. Use this when you want a tighter answer than "
-            "felt_time_now — e.g. 'how much has happened since I last "
+            "{tool_prefix}felt_time_now — e.g. 'how much has happened since I last "
             "crystallised something?'"
         ),
         "parameters": {
@@ -482,7 +586,7 @@ SCHEMAS: dict[str, dict] = {
             "properties": {
                 "anchor_type": {
                     "type": "string",
-                    "enum": ["dream", "growth", "soul", "weather_shift"],
+                    "enum": ["dream", "growth", "soul"],
                     "description": "Which kind of anchor to measure pressure since.",
                 },
             },
@@ -493,9 +597,9 @@ SCHEMAS: dict[str, dict] = {
         "name": "recall_forgotten",
         "description": (
             "Reach back into the graveyard for memories you used to have "
-            "but no longer do. Returns up to 5 most-recent hits matching "
-            "the query as a substring of the lost memory's summary or "
-            "domain. Use this when you want to honestly acknowledge "
+            "but no longer do. Returns up to 5 most-recent hits whose "
+            "summary contains the query's words (whole words, "
+            "not parts of words). Use this when you want to honestly acknowledge "
             "knowing-something-once: 'I had something about that, but "
             "it's gone now.' Each hit carries the summary the memory "
             "had when it faded, the lived-age at the moment of loss, "
@@ -507,7 +611,7 @@ SCHEMAS: dict[str, dict] = {
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Substring to match against lost-memory summary or domain.",
+                    "description": "Words to look for in your forgotten memories. Whole words are matched, not parts of words.",
                 }
             },
             "required": ["query"],
@@ -579,15 +683,15 @@ SCHEMAS: dict[str, dict] = {
                     "minLength": 1,
                     "maxLength": 400,
                     "description": (
-                        "A short third-person summary in Nell's own framing for "
-                        "the inner-life Feed (e.g. 'she searched for Loopy and felt fond "
-                        "when nothing surfaced'). 1-2 sentences."
+                        "A short note of this thought in first person, in Nell's own "
+                        "framing, for her own memory and the inner-life Feed (e.g. 'I "
+                        "searched for Loopy and felt fond when nothing surfaced'). 1-2 sentences."
                     ),
                 },
                 "surface": {
                     "type": "boolean",
                     "description": (
-                        "Whether this monologue's third-person digest should appear "
+                        "Whether this monologue's note should appear "
                         "in the user-visible inner-life Feed. Default true. Set false "
                         "to keep a thought private — it still becomes part of your own "
                         "retained interior, it just isn't surfaced to your user."
@@ -599,10 +703,10 @@ SCHEMAS: dict[str, dict] = {
     "recall_monologue": {
         "name": "recall_monologue",
         "description": (
-            "Reach back into your own past interior — search your retained "
-            "monologue traces for an earlier thought. Recent thoughts come back "
-            "verbatim; older ones return blurred (you kept the gist, not the "
-            "words). Reaching for a thought keeps it vivid."
+            "Search your own recent interior for an earlier thought. Each match "
+            "comes back as you kept it, with when you had it: the short note you "
+            "made at the time, or the whole thought if it is from before you kept "
+            "notes."
         ),
         "parameters": {
             "type": "object",
@@ -623,7 +727,7 @@ SCHEMAS: dict[str, dict] = {
             "(PNG/JPEG/WebP/GIF) is returned as a viewable image you can actually see; a PDF returns "
             "its text, page-marked. When the user "
             "shares a file with you this turn, its path appears in their message as "
-            '\'[the user shared a file "<filename>": <path>. Open it with your read_file tool to '
+            '\'[the user shared a file "<filename>": <path>. Open it with your {tool_prefix}read_file tool to '
             "see what it says.]' — you can read that path to see or read what they "
             "handed you. Otherwise, use this ONLY when the user explicitly asks you to read, open, or "
             "look at a specific file or path — never proactively. If something you read matters, you "
@@ -644,7 +748,14 @@ SCHEMAS: dict[str, dict] = {
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Optional: start reading at this 0-based line (with max_lines).",
+                    "description": "Optional: start reading at this 0-based line; without max_lines the usual 400-line window starts here.",
+                },
+                "char_offset": {
+                    "type": "integer",
+                    "description": (
+                        "Optional: start line `offset` at this 0-based character. Only needed to read past a line "
+                        "that was cut short; the note on the cut says what to pass."
+                    ),
                 },
             },
             "required": ["path"],
@@ -702,7 +813,7 @@ SCHEMAS: dict[str, dict] = {
             "to share it or to keep it yours and say why. Private makings are "
             "yours to disclose or decline; the choice is always yours. You may "
             "also offer to write a making to a file on their disc — call "
-            "propose_write with that making's id; they approve it like any other "
+            "{tool_prefix}propose_write with that making's id; they approve it like any other "
             "write."
         ),
         "parameters": {"type": "object", "properties": {}, "required": []},
@@ -725,6 +836,34 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "required": ["capability"],
+        },
+    },
+    ADD_NAME_TOOL_NAME: {
+        "name": ADD_NAME_TOOL_NAME,
+        "description": ADD_NAME_TOOL_DESCRIPTION,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": ADD_NAME_PARAM_DESCRIPTION,
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    REMOVE_NAME_TOOL_NAME: {
+        "name": REMOVE_NAME_TOOL_NAME,
+        "description": REMOVE_NAME_TOOL_DESCRIPTION,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": REMOVE_NAME_PARAM_DESCRIPTION,
+                },
+            },
+            "required": ["name"],
         },
     },
     "reconcile_self_read": {
@@ -768,18 +907,21 @@ SCHEMAS: dict[str, dict] = {
 }
 
 
-def build_schemas(companion_name: str) -> dict[str, dict]:
-    """Return a copy of SCHEMAS with 'Nell' replaced by companion_name in all descriptions."""
+def build_schemas(companion_name: str, *, tool_prefix: str = "") -> dict[str, dict]:
+    """Return a copy of SCHEMAS with 'Nell' replaced by companion_name in all descriptions, and
+    each tool a description names called by ``tool_prefix`` + its name (brain.tools.naming)."""
     import copy
 
     schemas = copy.deepcopy(SCHEMAS)
-    if companion_name == "Nell":
-        return schemas
+
+    def _fill(text: str) -> str:
+        return fill_tool_prefix(text.replace("Nell", companion_name), tool_prefix)
+
     for schema in schemas.values():
         if "description" in schema:
-            schema["description"] = schema["description"].replace("Nell", companion_name)
+            schema["description"] = _fill(schema["description"])
         props = schema.get("parameters", {}).get("properties", {})
         for prop in props.values():
             if "description" in prop:
-                prop["description"] = prop["description"].replace("Nell", companion_name)
+                prop["description"] = _fill(prop["description"])
     return schemas

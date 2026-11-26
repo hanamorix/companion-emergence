@@ -18,9 +18,10 @@ import numpy as np
 import pytest
 
 from brain.bridge import model_tier
+from brain.dev_constants import RERANK_MIN_REAL_CANDIDATES
 from brain.memory.embeddings import EmbeddingProvider
 from brain.memory.hebbian import HebbianMatrix
-from brain.memory.reranker import FakeRerankerProvider
+from brain.memory.reranker import ANCHOR_POOL, FakeRerankerProvider
 from brain.memory.store import Memory, MemoryStore
 from brain.tools.dispatch import dispatch
 
@@ -125,7 +126,7 @@ def _patch_provider(monkeypatch: pytest.MonkeyPatch, vectors: dict[str, np.ndarr
     # stamped on the rows; otherwise the first matrix read reloads from disk
     # filtered to the real production model id, finds nothing, and silently
     # discards the seeded vectors.
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
 
 
 def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -> None:
@@ -136,10 +137,28 @@ def _patch_reranker(monkeypatch: pytest.MonkeyPatch, scores: dict[str, float]) -
     a CONCLUSIVE (floor-clearing) semantic result must script the specific
     memory contents it expects to surface, same pattern as `_patch_provider`
     above for the embedding side."""
+    # Name-recall fix R1: anchors come on top of every rerank; scored at 0.0
+    # so each scripted score's normalized value equals the scripted value.
+    scripted = {**dict.fromkeys(ANCHOR_POOL, 0.0), **scores}
     monkeypatch.setattr(
         "brain.memory.reranker.build_reranker_provider",
-        lambda **kwargs: FakeRerankerProvider(scores=scores),
+        lambda **kwargs: FakeRerankerProvider(scores=scripted),
     )
+
+
+def _pad_semantic_pool(store: MemoryStore, have: int) -> None:
+    """Name-recall fix R1 (S5/S23): a rerank runs only with at least
+    RERANK_MIN_REAL_CANDIDATES candidates, so a semantic-mode test with a
+    smaller pool adds filler memories: low cosine, no word shared with any
+    query here, and unscripted for the fake reranker (its far-below-floor
+    default), so they never surface in either mode."""
+    for i in range(RERANK_MIN_REAL_CANDIDATES - have):
+        filler = _seed(store, f"zzfiller{i} qqpadding")
+        store._conn.execute(  # noqa: SLF001
+            "UPDATE memories SET embedding = ?, embedding_model_id = ? WHERE id = ?",
+            (_unit_vec_with_cosine(0.05).tobytes(), _SCRIPTED_MODEL_ID, filler.id),
+        )
+    store._conn.commit()  # noqa: SLF001
 
 
 def _seed_floor(
@@ -177,6 +196,7 @@ def test_default_mode_is_semantic(monkeypatch: pytest.MonkeyPatch, tmp_path: Pat
     m_target = _seed(ctx["store"], target)
 
     _seed_vectors(ctx["store"], vectors, contents_by_id={m_target.id: target})
+    _pad_semantic_pool(ctx["store"], 1)
     _patch_provider(monkeypatch, vectors, dim=dim)
     _seed_floor(ctx["store"])
     _patch_reranker(monkeypatch, scores={target: _TEST_FLOOR + 5.0})
@@ -206,10 +226,16 @@ def test_mode_lexical_matches_existing_keyword_behavior(tmp_path: Path) -> None:
     assert m1.id in ids and m2.id in ids, "disjoint multi-term query must union, not AND (unchanged C23 behavior)"
 
 
-def test_mode_lexical_never_touches_the_embedding_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_mode_lexical_never_touches_the_embedding_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """lexical mode must not construct an embedding cache/provider at all —
     forcing that construction to raise proves the lexical path never even
-    tries it."""
+    tries it. An unknown `mode` value falls back to the same lexical path,
+    and the output reports the path that actually ran, never the input
+    (#231 Fix 3: `dispatch` does not enforce the schema enum, so the garbage value reaches
+    the impl as-is; pre-fix, `resolved_mode` was seeded from the raw argument and kept
+    reporting "garbage" although lexical is what ran)."""
 
     def _boom() -> None:
         raise AssertionError("lexical mode must never build an embedding provider")
@@ -217,12 +243,23 @@ def test_mode_lexical_never_touches_the_embedding_path(monkeypatch: pytest.Monke
     monkeypatch.setattr("brain.memory.embeddings.build_embedding_provider", _boom)
 
     ctx = _ctx(tmp_path)
-    _seed(ctx["store"], "henryk likes long walks")
+    m = _seed(ctx["store"], "henryk likes long walks")
 
     res = dispatch("search_memories", {"query": "henryk", "mode": "lexical"}, **ctx)
 
     assert res["mode"] == "lexical"
     assert res["memories"]
+
+    garbage = dispatch("search_memories", {"query": "henryk", "mode": "garbage"}, **ctx)
+
+    # Retrieval actually ran lexical (a keyword hit surfaces with no
+    # embedding infra involved at all).
+    ids = {mm["id"] for mm in garbage["memories"]}
+    assert m.id in ids
+    # The output "mode" field must report the path that actually ran, never
+    # echo the invalid input back.
+    assert garbage["mode"] == "lexical"
+    assert garbage["mode"] != "garbage"
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +292,7 @@ def test_mode_semantic_paraphrase_beats_keyword_overlap_decoy(
     m_decoy = _seed(ctx["store"], decoy)
 
     _seed_vectors(ctx["store"], vectors, contents_by_id={m_target.id: target, m_decoy.id: decoy})
+    _pad_semantic_pool(ctx["store"], 2)
     _patch_provider(monkeypatch, vectors, dim=dim)
     _seed_floor(ctx["store"])
     # Both clear the calibrated floor (so the assertion actually exercises
@@ -285,7 +323,8 @@ def test_mode_semantic_result_shape_matches_existing_snippet_format(
 ) -> None:
     """Semantic-mode result rows use the SAME snippet shape the tool already
     formats (id, content, snippet: true, etc.) — the output contract is
-    unchanged, only the ranking path differs."""
+    unchanged, only the ranking path differs — and the search never bumps
+    recall_count (either mode). (One scenario, both properties.)"""
     query = "quiet evening"
     target = "a quiet evening with nothing much happening"
     dim = _EMBED_DIM
@@ -299,6 +338,7 @@ def test_mode_semantic_result_shape_matches_existing_snippet_format(
     _seed_vectors(ctx["store"], vectors, contents_by_id={m_target.id: target})
     _patch_provider(monkeypatch, vectors, dim=dim)
 
+    before = _rc(ctx["store"], m_target.id)
     res = dispatch("search_memories", {"query": query, "mode": "semantic"}, **ctx)
     assert res["memories"], "expected at least one semantic hit"
     for m in res["memories"]:
@@ -307,26 +347,7 @@ def test_mode_semantic_result_shape_matches_existing_snippet_format(
         assert "content" in m
         assert "emotions" in m
         assert "tags" in m
-
-
-def test_mode_semantic_stays_bump_free(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    query = "quiet evening"
-    target = "a quiet evening with nothing much happening"
-    dim = _EMBED_DIM
-    vectors = {
-        query: _query_unit_vec(),
-        target: _unit_vec_with_cosine(0.9),
-    }
-
-    ctx = _ctx(tmp_path)
-    m = _seed(ctx["store"], target)
-    _seed_vectors(ctx["store"], vectors, contents_by_id={m.id: target})
-    _patch_provider(monkeypatch, vectors, dim=dim)
-
-    before = _rc(ctx["store"], m.id)
-    res = dispatch("search_memories", {"query": query, "mode": "semantic"}, **ctx)
-    assert res["memories"]
-    after = _rc(ctx["store"], m.id)
+    after = _rc(ctx["store"], m_target.id)
     assert after == before, "search_memories (either mode) must never bump recall_count"
 
 
@@ -366,7 +387,7 @@ def test_semantic_falls_back_to_lexical_when_query_embed_raises(
     # `_patch_provider`'s docstring for why (this test scripts its own
     # provider directly rather than going through `_patch_provider`, so it
     # must do the alignment itself).
-    monkeypatch.setitem(model_tier.TIER_MODEL, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
+    monkeypatch.setitem(model_tier.LOCAL_MODEL_IDS, model_tier.TIER_EMBEDDING, _SCRIPTED_MODEL_ID)
 
     class _BoomProvider(_ScriptedProvider):
         def embed(self, text: str) -> np.ndarray:
@@ -385,31 +406,3 @@ def test_semantic_falls_back_to_lexical_when_query_embed_raises(
     assert res["mode"] == "lexical"
     ids = {mm["id"] for mm in res["memories"]}
     assert m.id in ids
-
-
-# ---------------------------------------------------------------------------
-# #231 Fix 3 — resolved_mode must never lie. An invalid `mode` value isn't
-# blocked by `dispatch` (the "enum" in the schema is advisory, not enforced
-# at the call boundary — see brain/tools/dispatch.py, which only checks
-# `required`), so it reaches the impl as-is. Pre-fix, that garbage value
-# skipped the `mode == "semantic"` branch entirely (retrieval correctly ran
-# lexical) but `resolved_mode` was seeded from the raw `mode` argument and
-# only ever corrected inside that branch — so the output "mode" field kept
-# reporting "garbage" even though lexical is what actually ran.
-# ---------------------------------------------------------------------------
-
-
-def test_mode_garbage_value_runs_lexical_and_reports_lexical_honestly(tmp_path: Path) -> None:
-    ctx = _ctx(tmp_path)
-    m = _seed(ctx["store"], "henryk likes long walks")
-
-    res = dispatch("search_memories", {"query": "henryk", "mode": "garbage"}, **ctx)
-
-    # Retrieval actually ran lexical (a keyword hit surfaces with no
-    # embedding infra involved at all).
-    ids = {mm["id"] for mm in res["memories"]}
-    assert m.id in ids
-    # The output "mode" field must report the path that actually ran, never
-    # echo the invalid input back.
-    assert res["mode"] == "lexical"
-    assert res["mode"] != "garbage"

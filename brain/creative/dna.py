@@ -8,20 +8,19 @@ This module owns the file I/O. The crystallizer
 (brain/growth/crystallizers/creative_dna.py) is the only auto-evolution
 caller. Migration imports from OG via brain/migrator/og_journal_dna.py.
 
-Atomic writes via save_with_backup; reads via attempt_heal so corruption
+Atomic writes via write_json; reads via read_json_result (HEAL) so corruption
 falls back to .bak rotation; if all backups corrupt, framework default
 applies (per spec §3.2).
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from pathlib import Path
 from typing import Any
 
 from brain.health.adaptive import compute_treatment
-from brain.health.attempt_heal import attempt_heal, save_with_backup
+from brain.health.json_io import Recovery, read_json, read_json_result, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +30,7 @@ _DEFAULT_PATH = Path(__file__).parent / "default_creative_dna.json"
 
 def _default_factory() -> dict[str, Any]:
     """Return the framework-shipped default. Read from the bundled JSON file."""
-    return json.loads(_DEFAULT_PATH.read_text(encoding="utf-8"))
+    return read_json(_DEFAULT_PATH, recover=Recovery.RAISE)  # a bundled file: absent or corrupt is an install bug
 
 
 def _validate_schema(data: object) -> None:
@@ -63,13 +62,14 @@ def load_creative_dna(persona_dir: Path) -> dict[str, Any]:
     path = persona_dir / CREATIVE_DNA_FILENAME
 
     if not path.exists():
-        # Seed the persona dir with the default. Never bypass attempt_heal
+        # Seed the persona dir with the default. Never bypass the heal
         # for live usage — but on first-creation it's a clean copy.
         default = _default_factory()
         save_creative_dna(persona_dir, default)
         return default
 
-    data, anomaly = attempt_heal(path, _default_factory, schema_validator=_validate_schema)
+    _res = read_json_result(path, default=_default_factory, recover=Recovery.HEAL, validate=_validate_schema)
+    data, anomaly = _res.data, _res.anomaly
     if anomaly is not None:
         logger.warning(
             "creative_dna at %s anomaly %s (action=%s); using recovered/default",
@@ -84,10 +84,9 @@ def save_creative_dna(persona_dir: Path, data: dict[str, Any]) -> None:
     """Atomic write with .bak rotation. Validates schema before writing."""
     _validate_schema(data)
     path = persona_dir / CREATIVE_DNA_FILENAME
-    persona_dir.mkdir(parents=True, exist_ok=True)
     try:
         treatment = compute_treatment(persona_dir, CREATIVE_DNA_FILENAME)
         backup_count = treatment.backup_count
     except Exception:  # noqa: BLE001
         backup_count = 3
-    save_with_backup(path, data, backup_count=backup_count)
+    write_json(path, data, backups=backup_count)

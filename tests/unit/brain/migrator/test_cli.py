@@ -802,3 +802,24 @@ def test_run_migrate_releases_lock_on_failure(
         run_migrate(args)
     # Lock released even though run_migrate raised
     assert not _migrate_lock_for(out).exists()
+
+
+def test_run_migrate_creates_memories_without_telling_the_emotion_engine(
+    og_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An import is not new experience: every memory it creates passes fold=False, and no engine folder appears."""
+    from brain.memory.store import MemoryStore
+
+    seen: list[dict] = []
+    real_create = MemoryStore.create
+
+    def recording_create(self, memory, **kwargs):
+        seen.append(kwargs)
+        return real_create(self, memory, **kwargs)
+
+    monkeypatch.setattr(MemoryStore, "create", recording_create)
+    out = tmp_path / "migrated"
+    run_migrate(MigrateArgs(input_dir=og_dir, output_dir=out, install_as=None, force=False))
+
+    assert len(seen) == 2 and all(kwargs.get("fold") is False for kwargs in seen)
+    assert not (out / "state").exists()

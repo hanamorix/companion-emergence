@@ -8,11 +8,11 @@ not available in the new framework's environment.
 from __future__ import annotations
 
 import ast
-import json
-import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+
+from brain.health.json_io import Recovery, read_json, write_json
 
 _ACTION_RENAMES = {
     "generate_story_pitch": "generate_pitch",
@@ -111,7 +111,7 @@ def migrate_reflex_arcs(
       preserve the original ``created_at`` / ``created_by`` for any arc whose
       name is already present.  Only newly introduced arc names get a fresh
       ``created_at`` of *now*.
-    - Writes atomically via a ``.new`` temp file + ``os.replace``.
+    - Writes atomically (brain.health.json_io).
 
     Returns the list of arc dicts written.
     """
@@ -122,19 +122,16 @@ def migrate_reflex_arcs(
     if og_reflex_engine_path is not None:
         source_arcs: list[dict[str, Any]] = extract_arcs_from_og(og_reflex_engine_path)
     else:
-        default_data = json.loads(_default_arcs_path().read_text(encoding="utf-8"))
+        default_data = read_json(_default_arcs_path(), recover=Recovery.RAISE)  # bundled: absent/corrupt is an install bug
         source_arcs = list(default_data.get("arcs", []))
 
     # 2. Load existing arcs (for idempotency — preserve created_at/created_by).
     existing_by_name: dict[str, dict[str, Any]] = {}
-    if arcs_path.exists():
-        try:
-            existing_data = json.loads(arcs_path.read_text(encoding="utf-8"))
-            for a in existing_data.get("arcs", []):
-                if isinstance(a, dict) and "name" in a:
-                    existing_by_name[a["name"]] = a
-        except (json.JSONDecodeError, OSError):
-            pass  # corrupt existing file — treat as empty, re-stamp everything
+    # An absent, corrupt or unreadable existing file is treated as empty and everything is re-stamped.
+    existing_data = read_json(arcs_path, default=dict, expect=dict)
+    for a in existing_data.get("arcs", []):
+        if isinstance(a, dict) and "name" in a:
+            existing_by_name[a["name"]] = a
 
     # 3. Stamp each arc with provenance.
     now_iso = datetime.now(UTC).isoformat()
@@ -153,11 +150,6 @@ def migrate_reflex_arcs(
         arcs_to_write.append(arc_dict)
 
     # 4. Atomic write.
-    tmp_path = arcs_path.with_suffix(arcs_path.suffix + ".new")
-    tmp_path.write_text(
-        json.dumps({"version": 1, "arcs": arcs_to_write}, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(tmp_path, arcs_path)
+    write_json(arcs_path, {"version": 1, "arcs": arcs_to_write}, fsync=False)
 
     return arcs_to_write

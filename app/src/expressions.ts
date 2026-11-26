@@ -155,26 +155,31 @@ const ACHING_FAMILY = new Set(["body_grief", "freedom_ache"]);
 /**
  * Body-emotion thresholds — when these fire, override whatever the
  * social emotions are saying. Spec principle: physiology speaks first.
+ * Arousal and intent are not judged here: the engine decides what is high and the server sends the
+ * list (`feels_high`); when there is no list, nothing counts as high.
  */
 const CLIMAX_OVERRIDE = 7;
-const AROUSAL_DESIRE_SUM_OVERRIDE = 12;
 const EXHAUSTION_OVERRIDE = 7;
 const DAYS_SINCE_CONTACT_ACHING = 5;
 
 export interface ExpressionInput {
   emotions: Record<string, number>;
   body: BodyState | null;
+  /** The feeling names the engine calls high (an array whenever the server's read of the engine worked, possibly
+   *  empty). The arousal and intent expressions follow this list and nothing else; null or undefined (the server's
+   *  call failed, or an older bridge does not send it) means nothing counts as high. */
+  feelsHigh?: string[] | null;
 }
 
 export function pickExpressionCategory(input: ExpressionInput): ExpressionCategory {
-  const { body, emotions } = input;
+  const { body, emotions, feelsHigh } = input;
   const bodyEmo = body?.body_emotions ?? {};
 
   // 1. Body overrides — physiology first
   if ((bodyEmo.climax ?? 0) >= CLIMAX_OVERRIDE) return "climax";
-  if (((bodyEmo.arousal ?? 0) + (bodyEmo.desire ?? 0)) >= AROUSAL_DESIRE_SUM_OVERRIDE) {
-    return "arousal";
-  }
+  const arousalOverride =
+    body !== null && (feelsHigh?.includes("arousal") ?? false) && (feelsHigh?.includes("desire") ?? false);
+  if (arousalOverride) return "arousal";
   if ((body?.exhaustion ?? 0) >= EXHAUSTION_OVERRIDE) return "exhausted";
 
   // 2. Long absence reads as bodily yearning
@@ -185,7 +190,7 @@ export function pickExpressionCategory(input: ExpressionInput): ExpressionCatego
   // categories (intent, defiant) win over generic ones (happy, angry).
   const top = topEmotion(emotions);
   if (top) {
-    if (INTENT_FAMILY.has(top) && (emotions[top] ?? 0) >= 7) return "intent";
+    if (INTENT_FAMILY.has(top) && feelsHigh?.includes(top)) return "intent";
     if (DEFIANT_FAMILY.has(top)) return "defiant";
     if (AWE_FAMILY.has(top)) return "awe";
     if (CONTENT_FAMILY.has(top)) return "content";
@@ -209,6 +214,7 @@ export function pickExpressionFromState(state: PersonaState | null): ExpressionC
   return pickExpressionCategory({
     emotions: state.emotions ?? {},
     body: state.body ?? null,
+    feelsHigh: state.feels_high ?? null,
   });
 }
 

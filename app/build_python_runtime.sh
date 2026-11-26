@@ -15,7 +15,7 @@
 #                   python-runtime/lib/python3.13/site-packages/brain/
 #
 #   Windows:        python-runtime/python.exe
-#                   python-runtime/Scripts/nell.exe   ← entry point
+#                   python-runtime/Scripts/nell.bat   ← entry point
 #                   python-runtime/Lib/site-packages/brain/
 #
 # The Rust `nell_command(app)` helper resolves the right entry point
@@ -209,6 +209,14 @@ uv pip install --python "$PY_BIN" --no-deps --quiet "$WHEEL"
 # machine where that path does not exist (or worse, exists from a
 # stale build). The wrapper resolves the bundled python by relative
 # path so the runtime tree is fully relocatable.
+# How the desktop app puts this wrapper on the user's PATH (app/src-tauri/nell-shortcut):
+#   macOS and the Linux .deb: a symlink ~/.local/bin/nell -> bin/nell (hence the symlink
+#     resolution in the wrapper below).
+#   Linux AppImage: ~/.local/bin/nell is a small script that runs the AppImage with
+#     --companion-nell-cli; the app then execs this wrapper from inside the mount.
+#   Windows: a nell.cmd in %LOCALAPPDATA%\CompanionEmergence\bin calls Scripts\nell.bat by
+#     full path (the .bat below finds python.exe through %~dp0), and its folder is added once
+#     to the user PATH.
 if [ "$HOST_OS" != "windows" ]; then
   echo "[build] writing relocatable nell wrapper (Unix)"
   cat > "$NELL_BIN" <<'NELL_WRAPPER'

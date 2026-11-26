@@ -159,3 +159,29 @@ def test_should_publish_cli_walks_real_history(tmp_path, monkeypatch, capsys):
     assert run(newer, json.dumps({"commit": "f" * 40})) == "publish=true"  # history rewritten
     assert run(newer, "{not json") == "publish=true"
     assert run(newer, None) == "publish=true"
+
+
+# ── envelope: manifest + signature in one asset (#365) ────────────────────────
+_FIXTURES = REPO / "app" / "src-tauri" / "src" / "brain_update_fixtures"
+
+
+def test_envelope_carries_the_exact_signed_bytes(tmp_path):
+    """One asset holds both halves, so a `--clobber` upload can never pair a new
+    manifest with the old signature; the manifest text survives byte for byte,
+    or the signature over it would stop verifying."""
+    out = tmp_path / "manifest.signed.json"
+    rc = bm.main(["envelope", "--manifest", str(_FIXTURES / "manifest.json"),
+                  "--sig", str(_FIXTURES / "manifest.json.sig"), "--out", str(out)])
+    assert rc == 0
+    env = json.loads(out.read_text(encoding="utf-8"))
+    assert env["manifest"].encode("utf-8") == (_FIXTURES / "manifest.json").read_bytes()
+    assert env["signature"].encode("utf-8") == (_FIXTURES / "manifest.json.sig").read_bytes()
+
+
+def test_envelope_fixture_is_what_the_script_writes(tmp_path):
+    """The Rust tests read manifest.signed.json from the fixtures; it must be the
+    script's own output, so the two sides can't drift on the format."""
+    out = tmp_path / "manifest.signed.json"
+    bm.main(["envelope", "--manifest", str(_FIXTURES / "manifest.json"),
+             "--sig", str(_FIXTURES / "manifest.json.sig"), "--out", str(out)])
+    assert out.read_bytes() == (_FIXTURES / "manifest.signed.json").read_bytes()

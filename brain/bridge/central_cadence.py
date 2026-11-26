@@ -8,7 +8,10 @@ background job whether it runs now. A gated job runs only when BOTH:
   reached wait for the next lull), and
 * the job is due: an interval job's persisted ``next_at`` has passed
   (S23/S34), or a no-interval job has work (pass 2, session snapshot/prune,
-  emotion backfill, embedding backfill: S53/S66), or a predicate job's own
+  emotion backfill, embedding backfill: S53/S66; the extraction backfill,
+  #523: an armed plan with an open target; the research recovery, #591: lost
+  research memories still to be recovered; the emotion recovery rebuild,
+  #584: a live persona's engine state is missing or unreadable), or a predicate job's own
   condition holds (deploy recalibration: the stored floor is stale, S70/S73;
   self-model articulation: its own cadence module, S29).
 
@@ -17,6 +20,13 @@ deploy recalibration immediately before daily calibration (S70/S73).
 
 Cadence rules (interval jobs, owned here):
 
+* A predicate job's own condition holds (the two floor-bootstrap RETRY jobs,
+  name-recall fix S85 revised, S91/S92: no calibrated row, no cached
+  bootstrap, the floor was needed or its last attempt failed, chat has
+  happened since the failed attempt, and no bootstrap of that floor in
+  flight), like deploy recalibration; and the stuck-width re-measure
+  (name-recall fix S100, S113: a stuck budget miss on an already-loaded
+  reranker, not yet re-measured at this chat activity marker).
 * A missing OR corrupt cadence file is created as "last ran now"
   (``next_at = now + interval``) and the job does not run on that pass
   (S22/S69). A present file with a past ``next_at`` is simply overdue (S34),
@@ -49,22 +59,43 @@ from __future__ import annotations
 
 import enum
 import logging
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain.bridge import background_jobs, cli_throttle, persisted_cadence
+from brain.bridge import background_jobs, cli_throttle, persisted_cadence, provider_auth
 
 logger = logging.getLogger(__name__)
 
 # S55 order, with deploy recalibration (S70/S73) immediately before daily
-# calibration. Names are the job table's keys and the log's `job=` values.
+# calibration and, after embedding backfill, the once-per-process cosine floor
+# bootstrap (name-recall fix S85; it needs the embedder, off the recall hot
+# path), then the stuck-width re-measure (S100: one timed rerank per lull
+# while the learned cost says fewer than 5 candidates fit), then the RAM-figure
+# measurement (S200, S220: the RAM ladder when a turn found no usable memory model),
+# then the cost-series flush (S146, S164: the buffered timing samples are saved to memories.db, after
+# the re-measure and the RAM figure so their samples are saved the same lull), then the recall
+# diagnostics flush (S189: records buffered while the log's lock was held), then the extraction
+# backfill (#523: one chunk per pass, after embedding backfill so the vectors its dedup reads are
+# current). The research recovery (#591: one interest's lost research memories per pass) runs right after the emotion
+# backfill. The emotion recovery rebuild (Engine 6, #584: a live persona's missing or unreadable engine state rebuilt from its rows)
+# runs first, before any job that reads the engine. Names are the job table's keys and the log's `job=` values.
 GATED_JOB_ORDER: tuple[str, ...] = (
+    "emotion_recovery_rebuild",
     "pass2",
     "session_snapshot_prune",
     "emotion_backfill",
+    "research_recovery",
     "embedding_backfill",
+    "cosine_floor_bootstrap",
+    "rerank_floor_bootstrap",
+    "rerank_width_remeasure",
+    "rerank_ram_figure",
+    "cost_series_flush",
+    "recall_diagnostics_flush",
+    "extraction_backfill",
     "maintenance",
     "interest_sweep",
     "self_model_articulation",
@@ -155,6 +186,9 @@ def run_central_pass(
     slot_available: Callable[[], bool] = cli_throttle.slot_available,
     now_wall: Callable[[], datetime] = lambda: datetime.now(UTC),
     between_jobs: Callable[[], None] | None = None,
+    should_stop: Callable[[], bool] | None = None,
+    deferred_until: dict[str, float] | None = None,
+    on_job: Callable[[str | None], None] | None = None,
 ) -> list[JobDecision]:
     """Run one pass of the central cadence function; return its decisions.
 
@@ -162,13 +196,20 @@ def run_central_pass(
     here). ``is_idle``/``slot_available``/``now_wall`` are injectable for
     deterministic tests; production uses the cli_throttle functions and the
     wall clock. ``between_jobs`` is the heartbeat hook (see module docstring).
+
+    #456 (D13): ``should_stop`` (the supervisor's stop request) ends the pass before the next job. A job that raises a
+    refusal (``ThrottleDeferred`` family: "not now") is never recorded as done, so its schedule is not advanced: with the
+    shutdown flag set (or ``should_stop``) the pass ends; an expired-login refusal skips the job and, through the
+    caller-owned ``deferred_until`` map (job name -> monotonic time, memory only), keeps it skipped until the login
+    re-probe interval has passed or the login is back; any other refusal (a lost slot race) skips it for this pass
+    only (the S20 rule). The pass continues after a skipped job.
     """
     persona_dir = Path(persona_dir)
     decisions: list[JobDecision] = []
 
     def _decide(job: str, action: str) -> None:
         decisions.append(JobDecision(job, action))
-        # skip-not-due fires for most jobs on most passes (14 lines a minute
+        # skip-not-due fires for most jobs on most passes (16 lines a minute
         # while idle); keep it out of the INFO log. Every other decision is INFO.
         level = logging.DEBUG if action == "skip-not-due" else logging.INFO
         logger.log(level, "central cadence: job=%s action=%s", job, action)
@@ -196,6 +237,16 @@ def run_central_pass(
             _decide(job.name, "init-cadence")
 
     for job in ordered:
+        if should_stop is not None and should_stop():
+            _decide(job.name, "skip-stopping")
+            break
+        if (
+            deferred_until is not None
+            and deferred_until.get(job.name, float("-inf")) > time.monotonic()
+            and provider_auth.login_expired()
+        ):
+            _decide(job.name, "skip-deferred")
+            continue
         # S43: ask is-chat-idle again before EVERY job; the first "not idle"
         # ends the sequence — the rest wait for the next lull.
         if not is_idle():
@@ -229,8 +280,21 @@ def run_central_pass(
             # INC-11 (S15/S23/S38): publish this job as running for the
             # duration of `run()` only — a paused job has already returned
             # (JobOutcome.PAUSED below) and so is no longer a member.
+            if on_job is not None:
+                on_job(job.name)  # #456: the stop's progress record names the job the supervisor is in
             with background_jobs.running(job.name):
                 outcome = job.run()
+        except cli_throttle.ThrottleDeferred as exc:
+            # #456 (D13): "not now" is not "done": no schedule advance.
+            if cli_throttle.shutdown_requested() or (should_stop is not None and should_stop()):
+                _decide(job.name, "paused")
+                break
+            if isinstance(exc, provider_auth.ProviderAuthDeferred) and deferred_until is not None:
+                deferred_until[job.name] = time.monotonic() + provider_auth.reprobe_interval_s()
+                logger.info("job %s backed off until the next login re-probe", job.name)
+            _decide(job.name, "skip-deferred")
+            logger.info("job %s deferred (not now), continuing", job.name)
+            continue
         except Exception:  # noqa: BLE001 — S44: a job that raises still advances
             logger.exception("central cadence: job=%s raised", job.name)
             outcome = JobOutcome.COMPLETED
@@ -257,4 +321,6 @@ def run_central_pass(
             # INC-10 seam: a job that paused for chat ends the sequence (S43).
             break
 
+    if on_job is not None:
+        on_job(None)
     return decisions

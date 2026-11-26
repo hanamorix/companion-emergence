@@ -1,7 +1,7 @@
 # 2 — Plan (persisted-cadence, defer #21)
 
-Full task-by-task plan: `docs/superpowers/plans/2026-06-23-persisted-cadence.md`
-(4 tasks, TDD, one commit each).
+Full task-by-task plan: the 2026-06-23 persisted-cadence plan (4 tasks, TDD, one
+commit each), never committed and lost (#797).
 
 ## How (summary)
 

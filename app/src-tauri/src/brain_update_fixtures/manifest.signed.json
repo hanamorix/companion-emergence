@@ -1,0 +1,4 @@
+{
+  "manifest": "{\"schema\": 1, \"commit\": \"0123456789abcdef0123456789abcdef01234567\", \"brain_version\": \"0.0.43\", \"built_at\": \"2026-09-28T12:00:00Z\", \"python\": \"3.13\", \"min_bundle_version\": \"0.0.43\", \"wheel\": {\"name\": \"companion_emergence-0.0.43-py3-none-any.whl\", \"sha256\": \"aa\"}, \"requirements\": {\"name\": \"requirements.txt\", \"sha256\": \"bb\"}}\n",
+  "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUL0prb2hESGFaVGdyUEFuZS8zZE5jZjJRQ2VtSWV3RWN1cmZUZGVnY0lFRmNtTWFsU2N5aWU4eURFdXYrRXVoVFcyUElHcEVaRG1SYzZSUFZXVFRtcUVKNmVDQzlyUUFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzkwNTk3MDEwCWZpbGU6bWFuaWZlc3QuanNvbgowY2xwQlZFYkkzWlVmUDZwU09aMUNDeGZXVzlZZVlPT2VrVEFkWTBLbWpTbFJQMU9pSC90WkZSS3JNV21Yd3hOWFBFYnVHZ1NUTmlSbE9HSklEZ0JCdz09Cg=="
+}

@@ -1,7 +1,6 @@
 """End-to-end: whitespace-only monologue → rejection logged → no digest, reply still ships."""
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 from brain.bridge.chat import ChatMessage, ChatResponse, ToolCall
@@ -37,6 +36,7 @@ class _MalformedProvider:
 
 
 def test_malformed_args_rejected_no_digest_no_pass2(tmp_path: Path):
+    from brain.chat import pass2_queue
     from brain.chat.tool_loop import build_tools_list, run_tool_loop
     from brain.memory.hebbian import HebbianMatrix
     from brain.memory.store import MemoryStore
@@ -58,7 +58,7 @@ def test_malformed_args_rejected_no_digest_no_pass2(tmp_path: Path):
         )
         assert resp.content == "reply continues"
 
-        time.sleep(0.2)
+        assert pass2_queue._queue_size(persona_dir) == 0  # a rejected capture queues no pass 2
         assert not (persona_dir / "monologue_digest.jsonl").exists()
         assert provider.generate_calls == 0
         rec = next(inv for inv in invocations if inv["name"] == "record_monologue")
