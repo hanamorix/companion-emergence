@@ -664,16 +664,16 @@ def test_cs2_g_the_call_node_oracle_one_over_fails_and_at_the_ceiling_passes(
     tmp_path: Path,
 ) -> None:
     """A copy of a real file with one more json call than its combined ceiling fails; at the ceiling it passes."""
-    real = (REPO / "brain" / "felt_time" / "state.py").read_text(encoding="utf-8")  # held: still has a direct json call
-    observed_real = scan_source(real, "brain/felt_time/state.py")
+    real = (REPO / "brain" / "felt_time" / "chat_log.py").read_text(encoding="utf-8")  # held: still has a direct json call
+    observed_real = scan_source(real, "brain/felt_time/chat_log.py")
     total = sum(v for k, v in observed_real.items() if k in ("read", "write", "not-file-io"))
     allow_text = "".join(
-        f"brain/felt_time/state.py::{k}::{v}   # G3\n" for k, v in observed_real.items()
+        f"brain/felt_time/chat_log.py::{k}::{v}   # G3\n" for k, v in observed_real.items()
     )
-    errors, _ = _compare(tmp_path, {"brain/felt_time/state.py": real}, allow_text)
+    errors, _ = _compare(tmp_path, {"brain/felt_time/chat_log.py": real}, allow_text)
     assert errors == [] and total >= 1
     bumped = real + "\n\ndef _extra(blob):\n    import json\n    return json.loads(blob)\n"
-    errors, _ = _compare(tmp_path, {"brain/felt_time/state.py": bumped}, allow_text)
+    errors, _ = _compare(tmp_path, {"brain/felt_time/chat_log.py": bumped}, allow_text)
     assert errors and "not-file-io" in errors[0]
 
 
