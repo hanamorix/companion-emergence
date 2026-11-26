@@ -51,7 +51,7 @@ def test_returns_real_schema(store, hebbian, tmp_path, emotion_engine_stub):
         "body_emotions",
         "computed_at",
     }
-    assert isinstance(out["energy"], int)
+    assert isinstance(out["energy"], float)
     assert isinstance(out["temperature"], int)
     assert isinstance(out["exhaustion"], int)
     assert set(out["body_emotions"].keys()) == {
@@ -64,9 +64,17 @@ def test_returns_real_schema(store, hebbian, tmp_path, emotion_engine_stub):
     }
 
 
-def test_baseline_energy_when_empty(store, hebbian, tmp_path):
+def test_baseline_energy_when_nothing_is_saved(store, hebbian, tmp_path):
     out = get_body_state(store=store, hebbian=hebbian, persona_dir=tmp_path)
-    assert out["energy"] == 8
+    assert out["energy"] == 6.5
+
+
+def test_energy_is_the_saved_level_to_one_decimal(store, hebbian, tmp_path):
+    from brain.felt_time.state import FeltTimeState, persist
+
+    persist(FeltTimeState(energy_level=6.326923076923077), tmp_path)
+    out = get_body_state(store=store, hebbian=hebbian, persona_dir=tmp_path)
+    assert out["energy"] == 6.3
 
 
 def test_session_hours_default_zero(store, hebbian, tmp_path):
@@ -119,12 +127,12 @@ def test_body_state_has_no_key_for_an_absent_body_emotion(store, hebbian, tmp_pa
     assert out["body_emotions"] == {"arousal": 4.0}
 
 
-def test_energy_and_temperature_follow_the_engines_predicate_not_a_level(
+def test_temperature_follows_the_engines_predicate_not_a_level_and_energy_follows_neither(
     store, hebbian, tmp_path, emotion_engine_stub
 ):
     from brain.emotion.engine import Reading
 
-    def numbers(readings: dict[str, float], high: set[str]) -> tuple[int, int]:
+    def numbers(readings: dict[str, float], high: set[str]) -> tuple[float, int]:
         emotion_engine_stub.high = set(high)
         emotion_engine_stub.readings = {
             n: Reading(short=v, long=0.0, difference=0.0, shift=0) for n, v in readings.items()
@@ -136,4 +144,4 @@ def test_energy_and_temperature_follow_the_engines_predicate_not_a_level(
     top = {"rest_need": 10.0, "desire": 10.0, "love": 10.0, "touch_hunger": 10.0}
     assert numbers(top, set()) == (energy, temperature)
     low = {"rest_need": 0.5, "desire": 0.5, "love": 0.5, "touch_hunger": 0.5}
-    assert numbers(low, set(low)) == (energy - 1, temperature + 1)
+    assert numbers(low, set(low)) == (energy, temperature + 1)  # rest_need high no longer lowers the energy

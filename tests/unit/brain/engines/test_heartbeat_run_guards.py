@@ -151,7 +151,9 @@ def test_no_pass_starts_while_a_reply_is_in_flight(tmp_path: Path) -> None:
 
     cli_throttle.note_user_message()  # a reply is "in flight"
     event_bus = EventBus()
-    result = _heartbeat_and_felt_time(persona_dir, FakeProvider(), event_bus, last_heartbeat_at=time.monotonic())
+    result = _heartbeat_and_felt_time(
+        persona_dir, FakeProvider(), event_bus, last_heartbeat_at=time.monotonic(), heartbeat_interval_s=900.0
+    )
     assert result is None, "must return early, doing nothing, while a reply is in flight"
     unchanged = HeartbeatState.load(state_path)
     assert unchanged is not None
@@ -160,7 +162,9 @@ def test_no_pass_starts_while_a_reply_is_in_flight(tmp_path: Path) -> None:
     assert _log_rows(log_path) == []
 
     cli_throttle.note_reply_end()
-    result2 = _heartbeat_and_felt_time(persona_dir, FakeProvider(), event_bus, last_heartbeat_at=time.monotonic())
+    result2 = _heartbeat_and_felt_time(
+        persona_dir, FakeProvider(), event_bus, last_heartbeat_at=time.monotonic(), heartbeat_interval_s=900.0
+    )
     assert result2 is not None
     advanced = HeartbeatState.load(state_path)
     assert advanced is not None

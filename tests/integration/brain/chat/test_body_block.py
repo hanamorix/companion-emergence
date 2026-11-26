@@ -106,8 +106,8 @@ def test_body_block_renders_with_no_emotions(store, soul_store, daemon_state, pe
         store=store,
     )
     assert "── body ──" in msg
-    # Default energy 8 (no session, no words, no high emotional load)
-    assert "energy: 8" in msg
+    # Default energy 6.5 (nothing saved yet: the level accessor's default), shown to one decimal
+    assert "energy: 6.5/10" in msg
 
 
 def test_body_block_degrades_gracefully_on_compute_failure(

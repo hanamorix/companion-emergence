@@ -165,7 +165,7 @@ def test_dispatch_crystallize_soul_creates_crystallization(tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 # get_body_state — dispatcher session_hours injection
 # (Bug surfaced 2026-05-17: MCP tool path returned session_hours=0.0,
-#  energy=7, exhaustion=0 even hours into a session, because the
+#  session_hours=0.0 even hours into a session, because the
 #  dispatcher claimed to inject session_hours but never did.)
 # ---------------------------------------------------------------------------
 

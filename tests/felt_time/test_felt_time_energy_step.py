@@ -23,6 +23,7 @@ HER = EnergyMessage(weight=1.0, length_factor=1.0)
 def _inputs(start, *, short=None, messages=(), high=()):
     return EnergyInputs(
         interval_start=start,
+        heartbeat_s=900.0,
         short=short or {},
         long={},
         high=frozenset(high),

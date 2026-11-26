@@ -725,6 +725,17 @@ def test_rest_state_from_energy_active_is_false() -> None:
     assert _rest_state_from_energy(10) is False
 
 
+def test_rest_state_from_energy_compares_the_unrounded_level() -> None:
+    """Spec 4: on at 3.0 or below, off at 3.4 (it was on below 3.5 when the level was rounded first)."""
+    from brain.initiate.review import _rest_state_from_energy  # type: ignore[attr-defined]
+
+    assert _rest_state_from_energy(3.0) is True
+    assert _rest_state_from_energy(2.999) is True
+    assert _rest_state_from_energy(3.0001) is False
+    assert _rest_state_from_energy(3.4) is False
+    assert _rest_state_from_energy(3.5) is False
+
+
 def test_rest_state_from_energy_none_is_false() -> None:
     """_rest_state_from_energy(None) must return False — fail-open on unreadable body."""
     from brain.initiate.review import _rest_state_from_energy  # type: ignore[attr-defined]

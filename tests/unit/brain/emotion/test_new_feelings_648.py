@@ -1,7 +1,7 @@
 """#648: `contentment`, `peace`, `calm` and `groundedness` are registered feelings.
 
-`brain/body/state.py` raises body energy when `peace` is high in a fresh session, and no vocabulary registered `peace`, so the
-engine's `read()` left it out, `feels_high("peace")` was always False and the rule could never fire. The four feelings are baseline
+The body energy step (`brain/body/energy.py`) reads `peace` and `calm` as calming feelings, and no vocabulary registered `peace`,
+so the engine's `read()` left it out and `feels_high("peace")` was always False. The four feelings are baseline
 entries now (`contentment` core; `peace`, `calm`, `groundedness` complex, flavours of contentment), their half-lives are written once
 in `dev_constants.EMOTION_HALF_LIFE_DAYS`, and the four descriptions are the owner's words. Personas here are tmp directories with
 synthetic state; nothing touches a real persona.
@@ -14,7 +14,6 @@ from datetime import UTC, datetime
 import pytest
 
 from brain import dev_constants
-from brain.body.state import body_state_from_short
 from brain.emotion import engine as engine_module
 from brain.emotion import engine_files, vocabulary
 from brain.emotion.engine_utils import Average, EmotionState, EngineState, SnapshotDay
@@ -83,11 +82,11 @@ def _days(*shorts: float) -> list[SnapshotDay]:
     return [SnapshotDay(f"2026-10-{i + 1:02d}", s, 0.0, True, None) for i, s in enumerate(shorts)]
 
 
-def test_the_body_energy_rule_fires_in_a_fresh_session_when_peace_is_high_through_the_real_engine(tmp_path):
+def test_peace_is_read_and_high_through_the_real_engine_when_it_is_in_the_upper_half_of_its_range(tmp_path):
     """No patched `read()`: a synthetic persona's state file holds `peace` in the upper half of its own 30-day range.
 
     The persona's vocabulary file has no `peace` entry, so only the baseline can register it. On the old code the engine's `read()`
-    left the unregistered name out, `feels_high("peace")` was False, and the energy was the same as with no peace at all.
+    left the unregistered name out and `feels_high("peace")` was False.
     """
     persona = make_persona(tmp_path / "persona")
     saved_at = datetime(2026, 11, 4, 12, 0, tzinfo=UTC)
@@ -98,10 +97,4 @@ def test_the_body_energy_rule_fires_in_a_fresh_session_when_peace_is_high_throug
     live = engine_module.engine_for(persona)
 
     assert live.feels_high("peace") is True
-
-    def energy(feels_high):
-        return body_state_from_short(
-            {"peace": 5.0}, feels_high=feels_high, session_hours=0.2, words_written=0, days_since_contact=0.0, now=saved_at
-        ).energy
-
-    assert energy(live.feels_high) == energy(lambda name: False) + 1
+    assert live.read()["peace"].short == pytest.approx(5.0)

@@ -660,15 +660,16 @@ def _build_creative_dna_block(persona_dir: Path) -> str:
 
 
 def _build_body_block(persona_dir: Path) -> str:
-    """Render the body block: computed energy/temperature/exhaustion +
+    """Render the body block: the saved energy level, temperature, exhaustion +
     six body emotions inline.
 
-    Per spec §4 + §7.3 — fail-soft. Any exception during body_state_from_short,
-    the engine read, or count_words_in_session → block omitted, chat
-    continues. Token cost ~80 (raw metadata, no LLM summarization).
+    Per spec §4 + §7.3 — fail-soft. Any exception during body_state_from_short
+    or the engine read → block omitted, chat continues. Token cost ~80 (raw
+    metadata, no LLM summarization).
 
-    The body is projected from the emotion engine's short averages (the recent feeling); the mood summary below
-    shows the long averages. The two differ on purpose.
+    The energy is the level felt time saved (`read_energy_level`), shown to one decimal. The rest of the body is
+    projected from the emotion engine's short averages (the recent feeling); the mood summary below shows the long
+    averages. The two differ on purpose.
 
     Inviolate properties enforced here:
     - #4 the body projection does no I/O and no LLM call (guarded by tests/unit/brain/body/test_state.py);
@@ -680,8 +681,8 @@ def _build_body_block(persona_dir: Path) -> str:
         from datetime import UTC, datetime
 
         from brain.body.state import body_state_from_short
-        from brain.body.words import count_words_in_session
         from brain.emotion import engine
+        from brain.felt_time.state import read_energy_level
         from brain.utils.memory import days_since_human
 
         live_engine = engine.engine_for(persona_dir)
@@ -694,19 +695,13 @@ def _build_body_block(persona_dir: Path) -> str:
         short = engine.short_values(live_engine.read())
         now = datetime.now(UTC)
         days = days_since_human(now=now, persona_dir=persona_dir)
-        # Chat composer doesn't track session_hours yet — passes 0.0; words
-        # falls back to 1-hour window. Bridge daemon callers will hand a real
+        # Chat composer doesn't track session_hours yet — passes 0.0. Bridge daemon callers will hand a real
         # value through their own composition path when SP-7 wires it.
-        words = count_words_in_session(
-            persona_dir=persona_dir,
-            session_hours=0.0,
-            now=now,
-        )
         body = body_state_from_short(
             short,
             feels_high=live_engine.feels_high,
             session_hours=0.0,
-            words_written=words,
+            energy=read_energy_level(persona_dir),
             days_since_contact=days,
             now=now,
         )
@@ -715,7 +710,7 @@ def _build_body_block(persona_dir: Path) -> str:
 
     lines = ["── body ──"]
     lines.append(
-        f"energy: {body.energy}/10, temperature: {body.temperature}/9, "
+        f"energy: {body.energy:.1f}/10, temperature: {body.temperature}/9, "
         f"exhaustion: {body.exhaustion}/10"
     )
     if body.days_since_contact > 0.5:

@@ -33,7 +33,7 @@ def _row(speaker: str, words: int, at: datetime, session: str = "sess_old") -> d
 
 
 def _gather(persona_dir: Path):
-    return gather_energy_inputs(persona_dir, interval_start=START, now=NOW)
+    return gather_energy_inputs(persona_dir, interval_start=START, now=NOW, heartbeat_s=900.0)
 
 
 def _lf(inputs):
@@ -61,6 +61,11 @@ def test_feelings_come_from_one_read_and_high_from_feels_high(tmp_path, emotion_
     assert inputs.short == {"joy": 6.0, "peace": 4.0}
     assert inputs.long == {"joy": 3.0, "peace": 4.0}
     assert inputs.high == frozenset({"joy"})  # only lift and drain names are asked; peace and anger are not
+
+
+def test_the_heartbeat_length_is_handed_through_unchanged(tmp_path, emotion_engine_stub):
+    inputs = gather_energy_inputs(tmp_path, interval_start=START, now=NOW, heartbeat_s=450.0)
+    assert inputs.heartbeat_s == 450.0 and inputs.interval_start == START
 
 
 def test_nothing_readable_gives_empty_feelings_and_no_high(tmp_path, emotion_engine_stub):

@@ -144,8 +144,12 @@ def _interval_messages(persona_dir: Path, interval_start: datetime, now: datetim
     return tuple(messages)
 
 
-def gather_energy_inputs(persona_dir: Path, *, interval_start: datetime, now: datetime) -> EnergyInputs:
+def gather_energy_inputs(
+    persona_dir: Path, *, interval_start: datetime, now: datetime, heartbeat_s: float
+) -> EnergyInputs:
     """Everything the energy step of the tick at `now` reads, for the interval that began at `interval_start`.
+
+    `heartbeat_s` is the supervisor's own heartbeat interval, handed through unchanged for the step's catch-up count.
 
     One `read()` of the emotion engine for the short and long averages, `feels_high` per lift and drain name (it reads the
     engine's cached state itself), the kindled's start from the emotion state file (lock-free; None when there is no state,
@@ -158,6 +162,7 @@ def gather_energy_inputs(persona_dir: Path, *, interval_start: datetime, now: da
     state = engine_files.read_state(persona_dir).state
     return EnergyInputs(
         interval_start=interval_start,
+        heartbeat_s=heartbeat_s,
         short=emotion_engine.short_values(readings),
         long={name: reading.long for name, reading in readings.items()},
         high=high,

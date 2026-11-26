@@ -411,11 +411,12 @@ def _build_feels_high(persona_dir: Path) -> list[str] | None:
 
 
 def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:
-    """Body block projected from the emotion engine's short averages (body_state_from_short). None on failure."""
+    """Body block: the saved energy level plus the rest projected from the emotion engine's short averages
+    (body_state_from_short). None on failure."""
     try:
         from brain.body.state import body_state_from_short
-        from brain.body.words import count_words_in_session
         from brain.emotion import engine
+        from brain.felt_time.state import read_energy_level
         from brain.utils.memory import days_since_human
 
         live_engine = engine.engine_for(persona_dir)
@@ -426,16 +427,11 @@ def _build_body(persona_dir: Path, *, now: datetime) -> dict | None:
         # session_hours from the active conversation buffer's
         # earliest entry — 0 when no session is open.
         session_hours = _active_session_hours(persona_dir, now=now)
-        words = count_words_in_session(
-            persona_dir=persona_dir,
-            session_hours=session_hours,
-            now=now,
-        )
         body = body_state_from_short(
             short,
             feels_high=live_engine.feels_high,
             session_hours=session_hours,
-            words_written=words,
+            energy=read_energy_level(persona_dir),
             days_since_contact=days,
             now=now,
         )

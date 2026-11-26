@@ -61,6 +61,13 @@ describe("BodyPanel", () => {
     expect(screen.queryByText(/Body quiet\./)).not.toBeInTheDocument();
   });
 
+  it("shows the energy level to one decimal, whole numbers included", () => {
+    const { rerender } = render(<BodyPanel state={fakeState({ ...makeBody({}), energy: 6.3 })} />);
+    expect(screen.getByText("6.3/10")).toBeInTheDocument();
+    rerender(<BodyPanel state={fakeState({ ...makeBody({}), energy: 7 })} />);
+    expect(screen.getByText("7.0/10")).toBeInTheDocument();
+  });
+
   it("shows 'Body offline.' when state.body is null (no signal yet)", () => {
     render(<BodyPanel state={fakeState(null)} />);
     expect(screen.getByText(/Body offline\./)).toBeInTheDocument();

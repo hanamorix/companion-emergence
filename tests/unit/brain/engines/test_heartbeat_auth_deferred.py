@@ -207,7 +207,7 @@ def test_supervisor_belt_logs_warning_without_traceback(tmp_path: Path, caplog, 
     monkeypatch.setattr(supervisor, "_run_heartbeat_tick", boom)
     monkeypatch.setattr(supervisor, "_run_felt_time_tick", lambda *a, **k: None)
     with caplog.at_level(logging.INFO, logger="brain.bridge.supervisor"):
-        supervisor._heartbeat_and_felt_time(tmp_path, _DeferringProvider(), object(), 0.0)
+        supervisor._heartbeat_and_felt_time(tmp_path, _DeferringProvider(), object(), 0.0, 900.0)
     recs = [r for r in caplog.records if "heartbeat" in r.getMessage()]
     assert recs and all(r.levelno == logging.WARNING and r.exc_info is None for r in recs), [(r.levelno, r.getMessage()) for r in recs]
 

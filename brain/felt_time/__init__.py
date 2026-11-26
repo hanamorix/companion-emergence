@@ -47,8 +47,6 @@ def _iso_to_seconds_delta(a: str | None, b: str) -> float:
     """Return wall-clock seconds from a → b. 0.0 when a is None."""
     if a is None:
         return 0.0
-    from datetime import datetime
-
     return (datetime.fromisoformat(b) - datetime.fromisoformat(a)).total_seconds()
 
 
@@ -61,8 +59,6 @@ def _compute_first_tick_ts(prev: FeltTimeState, now_iso: str) -> str:
       midpoint rate so the computed rate starts at ~_MIGRATION_SEED_RATE and
       self-corrects as new ticks accumulate.
     """
-    from datetime import datetime, timedelta
-
     if prev.first_tick_ts is not None:
         return prev.first_tick_ts
     if prev.last_tick_ts is None:

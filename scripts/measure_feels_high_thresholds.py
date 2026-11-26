@@ -256,7 +256,7 @@ def _top(e: dict[str, float]) -> str | None:
 
 
 # The reader rows: each reader condition, asking the predicate. `e` holds the short averages of present names.
-def reader_conditions(arcs: list[tuple[str, dict[str, float]]], many: int) -> dict[str, Callable[[dict[str, float], HighFn], bool]]:
+def reader_conditions(arcs: list[tuple[str, dict[str, float]]]) -> dict[str, Callable[[dict[str, float], HighFn], bool]]:
     def names(*wanted: str) -> Callable[[dict[str, float], HighFn], bool]:
         return lambda e, high: all(n in e and high(n) for n in wanted)
 
@@ -268,9 +268,7 @@ def reader_conditions(arcs: list[tuple[str, dict[str, float]]], many: int) -> di
         return feeling_half_passes(e, high)
 
     rows: dict[str, Callable[[dict[str, float], HighFn], bool]] = {
-        f"body: more than {many} feelings high": lambda e, high: sum(1 for n in e if high(n)) > many,
         "body: rest_need": names("rest_need"),
-        "body: peace": names("peace"),
         "temperature: arousal": names("arousal"),
         "temperature: desire": names("desire"),
         "temperature: belonging": names("belonging"),
@@ -285,12 +283,6 @@ def reader_conditions(arcs: list[tuple[str, dict[str, float]]], many: int) -> di
     rows["expression arousal override"] = names("arousal", "desire")
     rows["expression intent"] = lambda e, high: (lambda t: t == "creative_hunger" and high(t))(_top(e))
     return rows
-
-
-def strain_of(body_state) -> float:
-    raw_exhaustion = float(body_state.exhaustion) / 9.0
-    raw_energy_lack = 1.0 - float(body_state.energy) / 10.0
-    return max(0.0, min(1.0, max(raw_exhaustion, raw_energy_lack)))
 
 
 @dataclass
@@ -309,23 +301,20 @@ class RunResult:
     survival: dict = field(default_factory=lambda: defaultdict(list))  # row -> survival floors of floor-0 firings after day 30
     peak_short: dict = field(default_factory=dict)  # name -> highest short over the run
     high_means: dict = field(default_factory=dict)
-    strain_means: dict = field(default_factory=dict)
     maker: dict = field(default_factory=dict)
     avg_present: float = 0.0
     quiet_days: int = 0
     invariant_failures: list = field(default_factory=list)
 
 
-def run_one(label, rows, off_dates, dates, arcs, floors, rest_threshold) -> RunResult:
+def run_one(label, rows, off_dates, dates, arcs, floors) -> RunResult:
     from brain import dev_constants
-    from brain.body.state import body_state_from_short
     from brain.emotion import engine_utils as eu
     from brain.emotion import vocabulary
     from brain.maker import charge as maker_charge
     from brain.maker import config as maker_cfg
 
-    many = dev_constants.BODY_ENERGY_HIGH_COUNT
-    reader_rows = reader_conditions(arcs, many)
+    reader_rows = reader_conditions(arcs)
     row_names = list(reader_rows)
 
     rows = [m for m in rows if m.created_at.date() not in off_dates]
@@ -363,18 +352,6 @@ def run_one(label, rows, off_dates, dates, arcs, floors, rest_threshold) -> RunR
     post_gap: list[int] = []
     day_of_tick: list = []
     first_date = dates[0]
-    strain_base = strain_of(
-        body_state_from_short(
-            {},
-            feels_high=lambda _name: False,
-            session_hours=0.0,
-            words_written=0,
-            days_since_contact=0.0,
-            now=datetime.now(UTC),
-        )
-    )
-    strain_vals: dict = defaultdict(list)
-    arms = tuple(("new", f) for f in floors)
     charge_dir = Path(tempfile.mkdtemp(prefix="measure-maker-"))
     maker_state = {"fires": 0, "last_fire": None, "max_charge": 0.0, "intensity_sum": 0.0}
     registered_sizes: list[int] = []
@@ -448,20 +425,6 @@ def run_one(label, rows, off_dates, dates, arcs, floors, rest_threshold) -> RunR
                     if is_after30 and reader_rows[name](new, base.__contains__):
                         result.survival[name].append(_survival(reader_rows[name], new, base))
 
-                for arm in arms:
-                    body = body_state_from_short(
-                        new,
-                        feels_high=highs[arm].__contains__,
-                        session_hours=0.0,
-                        words_written=0,
-                        days_since_contact=0.0,
-                        now=t,
-                    )
-                    strain = strain_of(body)
-                    strain_vals[arm].append(strain)
-                    fire[("body_strain above its empty-state value", arm)].append(int(strain > strain_base + 1e-9))
-                    fire[(f"rest gate (energy <= {rest_threshold})", arm)].append(int(body.energy <= rest_threshold))
-
                 # maker: the real accumulate (soul and dream inputs zero), then the tick's own discharge test; the maker
                 # feeds the peak short average, not a "high" test, so it does not move with the floor
                 intensity = max(new.values(), default=0.0)
@@ -504,7 +467,6 @@ def run_one(label, rows, off_dates, dates, arcs, floors, rest_threshold) -> RunR
     result.day_of_tick = day_of_tick
     result.peak_short = peak_short
     result.high_means = {k: sum(v) / max(1, n_ticks) for k, v in high_counts.items()}
-    result.strain_means = {k: sum(v) / max(1, n_ticks) for k, v in strain_vals.items()}
     result.maker = {**maker_state, "mean_intensity": maker_state["intensity_sum"] / max(1, n_ticks)}
     result.avg_present = sum(registered_sizes) / max(1, n_ticks)
     result.quiet_days = len(quiet_days)
@@ -588,7 +550,7 @@ def report(results: list[RunResult], floors: tuple[float, ...], row_names: list[
         out.append("")
         out.append("| reader row | " + " | ".join(f"floor {f:g}" for f in floors) + " |")
         out.append("|" + "---|" * (len(floors) + 1))
-        for name in row_names:  # the derived rows (body strain, rest gate) have no shift or range arm
+        for name in row_names:
             cells = [
                 f"{_after(r.fire[(name, ('shift', f))], r.after30)} / {_after(r.fire[(name, ('range', f))], r.after30)}"
                 for f in floors
@@ -616,7 +578,6 @@ def report(results: list[RunResult], floors: tuple[float, ...], row_names: list[
                    f"(of {len(r.peak_short)} that were present at some tick): "
                    + "; ".join(f"floor {f:g}: {sum(1 for v in r.peak_short.values() if v >= f)}" for f in floors))
         out.append("")
-        out.append("body_strain mean: " + ", ".join(f"floor {f:g} {r.strain_means[('new', f)]:.3f}" for f in floors))
         m = r.maker
         out.append(
             f"maker discharges: {m['fires']} over {r.n_days} simulated active days; mean peak intensity fed in "
@@ -676,7 +637,6 @@ def parse_floors(text: str) -> tuple[float, ...]:
 def run(db: str, floors: tuple[float, ...]) -> tuple[list[str], int]:
     started = time.perf_counter()
     source, commit = _step_source(db)
-    from brain import dev_constants
     from brain.emotion import vocabulary
     from brain.memory.store import MemoryStore, _row_to_memory
     from brain.paths import get_home
@@ -700,13 +660,10 @@ def run(db: str, floors: tuple[float, ...]) -> tuple[list[str], int]:
         first, last = rows[0].created_at.date(), rows[-1].created_at.date()
         dates = [first + timedelta(days=i) for i in range((last - first).days + 1)]
         arcs = reflex_arcs()
-        from brain.initiate import review
-
-        rest_threshold = review._REST_ENERGY_THRESHOLD  # noqa: SLF001
 
         spans = place_off_days(len(dates))
         off_dates = {dates[s + k] for s, ln in spans for k in range(ln)}
-        row_names = list(reader_conditions(arcs, dev_constants.BODY_ENERGY_HIGH_COUNT))
+        row_names = list(reader_conditions(arcs))
         lines = ["# Feels-high threshold measurement (the engine's predicate at several floors)", ""]
         lines.append(_host_line())
         lines.append(f"commit: {commit}")
@@ -718,8 +675,8 @@ def run(db: str, floors: tuple[float, ...]) -> tuple[list[str], int]:
                          f"{dates[s]} to {dates[s + ln - 1]} ({ln} day{'s' if ln > 1 else ''}, index {s})" for s, ln in spans))
         lines.append("")
         results = [
-            run_one("every day active", rows, set(), dates, arcs, floors, rest_threshold),
-            run_one("days off (the set above)", rows, off_dates, dates, arcs, floors, rest_threshold),
+            run_one("every day active", rows, set(), dates, arcs, floors),
+            run_one("days off (the set above)", rows, off_dates, dates, arcs, floors),
         ]
         body, summary = report(results, floors, row_names)
         lines += body

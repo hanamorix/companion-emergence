@@ -177,7 +177,6 @@ def test_the_script_runs_end_to_end_on_the_engine_rule_alone(tmp_path):
         "By part, per floor",
         "Near-zero firings after day 30",
         "Present feelings whose highest short average",
-        "body_strain mean:",
         "maker discharges:",
         "host: ",
     ):
@@ -230,7 +229,7 @@ RESEARCH_ROW = "research gate: feeling half (opposing curve)"
 
 
 def _research_row():
-    return mod.reader_conditions([], 3)[RESEARCH_ROW]
+    return mod.reader_conditions([])[RESEARCH_ROW]
 
 
 def _high(*names: str):

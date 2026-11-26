@@ -530,10 +530,6 @@ RESEARCH_GATE_OPPOSING_CURVE: tuple[tuple[float, float], ...] = (
     (7.0, 6.5),
     (10.0, 8.0),
 )
-# Body energy drops by one when MORE THAN this many feelings are high at once (both body projections: the engine path asks
-# `engine.feels_high` per feeling, the old path compares to its fixed levels). Today's value, unchanged by S52 and S53 (they
-# replaced the feeling levels, not this count). Read at call time in `brain.body.state`.
-BODY_ENERGY_HIGH_COUNT: int = 6
 
 # --- body energy as a carried level (#650, spec section 6) ----------------------------------------------------------------
 # Owner-set values, each tracked on #645. `BODY_ENERGY_BASELINE` is read by felt time's state default and the light level
@@ -552,11 +548,9 @@ BODY_ENERGY_STEP: float = 0.375
 # Speaker weights of a message's effect: hers and the user's.
 BODY_ENERGY_HER_MESSAGE_WEIGHT: float = 1.0
 BODY_ENERGY_USER_MESSAGE_WEIGHT: float = 0.5
-# The drift toward the baseline, per heartbeat before the funnel; the value assumes the 900 s heartbeat (96 steps are 24 hours).
+# The drift toward the baseline, per heartbeat before the funnel; it is calibrated for the supervisor's default 900 s
+# heartbeat (96 steps are 24 hours).
 BODY_ENERGY_DRIFT_STEP: float = 0.0985
-# The length of one heartbeat in seconds, the unit the energy step counts closed time in (every whole interval since the last
-# saved step is one heartbeat). It is the supervisor's `heartbeat_interval_s` default, and the drift step above assumes it.
-BODY_ENERGY_HEARTBEAT_S: float = 900.0
 # The share of a message's excess length (over her average for that speaker) that counts.
 BODY_ENERGY_LENGTH_EXCESS_SHARE: float = 0.5
 # A mean of long averages below this counts as this (the "used to negative feelings" ratio).

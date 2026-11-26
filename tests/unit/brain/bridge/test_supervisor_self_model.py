@@ -852,7 +852,7 @@ def test_cooldown_filter_prunes_directions_with_per_channel(tmp_path, emotion_en
     assert state.current_gap.directions == {"calm": -1}
 
 
-def test_live_tick_asks_the_engines_predicate_for_body_energy(tmp_path, emotion_engine_stub) -> None:
+def test_live_tick_asks_the_engines_predicate_for_the_body_projection(tmp_path, emotion_engine_stub) -> None:
     import brain.body.state as body_state
 
     persona_dir = _persona_dir(tmp_path)

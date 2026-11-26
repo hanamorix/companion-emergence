@@ -291,9 +291,10 @@ def test_a_feeling_the_kindled_lacks_counts_zero_in_the_means():
 # ── the long-average fold and the caught-up heartbeats (A17) ────────────────────────────────────────────────────────
 
 
-def _inputs(*, start=T0, short=None, long=None, high=(), messages=(), persona_start_at=None):
+def _inputs(*, start=T0, short=None, long=None, high=(), messages=(), persona_start_at=None, heartbeat_s=900.0):
     return EnergyInputs(
         interval_start=start,
+        heartbeat_s=heartbeat_s,
         short=short or {},
         long=long or {},
         high=frozenset(high),
@@ -327,6 +328,39 @@ def test_the_caught_up_count_is_whole_intervals_less_the_current_heartbeat(monke
         now=T0 + timedelta(seconds=elapsed_s),
     )
     assert len(calls) == caught_up + 1
+
+
+@pytest.mark.parametrize(
+    ("heartbeat_s", "elapsed_s", "caught_up"),
+    [(450.0, 905, 1), (450.0, 1800, 3), (450.0, 2700, 5), (450.0, 449, 0), (1800.0, 2700, 0), (1800.0, 3600, 1)],
+)
+def test_the_caught_up_count_counts_closed_time_in_the_supervisors_own_heartbeat_length(
+    monkeypatch, heartbeat_s, elapsed_s, caught_up
+):
+    """One value: the length handed in with the inputs (the supervisor's `heartbeat_interval_s`), not a copy of 900."""
+    calls = _spy_beats(monkeypatch)
+    energy.advance_energy(
+        EnergyCarry(6.5, 0.0, 0.0),
+        prev_feelings=None,
+        inputs=_inputs(heartbeat_s=heartbeat_s),
+        now=T0 + timedelta(seconds=elapsed_s),
+    )
+    assert len(calls) == caught_up + 1
+    for k, call in enumerate(calls[:-1], start=1):
+        assert call["at"] == T0 + timedelta(seconds=k * heartbeat_s)
+        assert call["hours"] == pytest.approx(heartbeat_s / 3600.0)
+
+
+@pytest.mark.parametrize("heartbeat_s", [0.0, -900.0])
+def test_a_heartbeat_length_of_zero_or_less_has_no_caught_up_heartbeats_and_no_division(monkeypatch, heartbeat_s):
+    calls = _spy_beats(monkeypatch)
+    energy.advance_energy(
+        EnergyCarry(6.5, 0.0, 0.0),
+        prev_feelings=None,
+        inputs=_inputs(heartbeat_s=heartbeat_s),
+        now=T0 + timedelta(hours=8),
+    )
+    assert len(calls) == 1
 
 
 def test_caught_up_heartbeats_have_no_messages_and_no_x_and_the_current_one_has_both(monkeypatch):

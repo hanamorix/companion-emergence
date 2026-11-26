@@ -33,14 +33,15 @@ _LOW_AROUSAL_CHANNELS: frozenset[str] = frozenset(
 def compute_unnamed_pressure(
     channels: dict[str, float],
     *,
-    body_energy: int,
+    body_energy: float,
     body_exhaustion: int,
 ) -> float:
     """Residual body signal with no channel home (conservative floor).
 
     Fires only when the body is in an extreme low-arousal state AND no low-arousal
     channel is present in `channels` (the engine's short averages, so the body signal maps nowhere).
-    Otherwise 0.0.
+    Otherwise 0.0. `body_energy` is the unrounded saved level, so the energy half of "extreme" is on only at the
+    floor, 1.0.
     """
     extreme_body = (body_exhaustion >= _UNNAMED_EXHAUSTION_FLOOR) or (body_energy <= _UNNAMED_ENERGY_CEIL)
     if not extreme_body:

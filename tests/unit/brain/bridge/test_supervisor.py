@@ -274,8 +274,11 @@ def test_run_folded_retries_heartbeat_soon_after_a_skip_not_a_full_interval(
     heartbeat_interval_s = 0.3
     tick_interval_s = 0.05
 
-    def fake_heartbeat_and_felt_time(persona_dir, provider, event_bus, last_heartbeat_at):
+    seen_interval: list[float] = []
+
+    def fake_heartbeat_and_felt_time(persona_dir, provider, event_bus, last_heartbeat_at, heartbeat_interval_s_arg):
         seen_last_heartbeat_at.append(last_heartbeat_at)
+        seen_interval.append(heartbeat_interval_s_arg)
         # First 2 calls simulate a reply-in-flight skip (S21): return None,
         # doing nothing. From the 3rd call on, simulate a real pass.
         succeeded = len(seen_last_heartbeat_at) >= 3
@@ -307,6 +310,8 @@ def test_run_folded_retries_heartbeat_soon_after_a_skip_not_a_full_interval(
         stop.set()
         finish_threads(t)
     assert not t.is_alive()
+    # Every attempt is handed the loop's own interval (the energy catch-up counts closed time in it).
+    assert seen_interval and set(seen_interval) == {heartbeat_interval_s}
 
     # The two SKIPPED calls (both None) must have been handed the exact
     # SAME `last_heartbeat_at` value — proving the skip left it untouched
@@ -1301,31 +1306,21 @@ def test_supervisor_initiate_review_tick_passes_rest_state_low_energy(tmp_path: 
     is_rest_state=True into run_initiate_review_tick."""
     from unittest.mock import MagicMock, patch
 
-    from brain.body.state import BodyState
     from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
+    from brain.felt_time.state import FeltTimeState, persist
     from brain.initiate.review import _REST_ENERGY_THRESHOLD  # type: ignore[attr-defined]
 
     persona_dir = _persona_dir(tmp_path)
     bus = _CapturingBus()
+    persist(FeltTimeState(energy_level=float(_REST_ENERGY_THRESHOLD)), persona_dir)
 
     captured: dict[str, object] = {}
 
     def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False, should_pause=None, paused_out=None):
         captured["is_rest_state"] = is_rest_state
 
-    low_energy_body = BodyState(
-        energy=_REST_ENERGY_THRESHOLD,
-        temperature=5,
-        exhaustion=4,
-        session_hours=0.0,
-        days_since_contact=1.0,
-        body_emotions={},
-        computed_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
-    )
-
     with (
         patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
-        patch("brain.body.state.body_state_from_short", return_value=low_energy_body),
         patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
     ):
         _run_initiate_review_tick(persona_dir, MagicMock(), bus)
@@ -1338,31 +1333,21 @@ def test_supervisor_initiate_review_tick_passes_rest_state_active_energy(tmp_pat
     is_rest_state=False into run_initiate_review_tick."""
     from unittest.mock import MagicMock, patch
 
-    from brain.body.state import BodyState
     from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
+    from brain.felt_time.state import FeltTimeState, persist
     from brain.initiate.review import _REST_ENERGY_THRESHOLD  # type: ignore[attr-defined]
 
     persona_dir = _persona_dir(tmp_path)
     bus = _CapturingBus()
+    persist(FeltTimeState(energy_level=float(_REST_ENERGY_THRESHOLD + 1)), persona_dir)
 
     captured: dict[str, object] = {}
 
     def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False, should_pause=None, paused_out=None):
         captured["is_rest_state"] = is_rest_state
 
-    active_energy_body = BodyState(
-        energy=_REST_ENERGY_THRESHOLD + 1,
-        temperature=5,
-        exhaustion=2,
-        session_hours=0.0,
-        days_since_contact=1.0,
-        body_emotions={},
-        computed_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
-    )
-
     with (
         patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
-        patch("brain.body.state.body_state_from_short", return_value=active_energy_body),
         patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
     ):
         _run_initiate_review_tick(persona_dir, MagicMock(), bus)
@@ -1370,8 +1355,33 @@ def test_supervisor_initiate_review_tick_passes_rest_state_active_energy(tmp_pat
     assert captured.get("is_rest_state") is False, f"expected is_rest_state=False for active energy, got: {captured}"
 
 
+@pytest.mark.parametrize(("level", "resting"), [(3.0, True), (3.4, False), (3.5, False), (1.0, True), (10.0, False)])
+def test_supervisor_initiate_review_tick_compares_the_unrounded_saved_level(
+    tmp_path: Path, level: float, resting: bool
+) -> None:
+    """Spec 4: the gate is on at 3.0 or below and off at 3.4 (it was on below 3.5 when the level was rounded)."""
+    from unittest.mock import MagicMock, patch
+
+    from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
+    from brain.felt_time.state import FeltTimeState, persist
+
+    persona_dir = _persona_dir(tmp_path)
+    persist(FeltTimeState(energy_level=level), persona_dir)
+    captured: dict[str, object] = {}
+
+    def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False, should_pause=None, paused_out=None):
+        captured["is_rest_state"] = is_rest_state
+
+    with (
+        patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
+        patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
+    ):
+        _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
+    assert captured["is_rest_state"] is resting
+
+
 def test_supervisor_initiate_review_tick_rest_state_fail_open(tmp_path: Path) -> None:
-    """When body state computation raises, supervisor must pass is_rest_state=False
+    """When reading the saved level raises, supervisor must pass is_rest_state=False
     (fail-open: a body bug must never permanently silence recall-resonance)."""
     from unittest.mock import MagicMock, patch
 
@@ -1386,7 +1396,7 @@ def test_supervisor_initiate_review_tick_rest_state_fail_open(tmp_path: Path) ->
 
     with (
         patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
-        patch("brain.body.state.body_state_from_short", side_effect=RuntimeError("body read failed")),
+        patch("brain.felt_time.state.read_energy_level", side_effect=RuntimeError("body read failed")),
         patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
     ):
         _run_initiate_review_tick(persona_dir, MagicMock(), bus)
@@ -1443,17 +1453,15 @@ def test_run_folded_interest_sweep_advances_cadence_even_when_tick_raises(tmp_pa
     assert state.next_at > datetime.now(UTC), "cadence must advance even when the tick raised"
 
 
-def test_supervisor_initiate_review_tick_live_rest_gate_reads_short_averages_and_opens_no_store(
+def test_supervisor_initiate_review_tick_rest_gate_reads_the_saved_level_and_opens_no_store(
     tmp_path: Path, emotion_engine_stub, monkeypatch
 ) -> None:
-    """The gate's body is built from the engine's short averages (not the store's
-    rows), reports rest when the energy is low, and opens no memory store."""
-    from datetime import UTC, datetime
+    """The gate reads the saved energy level (no body projection, no engine read, not the store's
+    rows), reports rest when the level is low, and opens no memory store."""
     from unittest.mock import MagicMock, patch
 
-    from brain.body.state import BodyState
     from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
-    from brain.emotion.engine import Reading
+    from brain.felt_time.state import FeltTimeState, persist
     from brain.initiate.review import _REST_ENERGY_THRESHOLD  # type: ignore[attr-defined]
     from brain.memory.store import Memory, MemoryStore
 
@@ -1461,22 +1469,12 @@ def test_supervisor_initiate_review_tick_live_rest_gate_reads_short_averages_and
     seeded = MemoryStore(persona_dir / "memories.db")
     seeded.create(Memory.create_new(content="x", memory_type="fact", domain="us", emotions={"joy": 9.0}))
     seeded.close()
-    emotion_engine_stub.readings = {"rest_need": Reading(short=8.5, long=0.0, difference=0.0, shift=0)}
 
-    seen: dict[str, object] = {"emotions": None, "opened": 0}
-    low = BodyState(
-        energy=_REST_ENERGY_THRESHOLD,
-        temperature=5,
-        exhaustion=4,
-        session_hours=0.0,
-        days_since_contact=1.0,
-        body_emotions={"rest_need": 8.5},
-        computed_at=datetime.now(UTC),
-    )
+    seen: dict[str, object] = {"opened": 0}
+    persist(FeltTimeState(energy_level=float(_REST_ENERGY_THRESHOLD)), persona_dir)
 
-    def fake_from_short(short, *, feels_high, **kwargs):
-        seen["emotions"] = dict(short)
-        return low
+    def projection_must_not_run(*args, **kwargs):
+        raise AssertionError("the rest gate reads the saved level, it builds no body projection")
 
     real_init = MemoryStore.__init__
 
@@ -1493,29 +1491,28 @@ def test_supervisor_initiate_review_tick_live_rest_gate_reads_short_averages_and
 
     with (
         patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
-        patch("brain.body.state.body_state_from_short", fake_from_short),
+        patch("brain.body.state.body_state_from_short", projection_must_not_run),
         patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
     ):
         _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
 
-    assert seen["emotions"] == {"rest_need": 8.5}
     assert captured["is_rest_state"] is True
     assert seen["opened"] == 0, "the gate reads no memory, so it opens no store"
 
 
-def test_supervisor_initiate_review_tick_live_rest_gate_read_that_raises_is_fail_open(
+def test_supervisor_initiate_review_tick_rest_gate_does_not_read_the_engine(
     tmp_path: Path, emotion_engine_stub
 ) -> None:
+    """The gate's level is the saved one: an engine whose read raises changes nothing (no rest, no fail-open path)."""
     from unittest.mock import MagicMock, patch
 
     from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
+    from brain.felt_time.state import FeltTimeState, persist
 
     persona_dir = _persona_dir(tmp_path)
-
-    asked: list[str] = []
+    persist(FeltTimeState(energy_level=2.0), persona_dir)
 
     def boom():
-        asked.append("read")
         raise RuntimeError("engine fault")
 
     emotion_engine_stub.read = boom
@@ -1529,30 +1526,4 @@ def test_supervisor_initiate_review_tick_live_rest_gate_read_that_raises_is_fail
         patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
     ):
         _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
-    assert asked, "the live rest gate must ask the engine for its read"
-    assert captured["is_rest_state"] is False
-
-
-def test_live_rest_gate_asks_the_engines_predicate_for_body_energy(tmp_path: Path, emotion_engine_stub) -> None:
-    """With the engine live the rest gate's body projection takes the engine's `feels_high`, not a fixed level."""
-    from unittest.mock import MagicMock, patch
-
-    import brain.body.state as body_state
-    from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
-
-    persona_dir = _persona_dir(tmp_path)
-    seen: list[object] = []
-    real = body_state.body_state_from_short
-
-    def recording(short, *, feels_high, **kwargs):
-        seen.append(feels_high)
-        return real(short, feels_high=feels_high, **kwargs)
-
-    with (
-        patch("brain.bridge.supervisor.run_initiate_review_tick", lambda *a, **k: None),
-        patch("brain.body.state.body_state_from_short", recording),
-        patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
-    ):
-        _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
-
-    assert seen == [emotion_engine_stub.feels_high]
+    assert captured["is_rest_state"] is True

@@ -17,3 +17,12 @@ def test_compute_unnamed_pressure_is_public_and_fires_only_for_an_extreme_body_w
     """The live tick calls it with the engine's short averages."""
     assert compute_unnamed_pressure({"joy": 4.0}, body_energy=8, body_exhaustion=0) == 0.0
     assert compute_unnamed_pressure({"joy": 4.0}, body_energy=1, body_exhaustion=8) > 0.0
+
+
+def test_unnamed_pressure_compares_the_unrounded_energy_so_it_is_on_only_at_the_floor():
+    """Spec 4: on at 1.0, off at 1.4 and 1.5 (it was on below 1.5 when the level was rounded first)."""
+    assert compute_unnamed_pressure({"joy": 4.0}, body_energy=1.0, body_exhaustion=0) == pytest.approx(0.4)
+    assert compute_unnamed_pressure({"joy": 4.0}, body_energy=1.4, body_exhaustion=0) == 0.0
+    assert compute_unnamed_pressure({"joy": 4.0}, body_energy=1.5, body_exhaustion=0) == 0.0
+    # a low-arousal channel in the read still takes the signal home
+    assert compute_unnamed_pressure({"grief": 2.0}, body_energy=1.0, body_exhaustion=0) == 0.0

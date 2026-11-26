@@ -38,10 +38,12 @@ class EnergyInputs:
     `interval_start` is the previous step's time (felt time's `last_tick_ts`, or now less the elapsed wall time when there is
     none). `short` and `long` are the feelings' recent and long averages from one `read()` (empty while a recovery rebuild is
     pending). `high` holds the lift-list and drain-list feelings the engine calls high now. `messages` are the interval's
-    messages, `persona_start_at` is the kindled's start for the 30-day gate (None closes it).
+    messages, `persona_start_at` is the kindled's start for the 30-day gate (None closes it). `heartbeat_s` is the
+    supervisor's own `heartbeat_interval_s`, the length of one heartbeat that closed time is counted in (spec 2.5).
     """
 
     interval_start: datetime
+    heartbeat_s: float
     short: Mapping[str, float]
     long: Mapping[str, float]
     high: frozenset[str]
@@ -233,9 +235,10 @@ def advance_energy(
     aged by one heartbeat length. The current heartbeat has the interval's messages and X, and ages the average by the time
     since the last caught-up heartbeat.
     """
-    beat = dev_constants.BODY_ENERGY_HEARTBEAT_S
+    beat = inputs.heartbeat_s
     elapsed = (now - inputs.interval_start).total_seconds()
-    caught_up = max(0, int(elapsed // beat) - 1)
+    # A heartbeat length of zero or less has no whole interval to count: no caught-up heartbeats (and no division by it).
+    caught_up = max(0, int(elapsed // beat) - 1) if beat > 0 else 0
     previous = inputs.interval_start
     for k in range(1, caught_up + 1):
         at = inputs.interval_start + timedelta(seconds=k * beat)

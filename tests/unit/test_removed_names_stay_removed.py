@@ -871,6 +871,32 @@ REMOVED: tuple[Removed, ...] = (
         kind="code",
         scope=("brain/emotion/engine_utils.py",),
     ),
+    # --- body energy as a carried level (#650 step 4): the old computed energy and its inputs ---------------------------------
+    Removed(
+        names=(
+            "_energy_from_flags",
+            "BODY_ENERGY_HIGH_COUNT",
+            "words_written",
+            "count_words_in_session",
+        ),
+        why="the old energy rules (baseline 8, the session-length and words-written drains, the 'more than six feelings high' drain, the rest-need drain and the peace restore) and the word count only they used; energy is the level felt time carries from heartbeat to heartbeat, every reader reads the saved level and passes it to `body_state_from_short` as `energy`",
+        ref="#650 body energy, spec 1.5 and builder note 3 (draft PR #655)",
+        kind="code",
+        scope=("brain", "scripts"),
+    ),
+    Removed(
+        names=("brain/body/words.py",),
+        why="the word counter of the old energy rules was deleted with them (#650)",
+        ref="#650 body energy, spec builder note 3 (draft PR #655)",
+        kind="file",
+    ),
+    Removed(
+        names=("BODY_ENERGY_HEARTBEAT_S",),
+        why="a second copy of the supervisor's heartbeat length that could drift from it; the energy catch-up counts closed time in the supervisor's own `heartbeat_interval_s`, handed in with the other inputs (`EnergyInputs.heartbeat_s`)",
+        ref="#650 body energy, spec 2.5 (draft PR #655)",
+        kind="code",
+        scope=("brain", "scripts"),
+    ),
 )
 
 

@@ -1676,7 +1676,7 @@ def test_long_average_sites_render_the_stub_long_values_and_apply_no_time_factor
     assert "love:7.0" in first and "awe:5.5" in first
 
 
-def _body_block_numbers(tmp_path, stub, readings: dict[str, float], high: set[str]) -> tuple[int, int]:
+def _body_block_numbers(tmp_path, stub, readings: dict[str, float], high: set[str]) -> tuple[str, int]:
     import re
 
     from brain.chat.prompt import _build_body_block
@@ -1684,19 +1684,28 @@ def _body_block_numbers(tmp_path, stub, readings: dict[str, float], high: set[st
     stub.high = set(high)
     stub.readings = {n: _reading(short=v) for n, v in readings.items()}
     block = _build_body_block(tmp_path)
-    match = re.search(r"energy: (\d+)/10, temperature: (\d+)/9", block)
+    match = re.search(r"energy: (\d+\.\d)/10, temperature: (\d+)/9", block)
     assert match is not None, block
-    return int(match.group(1)), int(match.group(2))
+    return match.group(1), int(match.group(2))
 
 
-def test_body_block_energy_and_temperature_follow_the_engines_predicate_not_a_level(
+def test_body_block_temperature_follows_the_engines_predicate_not_a_level_and_energy_follows_neither(
     tmp_path, emotion_engine_stub
 ):
     energy, temperature = _body_block_numbers(tmp_path, emotion_engine_stub, {}, set())
+    assert energy == "6.5"  # nothing saved: the accessor's default, to one decimal
     # Far above every old level, but the engine calls nothing high: no change.
     top = {"rest_need": 10.0, "desire": 10.0, "love": 10.0, "touch_hunger": 10.0}
     assert _body_block_numbers(tmp_path, emotion_engine_stub, top, set()) == (energy, temperature)
-    # Far below every old level, but high: energy -1 (rest_need) and temperature +1 (desire) +1 (love) -1 (touch_hunger).
+    # Far below every old level, but high: temperature +1 (desire) +1 (love) -1 (touch_hunger); rest_need no longer
+    # lowers the energy.
     low = {"rest_need": 0.5, "desire": 0.5, "love": 0.5, "touch_hunger": 0.5}
     got = _body_block_numbers(tmp_path, emotion_engine_stub, low, set(low))
-    assert got == (energy - 1, temperature + 1)
+    assert got == (energy, temperature + 1)
+
+
+def test_body_block_energy_is_the_saved_level_to_one_decimal(tmp_path, emotion_engine_stub):
+    from brain.felt_time.state import FeltTimeState, persist
+
+    persist(FeltTimeState(energy_level=6.326923076923077), tmp_path)
+    assert _body_block_numbers(tmp_path, emotion_engine_stub, {}, set())[0] == "6.3"

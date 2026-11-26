@@ -17,7 +17,7 @@ export function BodyPanel({ state }: Props) {
       <SectionLabel>Body</SectionLabel>
       {body ? (
         <>
-          <Bar label="Energy" value={body.energy} max={10} formatValue={(v) => `${v}/10`} />
+          <Bar label="Energy" value={body.energy} max={10} formatValue={(v) => `${v.toFixed(1)}/10`} />
           <Bar label="Temp" value={body.temperature} max={9} formatValue={(v) => `${v}/9`} />
           <Bar
             label="Exhaust"
