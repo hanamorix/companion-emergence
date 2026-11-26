@@ -534,3 +534,44 @@ RESEARCH_GATE_OPPOSING_CURVE: tuple[tuple[float, float], ...] = (
 # `engine.feels_high` per feeling, the old path compares to its fixed levels). Today's value, unchanged by S52 and S53 (they
 # replaced the feeling levels, not this count). Read at call time in `brain.body.state`.
 BODY_ENERGY_HIGH_COUNT: int = 6
+
+# --- body energy as a carried level (#650, spec section 6) ----------------------------------------------------------------
+# Owner-set values, each tracked on #645. `BODY_ENERGY_BASELINE` is read now (felt time's state default and the light level
+# accessor, `brain.felt_time.state`); every other constant below has no reader yet: the per-heartbeat step function and its
+# input gathering (a later #650 step, build step 3) read them, and `BODY_STATS_BUSIEST_COUNT` is read by the stats line (build
+# step 6). Read at call time as `dev_constants.NAME`.
+# The level a kindled starts at, and that the drift returns to.
+BODY_ENERGY_BASELINE: float = 6.5
+# The level is held to this range (the 1 to 10 scale).
+BODY_ENERGY_MIN: float = 1.0
+BODY_ENERGY_MAX: float = 10.0
+# The funnel: a drop is scaled by pivot / level and a rise by level / pivot.
+BODY_ENERGY_FUNNEL_PIVOT: float = 5.0
+# The base cost of one average-length message, before the speaker weight and the funnel.
+BODY_ENERGY_STEP: float = 0.375
+# Speaker weights of a message's effect: hers and the user's.
+BODY_ENERGY_HER_MESSAGE_WEIGHT: float = 1.0
+BODY_ENERGY_USER_MESSAGE_WEIGHT: float = 0.5
+# The drift toward the baseline, per heartbeat before the funnel; the value assumes the 900 s heartbeat (96 steps are 24 hours).
+BODY_ENERGY_DRIFT_STEP: float = 0.0985
+# The share of a message's excess length (over her average for that speaker) that counts.
+BODY_ENERGY_LENGTH_EXCESS_SHARE: float = 0.5
+# A mean of long averages below this counts as this (the "used to negative feelings" ratio).
+BODY_ENERGY_MEAN_FLOOR: float = 1.0
+# The feelings that lift energy, those that drain it, and those that calm the drift (the strongest of them sets its pace).
+BODY_ENERGY_LIFT_FEELINGS: tuple[str, ...] = ("joy", "love", "gratitude", "belonging", "defiance")
+BODY_ENERGY_DRAIN_FEELINGS: tuple[str, ...] = (
+    "grief",
+    "memory_grief",
+    "shame",
+    "guilt",
+    "loneliness",
+    "jealousy",
+    "touch_hunger",
+    "rest_need",
+)
+BODY_ENERGY_CALM_FEELINGS: tuple[str, ...] = ("peace", "calm", "contentment", "groundedness")
+# How many days of conversation files a speaker's average message length is worked out from.
+BODY_ENERGY_LENGTH_WINDOW_DAYS: int = 30
+# The stats line lists the user's busiest stretches per day, at most this many.
+BODY_STATS_BUSIEST_COUNT: int = 3

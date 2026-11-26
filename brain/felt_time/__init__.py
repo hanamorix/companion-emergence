@@ -160,6 +160,11 @@ class FeltTime:
             replayed=False,  # first real tick clears the recovery banner
             horizon_pressure=horizon_pressure,
             arc_anchors=arc_anchors,
+            # The energy fields are carried as they are: the per-heartbeat energy step is not part of this rebuild.
+            energy_level=self._state.energy_level,
+            energy_long_avg=self._state.energy_long_avg,
+            energy_long_weight=self._state.energy_long_weight,
+            energy_feelings=self._state.energy_feelings,
         )
         persist(self._state, self.persona_dir)
 

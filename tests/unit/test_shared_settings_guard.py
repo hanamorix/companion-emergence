@@ -796,8 +796,13 @@ ALLOW: tuple[tuple[str, str, str, tuple[str, ...], str], ...] = (
     ("APP-R3", "app/src/components/ChatPanel.tsx", "number 20971520", _UPLOAD_CAPS,
      "real copy of the 20 MiB upload cap (MAX_BYTES, applied to every staged file) that cannot read the setting: the "
      "TypeScript cannot import the Python tunable; tracked in #560"),
+    # The four feelings the #648 vocabulary swap rewrites equal body energy's calm list (#650) by coincidence of the content.
+    ("R3-collection", "brain/emotion/vocabulary_swap.py", "assign _SWAPPED_NAMES",
+     ("dev_constants.BODY_ENERGY_CALM_FEELINGS",),
+     "different purpose: the fixed target list of a one-time migration (the four feelings #648 registered), which must not "
+     "change when body energy's calm list does; the calm list is the feelings whose level paces energy's drift"),
 )
-ALLOW_SIZE = 4
+ALLOW_SIZE = 5
 
 
 @pytest.fixture(scope="module")

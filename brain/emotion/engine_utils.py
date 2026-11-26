@@ -270,11 +270,12 @@ def _hold(value: float) -> float:
     return min(max(value, 0.0), dev_constants.EMOTION_VALUE_CAP)
 
 
-def _decay(hours: float, half_life_hours: float) -> float:
+def decay(hours: float, half_life_hours: float) -> float:
+    """The factor an average's weight is aged by after `hours`, for a half-life of `half_life_hours`."""
     return 0.5 ** (hours / half_life_hours)
 
 
-def _fold_average(average: Average, value: float, w: float) -> None:
+def fold_average(average: Average, value: float, w: float) -> None:
     """`weight = aged weight + w`; `average = average + (value - average) x w / weight`.
 
     The delta form of the weighted mean: an average fed the value it already holds does not move at all, so a steady feeling
@@ -311,19 +312,19 @@ def _fold(
         if state.last_update is not None:
             elapsed = (at - state.last_update).total_seconds() / 3600.0
             for other in state.emotions.values():
-                other.short.weight *= _decay(elapsed, short_hours)
-                other.long.weight *= _decay(elapsed, long_hours)
+                other.short.weight *= decay(elapsed, short_hours)
+                other.long.weight *= decay(elapsed, long_hours)
         state.last_update = at
         w_short = w_long = w
     else:
         # Before the reference time: the entry is pre-aged by its own age and ages nothing else. Both orders store the
         # same sum of w x 0.5^(age / H), so the averages do not depend on the order entries arrive in.
         elapsed = (state.last_update - at).total_seconds() / 3600.0
-        w_short = w * _decay(elapsed, short_hours)
-        w_long = w * _decay(elapsed, long_hours)
+        w_short = w * decay(elapsed, short_hours)
+        w_long = w * decay(elapsed, long_hours)
     emotion_state = existing if existing is not None else EmotionState()
-    _fold_average(emotion_state.short, short_value, w_short)
-    _fold_average(emotion_state.long, long_value, w_long)
+    fold_average(emotion_state.short, short_value, w_short)
+    fold_average(emotion_state.long, long_value, w_long)
     if existing is None:
         if emotion_state.long.weight <= 0.0:
             return  # so old that nothing of it survives: no ghost emotion
@@ -815,11 +816,22 @@ def _moves_between(
     return moves, felts
 
 
+def persona_past_long_window(persona_start_at: datetime | None, end: datetime) -> bool:
+    """The engine's 30-day test: is `end` at least `EMOTION_LONG_HALF_LIFE_D` days after the persona's start?
+
+    A persona with no recorded start is never past it. `_shift_of` asks it with the end of a feeling's last snapshot day;
+    body energy asks it with the time of the heartbeat it steps (its "used to" multipliers wait for the same 30 days).
+    """
+    if persona_start_at is None:
+        return False
+    return end - persona_start_at >= timedelta(days=dev_constants.EMOTION_LONG_HALF_LIFE_D)
+
+
 def _shift_of(days: Sequence[SnapshotDay], persona_start_at: datetime | None) -> int:
-    if not days or persona_start_at is None:
+    if not days:
         return 0
-    # The gate: the end of the last snapshot day must be at least 30 days after the persona's start.
-    if _day_start(_add_days(days[-1].day, 1)) - persona_start_at < timedelta(days=dev_constants.EMOTION_LONG_HALF_LIFE_D):
+    # The start gate, with the end of the last snapshot day as the end.
+    if not persona_past_long_window(persona_start_at, _day_start(_add_days(days[-1].day, 1))):
         return 0
     long_moves, _ = _moves_between(days, lambda d: d.long)
     long_runs = run_tracker(long_moves, seed=_seed_for(days, 0))
@@ -839,7 +851,7 @@ def _shift_of(days: Sequence[SnapshotDay], persona_start_at: datetime | None) ->
 def shift_for(snapshot_days: Mapping[str, Sequence[SnapshotDay]], persona_start_at: datetime | None) -> dict[str, int]:
     """For each emotion: +1 (a rising run), -1 (a falling run) or 0, from its 30-day snapshot. Rules: A3 E5.22 to E5.26.
 
-    Shifted only when the start gate is open (the last snapshot day ends 30 or more days after `persona_start_at`; null is
+    Shifted only when the start gate is open (`persona_past_long_window` of the end of the last snapshot day; null is
     closed) and the long average has a finished run, and the short average's run in progress is longer than the longest
     finished long run (equal does not count; the long run is measured from its recorded start), and, for a fall, she felt the
     emotion on more than half of the run's days. Takes no `now`: the gate compares the last snapshot day.

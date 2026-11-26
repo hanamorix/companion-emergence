@@ -863,6 +863,14 @@ REMOVED: tuple[Removed, ...] = (
         ref="Engine 6 S107 HS8 (#633, Planning B55)",
         kind="code",
     ),
+    # --- body energy as a carried level (#650 step 2): two engine helpers made public ----------------------------------------
+    Removed(
+        names=("_fold_average", "_decay"),
+        why="the running-average fold and the weight ageing of the emotion engine became the public `fold_average` and `decay`, so body energy's long average folds with the engine's own functions instead of a copy; no private alias was left behind",
+        ref="#650 body energy, spec 1.8 (draft PR #655)",
+        kind="code",
+        scope=("brain/emotion/engine_utils.py",),
+    ),
 )
 
 
