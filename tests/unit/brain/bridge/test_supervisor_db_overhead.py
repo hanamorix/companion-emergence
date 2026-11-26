@@ -594,7 +594,7 @@ def _drive_one_maintenance_tick(persona_dir: Path, *, throttle_grants: bool):
     sidecar_spy = MagicMock()
 
     @contextmanager
-    def _fake_slot(*, now=None):
+    def _fake_slot(*, now=None, lull_required=True):
         yield throttle_grants
 
     with (
@@ -688,7 +688,7 @@ def test_forgetting_failure_does_not_skip_narrative_pass(tmp_path):
     narrative_spy = MagicMock()
 
     @contextmanager
-    def _granting_slot(*, now=None):
+    def _granting_slot(*, now=None, lull_required=True):
         yield True
 
     with (

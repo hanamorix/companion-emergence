@@ -115,6 +115,75 @@ def test_slot_available_does_not_consume_a_slot():
 
 
 # ---------------------------------------------------------------------------
+# #817 (spec 9, A26): the reply-only gate pass 2 uses instead of the quiet-chat lull
+# ---------------------------------------------------------------------------
+
+
+def test_reply_gate_is_open_inside_the_lull_and_closed_while_a_reply_is_in_flight():
+    cli_throttle.reset()
+    cli_throttle.note_user_message()
+    assert cli_throttle.reply_gate_open() is False  # a reply is in flight
+    cli_throttle.note_reply_end()
+    assert cli_throttle.is_chat_idle() is False  # the lull has not passed
+    assert cli_throttle.reply_gate_open() is True  # but no reply is in flight
+
+
+def test_reply_gate_is_closed_while_the_bridge_is_stopping():
+    cli_throttle.reset()
+    cli_throttle.request_shutdown()
+    try:
+        assert cli_throttle.reply_gate_open() is False
+        assert cli_throttle.acquire_background(lull_required=False) is False
+    finally:
+        cli_throttle.clear_shutdown()
+
+
+def test_reply_gate_fails_closed_on_an_internal_error(monkeypatch):
+    cli_throttle.reset()
+
+    def _boom():
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(cli_throttle, "reply_in_flight", _boom)
+    assert cli_throttle.reply_gate_open() is False
+
+
+def test_slot_without_lull_is_granted_inside_the_lull_when_no_reply_is_in_flight():
+    cli_throttle.reset()
+    cli_throttle.mark_interactive_active()  # a message just now
+    assert cli_throttle.slot_available() is False
+    assert cli_throttle.acquire_background() is False
+    assert cli_throttle.slot_available(lull_required=False) is True
+    with cli_throttle.background_slot(lull_required=False) as ok:
+        assert ok is True
+
+
+def test_slot_without_lull_is_denied_while_a_reply_is_in_flight():
+    cli_throttle.reset()
+    cli_throttle.note_user_message()
+    try:
+        assert cli_throttle.slot_available(lull_required=False) is False
+        assert cli_throttle.acquire_background(lull_required=False) is False
+        with cli_throttle.background_slot(lull_required=False) as ok:
+            assert ok is False
+    finally:
+        cli_throttle.note_reply_end()
+
+
+def test_slot_without_lull_still_counts_against_the_one_background_slot():
+    cli_throttle.reset()
+    cli_throttle.mark_interactive_active()
+    assert cli_throttle.acquire_background(lull_required=False) is True
+    try:
+        assert cli_throttle.slot_available(lull_required=False) is False
+        assert cli_throttle.acquire_background(lull_required=False) is False
+        far = cli_throttle._lull_seconds() + 1e9
+        assert cli_throttle.acquire_background(now=far) is False  # a lull-gated job shares that same slot
+    finally:
+        cli_throttle.release_background()
+
+
+# ---------------------------------------------------------------------------
 # ram-spike-fix INC-6: is_chat_idle / the single lull / fail-closed (C4, C24, C35)
 # ---------------------------------------------------------------------------
 #

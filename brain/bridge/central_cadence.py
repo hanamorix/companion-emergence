@@ -5,7 +5,10 @@ background job whether it runs now. A gated job runs only when BOTH:
 
 * the chat is idle (``cli_throttle.is_chat_idle()`` — asked again before every
   job, S43; the first "not idle" stops the whole sequence and the jobs not
-  reached wait for the next lull), and
+  reached wait for the next lull; the one exception is pass 2 (#817): it needs
+  only "no reply in flight" (``cli_throttle.reply_gate_open()``), so it runs on
+  the pass after a turn is queued, inside the lull; a not-idle job ordered before
+  it does not hide it, and every job after it still waits for the lull), and
 * the job is due: an interval job's persisted ``next_at`` has passed
   (S23/S34), or a no-interval job has work (pass 2, session snapshot/prune,
   embedding backfill: S53/S66; the extraction backfill,
@@ -50,7 +53,8 @@ returned, and the next job starts only after the whole heartbeat pass
 the same hook between a job's items.
 
 Slot: before running a due job this function peeks
-``cli_throttle.slot_available()`` (read-only, never takes the semaphore). A
+``cli_throttle.slot_available()`` (read-only, never takes the semaphore; pass 2 peeks with
+``lull_required=False``, so the concurrency cap is the same one slot). A
 denied peek skips the job without advancing its cadence (S20). Jobs that make
 background CLI calls keep their own authoritative acquire inside ``run``; a
 lost race there returns ``JobOutcome.SKIPPED`` (no advance).
@@ -130,6 +134,9 @@ class GatedJob:
       ``has_work`` and saves its own cadence inside ``run``.
 
     ``run`` returns a ``JobOutcome`` (``None`` counts as ``COMPLETED``).
+
+    ``needs_lull`` is True for every job but pass 2 (#817): pass 2 alone is gated on "no reply in flight" instead of the
+    quiet-chat lull, for both the pass's gate and its slot peek.
     """
 
     name: str
@@ -137,6 +144,7 @@ class GatedJob:
     cadence_file: str | None = None
     interval_s: float | None = None
     has_work: Callable[[], bool] | None = None
+    needs_lull: bool = True
 
     def __post_init__(self) -> None:
         interval_job = self.cadence_file is not None
@@ -183,6 +191,8 @@ def run_central_pass(
     *,
     is_idle: Callable[[], bool] = cli_throttle.is_chat_idle,
     slot_available: Callable[[], bool] = cli_throttle.slot_available,
+    reply_gate: Callable[[], bool] = cli_throttle.reply_gate_open,
+    exempt_slot_available: Callable[[], bool] = lambda: cli_throttle.slot_available(lull_required=False),
     now_wall: Callable[[], datetime] = lambda: datetime.now(UTC),
     between_jobs: Callable[[], None] | None = None,
     should_stop: Callable[[], bool] | None = None,
@@ -194,7 +204,8 @@ def run_central_pass(
     ``jobs`` is the job table (any order; sorted into ``GATED_JOB_ORDER``
     here). ``is_idle``/``slot_available``/``now_wall`` are injectable for
     deterministic tests; production uses the cli_throttle functions and the
-    wall clock. ``between_jobs`` is the heartbeat hook (see module docstring).
+    wall clock. ``reply_gate``/``exempt_slot_available`` are the same two checks for a job with
+    ``needs_lull=False`` (pass 2, #817). ``between_jobs`` is the heartbeat hook (see module docstring).
 
     #456 (D13): ``should_stop`` (the supervisor's stop request) ends the pass before the next job. A job that raises a
     refusal (``ThrottleDeferred`` family: "not now") is never recorded as done, so its schedule is not advanced: with the
@@ -235,7 +246,7 @@ def run_central_pass(
             initialised.add(job.name)
             _decide(job.name, "init-cadence")
 
-    for job in ordered:
+    for index, job in enumerate(ordered):
         if should_stop is not None and should_stop():
             _decide(job.name, "skip-stopping")
             break
@@ -247,9 +258,14 @@ def run_central_pass(
             _decide(job.name, "skip-deferred")
             continue
         # S43: ask is-chat-idle again before EVERY job; the first "not idle"
-        # ends the sequence — the rest wait for the next lull.
-        if not is_idle():
+        # ends the sequence, the rest wait for the next lull. A job with
+        # needs_lull=False (pass 2, #817) asks only "no reply in flight"; and
+        # a not-idle job ahead of such a job does not end the sequence, so the
+        # exempt job is still reached (with none later, this is the old break).
+        if not (is_idle() if job.needs_lull else reply_gate()):
             _decide(job.name, "skip-no-lull")
+            if any(not later.needs_lull for later in ordered[index + 1 :]):
+                continue
             break
 
         if job.name in initialised:
@@ -269,7 +285,7 @@ def run_central_pass(
             _decide(job.name, "skip-not-due")
             continue
 
-        if not slot_available():
+        if not (slot_available() if job.needs_lull else exempt_slot_available()):
             # S20: a denied slot is a skip, not a run — cadence untouched.
             _decide(job.name, "skip-slot")
             continue

@@ -125,12 +125,12 @@ def _real_jobs(persona_dir: Path, **overrides) -> list[GatedJob]:
 
 
 @contextmanager
-def _granting_slot(*, now=None):  # noqa: ARG001
+def _granting_slot(*, now=None, lull_required=True):  # noqa: ARG001
     yield True
 
 
 @contextmanager
-def _denying_slot(*, now=None):  # noqa: ARG001
+def _denying_slot(*, now=None, lull_required=True):  # noqa: ARG001
     yield False
 
 
@@ -269,12 +269,20 @@ def stubs(monkeypatch):
     return SimpleNamespace(order=order, work=work)
 
 
-def _pass(persona_dir, jobs, *, idle=True, slot=True, now=NOW, between_jobs=None):
+def _pass(persona_dir, jobs, *, idle=True, slot=True, now=NOW, between_jobs=None, reply_gate=None, exempt_slot=None):
+    """``reply_gate`` / ``exempt_slot`` are the checks of a ``needs_lull=False`` job (pass 2); unset, they follow
+    ``idle`` / ``slot`` so a test that does not name them treats every job alike."""
+    is_idle = idle if callable(idle) else (lambda: idle)
+    peek = slot if callable(slot) else (lambda: slot)
     return central_cadence.run_central_pass(
         persona_dir,
         jobs,
-        is_idle=(idle if callable(idle) else (lambda: idle)),
-        slot_available=(slot if callable(slot) else (lambda: slot)),
+        is_idle=is_idle,
+        slot_available=peek,
+        reply_gate=(is_idle if reply_gate is None else (reply_gate if callable(reply_gate) else (lambda: reply_gate))),
+        exempt_slot_available=(
+            peek if exempt_slot is None else (exempt_slot if callable(exempt_slot) else (lambda: exempt_slot))
+        ),
         now_wall=lambda: now,
         between_jobs=between_jobs,
     )
@@ -856,7 +864,7 @@ def test_c23_pass2_drains_at_every_idle_pass_while_non_empty(tmp_path, monkeypat
 
 
 def test_c23_pass2_job_stops_at_the_next_item_when_chat_resumes(tmp_path, monkeypatch):
-    """S14 (per item): the job drains with should_pause = "chat not idle"."""
+    """S14 (per item), #817: the job drains with should_pause = "a reply is in flight" (a message that starts a reply)."""
     persona_dir = _persona(tmp_path)
     monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _granting_slot)
     log: list[str] = []
@@ -869,6 +877,158 @@ def test_c23_pass2_job_stops_at_the_next_item_when_chat_resumes(tmp_path, monkey
         assert pass2_queue.queue_length(persona_dir) == 1
     finally:
         cli_throttle.note_reply_end()
+
+
+# ---------------------------------------------------------------------------
+# #817 (spec 9, A26): pass 2 waits for no reply in flight, not for the lull
+# ---------------------------------------------------------------------------
+
+
+def _decisions(result):
+    return [(d.job, d.action) for d in result]
+
+
+def test_817_only_pass2_is_exempt_from_the_lull(tmp_path):
+    jobs = _real_jobs(_persona(tmp_path))
+    assert [j.name for j in jobs if not j.needs_lull] == ["pass2"]
+
+
+def test_817_pass2_runs_inside_the_lull_and_every_later_job_still_waits(tmp_path, stubs):
+    """A26: a turn is queued, no reply in flight, chat not quiet for the lull: with the REAL gates the pass runs pass 2
+    (the not-idle recovery job ahead of it is skipped for the lull) and nothing after it."""
+    persona_dir = _persona(tmp_path)
+    cli_throttle.reset()
+    cli_throttle.note_user_message()
+    cli_throttle.note_reply_end()  # the reply just ended: inside the lull
+    try:
+        result = central_cadence.run_central_pass(
+            persona_dir,
+            _real_jobs(persona_dir),
+            slot_available=lambda: True,
+            exempt_slot_available=lambda: True,
+            now_wall=lambda: NOW,
+        )
+    finally:
+        cli_throttle.reset()
+    assert stubs.order == ["pass2"]
+    assert ("emotion_recovery_rebuild", "skip-no-lull") in _decisions(result)
+    assert ("pass2", "run") in _decisions(result)
+    assert _decisions(result)[-1] == ("session_snapshot_prune", "skip-no-lull")
+
+
+def test_817_pass2_does_not_start_while_a_reply_is_in_flight(tmp_path, stubs):
+    persona_dir = _persona(tmp_path)
+    cli_throttle.reset()
+    cli_throttle.note_user_message()  # a reply is in flight
+    try:
+        result = central_cadence.run_central_pass(
+            persona_dir,
+            _real_jobs(persona_dir),
+            slot_available=lambda: True,
+            exempt_slot_available=lambda: True,
+            now_wall=lambda: NOW,
+        )
+    finally:
+        cli_throttle.note_reply_end()
+        cli_throttle.reset()
+    assert stubs.order == []
+    assert ("pass2", "skip-no-lull") in _decisions(result)
+
+
+def test_817_not_idle_job_before_the_exempt_job_does_not_hide_it_but_one_after_it_ends_the_pass(tmp_path):
+    log: list[str] = []
+    jobs = [
+        GatedJob("emotion_recovery_rebuild", run=lambda: log.append("rec"), has_work=lambda: True),
+        GatedJob("pass2", run=lambda: log.append("pass2"), has_work=lambda: True, needs_lull=False),
+        GatedJob("session_snapshot_prune", run=lambda: log.append("snap"), has_work=lambda: True),
+        GatedJob("research_recovery", run=lambda: log.append("research"), has_work=lambda: True),
+    ]
+    result = _pass(tmp_path, jobs, idle=False, reply_gate=True)
+    assert log == ["pass2"]
+    assert _decisions(result) == [
+        ("emotion_recovery_rebuild", "skip-no-lull"),
+        ("pass2", "run"),
+        ("pass2", "completed"),
+        ("session_snapshot_prune", "skip-no-lull"),
+    ]
+
+
+def test_817_with_no_exempt_job_in_the_table_the_first_not_idle_job_ends_the_pass(tmp_path):
+    log: list[str] = []
+    jobs = [
+        GatedJob("emotion_recovery_rebuild", run=lambda: log.append("rec"), has_work=lambda: True),
+        GatedJob("pass2", run=lambda: log.append("pass2"), has_work=lambda: True),
+    ]
+    result = _pass(tmp_path, jobs, idle=False, reply_gate=True)
+    assert log == []
+    assert _decisions(result) == [("emotion_recovery_rebuild", "skip-no-lull")]
+
+
+def test_817_exempt_job_with_a_reply_in_flight_skips_and_ends_the_pass(tmp_path):
+    log: list[str] = []
+    jobs = [
+        GatedJob("emotion_recovery_rebuild", run=lambda: log.append("rec"), has_work=lambda: True),
+        GatedJob("pass2", run=lambda: log.append("pass2"), has_work=lambda: True, needs_lull=False),
+        GatedJob("session_snapshot_prune", run=lambda: log.append("snap"), has_work=lambda: True),
+    ]
+    result = _pass(tmp_path, jobs, idle=False, reply_gate=False)
+    assert log == []
+    assert _decisions(result) == [
+        ("emotion_recovery_rebuild", "skip-no-lull"),
+        ("pass2", "skip-no-lull"),
+    ]
+
+
+def test_817_exempt_job_peeks_its_own_slot(tmp_path):
+    log: list[str] = []
+    jobs = [GatedJob("pass2", run=lambda: log.append("pass2"), has_work=lambda: True, needs_lull=False)]
+    result = _pass(tmp_path, jobs, idle=False, reply_gate=True, slot=True, exempt_slot=False)
+    assert log == [] and _decisions(result) == [("pass2", "skip-slot")]
+
+
+def test_817_pass2_job_takes_the_background_slot_without_the_lull(tmp_path, monkeypatch):
+    persona_dir = _persona(tmp_path)
+    seen: list[dict] = []
+
+    @contextmanager
+    def _recording_slot(**kwargs):
+        seen.append(kwargs)
+        yield True
+
+    monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _recording_slot)
+    log: list[str] = []
+    cli_throttle.reset()
+    _enqueue_probe(persona_dir, log, "a")
+    _pass(persona_dir, _pass2_only(persona_dir))
+    assert log == ["a"]
+    assert seen == [{"lull_required": False}]
+
+
+def test_817_pass2_drain_is_not_paused_by_the_lull_only_by_a_reply(tmp_path, monkeypatch):
+    """A reply that starts and ends inside item a leaves the lull open and no reply in flight: item b still drains."""
+    persona_dir = _persona(tmp_path)
+    log: list[str] = []
+    cli_throttle.reset()
+
+    def _a_whole_reply():
+        cli_throttle.note_user_message()
+        cli_throttle.note_reply_end()
+
+    _enqueue_probe(persona_dir, log, "a", side=_a_whole_reply)
+    _enqueue_probe(persona_dir, log, "b")
+    try:
+        result = central_cadence.run_central_pass(
+            persona_dir,
+            _pass2_only(persona_dir),
+            slot_available=lambda: True,
+            exempt_slot_available=lambda: True,
+            now_wall=lambda: NOW,
+        )
+    finally:
+        cli_throttle.reset()
+    assert log == ["a", "b"]
+    assert pass2_queue.queue_length(persona_dir) == 0
+    assert ("pass2", "completed") in _decisions(result)
 
 
 # ---------------------------------------------------------------------------

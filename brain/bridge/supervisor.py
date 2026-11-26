@@ -575,6 +575,15 @@ def run_folded(
             logger.exception("supervisor between-items heartbeat hook raised")
         return stop_event.is_set() or not cli_throttle.is_chat_idle()
 
+    def _pass2_between_items() -> bool:
+        """The same hook for pass 2's drain (#817): the heartbeat runs between items, and the drain pauses when a stop
+        is requested or a reply is in flight, not for the quiet-chat lull (pass 2 does not wait for it)."""
+        try:
+            _maybe_run_heartbeat()
+        except Exception:
+            logger.exception("supervisor pass-2 between-items heartbeat hook raised")
+        return stop_event.is_set() or not cli_throttle.reply_gate_open()
+
     # The gated jobs, in the S55 order (see brain/bridge/central_cadence.py).
     tick_stats = {"closed_sessions": 0, "pruned_empty_sessions": 0}
     # The per-tick shared MemoryStore (#132: one memories.db open per tick,
@@ -611,6 +620,7 @@ def run_folded(
         tick_ctx=tick_ctx,
         bridge_started_at=bridge_started_at,
         between_items=_between_items,
+        pass2_between_items=_pass2_between_items,
         should_stop=_stopping,
     )
 
@@ -982,6 +992,7 @@ def _build_gated_jobs(
     tick_ctx: dict[str, MemoryStore | None] | None = None,
     bridge_started_at: datetime | None = None,
     between_items: Callable[[], bool] | None = None,
+    pass2_between_items: Callable[[], bool] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> list[GatedJob]:
     """The job table of the central cadence function (INC-9, S16/S55/S70).
@@ -990,7 +1001,8 @@ def _build_gated_jobs(
     test/dev disable knob) is left out. The emotion recovery rebuild (#584), pass 2, session snapshot/prune,
     research recovery (#591), embedding backfill and the extraction backfill (#523)
     have no interval: each runs at every idle pass while it has work (S53/S66;
-    the extraction backfill takes one chunk per pass). Deploy recalibration is due
+    the extraction backfill takes one chunk per pass); pass 2 alone does not wait for the
+    lull, only for no reply in flight (#817). Deploy recalibration is due
     while the stored floor is stale (S70/S73). The cosine and rerank floor
     bootstraps (name-recall fix S85 revised, S91, S92) are the next-lull RETRY
     path here: due while neither a calibrated row nor the process-cached
@@ -1014,6 +1026,14 @@ def _build_gated_jobs(
     # behavior pass2's should_pause had before this increment.
     _between_items: Callable[[], bool] = (
         between_items if between_items is not None else (lambda: not cli_throttle.is_chat_idle())
+    )
+    # Pass 2's own pause test (#817): the supervisor wires `_pass2_between_items` (reply in flight, not the lull). A
+    # caller that wires only `between_items` (a test double) gets that one for pass 2 too; one that wires neither gets
+    # the bare reply-gate check.
+    _pass2_pause: Callable[[], bool] = (
+        pass2_between_items
+        if pass2_between_items is not None
+        else (between_items if between_items is not None else (lambda: not cli_throttle.reply_gate_open()))
     )
 
     @contextmanager
@@ -1044,17 +1064,20 @@ def _build_gated_jobs(
         )
     )
 
-    # 1. pass 2 — S53: every idle pass while the saved queue is non-empty.
+    # 1. pass 2 (S53, #817): every central pass while the saved queue is non-empty and no reply is in flight. It does
+    # not wait for the quiet-chat lull (needs_lull=False below; the slot is still the shared background slot). It may
+    # run before the emotion recovery rebuild's first attempt in a lull window: that is the engine state it already ran
+    # against after a failed rebuild, and the engine guards its own drain (`EmotionEngine._run_apply`).
     def _pass2_run() -> JobOutcome:
-        with cli_throttle.background_slot() as slot:
+        with cli_throttle.background_slot(lull_required=False) as slot:
             if not slot:
                 return JobOutcome.SKIPPED
-            # S14 (per item): a message arriving mid-drain stops it at the next
-            # item boundary; what's left stays saved for the next lull (S64).
-            # INC-10: should_pause is the between-items hook (heartbeat + idle),
-            # not a bare idle check, so a heartbeat due mid-drain still runs
+            # S14 (per item): a reply starting mid-drain stops it at the next
+            # item boundary; what's left stays saved for the next pass (S64).
+            # INC-10: should_pause is the between-items hook (heartbeat + reply gate),
+            # not a bare check, so a heartbeat due mid-drain still runs
             # between items rather than waiting for the whole drain (S41/S65).
-            drained = pass2_queue.drain_all_locked(persona_dir, should_pause=_between_items)
+            drained = pass2_queue.drain_all_locked(persona_dir, should_pause=_pass2_pause)
         logger.info("pass-2 job: drained=%d", drained)
         # 0 drained with work queued = another process holds pass2_drain.lock
         # (S77): nothing ran, so report a skip (pass 2 has no cadence either way).
@@ -1072,6 +1095,7 @@ def _build_gated_jobs(
             "pass2",
             run=_pass2_run,
             has_work=lambda: pass2_queue.queue_length(persona_dir) > 0,
+            needs_lull=False,
         )
     )
 
