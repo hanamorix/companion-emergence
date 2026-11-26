@@ -605,3 +605,33 @@ def test_a_log_row_with_a_non_string_ts_never_resets_lived_age(tmp_path):
     reloaded, recovered = load_or_recover(tmp_path)
     assert recovered is False
     assert reloaded.lived_age_hours == pytest.approx(ticked)
+
+
+def test_nul_repair_of_the_arc_log_does_not_fold_an_arc_twice(tmp_path):
+    """#618's one-time repair restores a record a NUL run swallowed, which shifts the log
+    positions of the rows after it. An arc already folded must not be folded again at its
+    new position (cold review of #385)."""
+    from brain.health.jsonl_nul_repair import run_jsonl_nul_repair
+
+    def row(title: str, ts: str) -> bytes:
+        return json.dumps({"event": "arc_opened", "ts_iso": ts, "title": title}).encode() + b"\n"
+
+    log = tmp_path / "arcs.log.jsonl"
+    swallowed = row("B", "2026-09-30T09:00:00+00:00")
+    log.write_bytes(
+        row("A", "2026-09-30T08:00:00+00:00")
+        + b'{"event": "arc_op' + b"\0" * 20 + swallowed  # a cut-short append, then B swallowed by the NUL run
+        + row("C", "2026-09-30T10:00:00+00:00")
+    )
+
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx(_T0))
+    assert [a.label for a in ft.get_state().arc_anchors] == ["A", "C"]
+
+    run_jsonl_nul_repair(tmp_path)
+    assert swallowed in log.read_bytes()  # B is whole again, so C moved down one position
+
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:15:00+00:00"))
+    labels = [a.label for a in ft.get_state().arc_anchors]
+    assert labels.count("C") == 1

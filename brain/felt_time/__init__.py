@@ -138,8 +138,14 @@ class FeltTime:
             (a for a in all_anchors if a.type == "arc" and (_arc_log_index(a) or 0) > folded_upto),
             key=lambda a: _arc_log_index(a) or 0,  # log order, so the cap evicts the oldest-appended
         )
-        # Known limit: if arcs.log.jsonl were ever replaced by a shorter log, folding pauses
-        # until it grows past folded_upto. Nothing in brain/ rotates or truncates it.
+        # Positions can shift down: #618's one-time NUL repair restores a record a NUL run
+        # swallowed, so every row after it moves down one. A row already folded then shows
+        # up again past folded_upto; skip any event identical to one already held (a copy
+        # carries nothing new). The restored record itself sits below folded_upto and is
+        # not folded. Known limit: if arcs.log.jsonl were ever replaced by a shorter log,
+        # folding pauses until it grows past folded_upto.
+        held = {(a.event_type, a.ts, a.label) for a in arc_anchors}
+        new_arc_anchors = [a for a in new_arc_anchors if (a.event_type, a.ts, a.label) not in held]
         arc_anchors.extend(new_arc_anchors)
         if len(arc_anchors) > _ARC_ANCHOR_CAP:
             arc_anchors = arc_anchors[-_ARC_ANCHOR_CAP:]
