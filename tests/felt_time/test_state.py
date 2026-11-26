@@ -270,6 +270,12 @@ def test_an_unsound_energy_field_loads_as_its_default_and_does_not_raise(tmp_pat
     assert (loaded.energy_level, loaded.energy_long_avg, loaded.energy_long_weight) == (6.5, 0.0, 0.0)
 
 
+def test_a_negative_long_average_weight_loads_as_no_long_average(tmp_path):
+    _write_state_file(tmp_path, {"last_tick_ts": "2026-05-17T22:00:00+00:00", "energy_long_avg": 5.0, "energy_long_weight": -1.0})
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.energy_long_weight == 0.0
+
+
 @pytest.mark.parametrize(
     "bad",
     ["joy", [1.0], {"joy": "3"}, {"joy": None}, {"joy": float("nan")}, {"joy": True}, {"joy": 2.0, "grief": "x"}],

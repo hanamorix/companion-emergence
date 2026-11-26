@@ -118,6 +118,15 @@ def _finite_number(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _energy_weight_of(value: object) -> float:
+    """The saved long-average weight: a positive finite number as it is, else 0 (no long average yet).
+
+    A weight below 0 is not a weight: left as it is it could sum to 0 on a fold and divide by it.
+    """
+    number = _finite_number(value)
+    return number if number is not None and number > 0.0 else 0.0
+
+
 def _energy_feelings_of(raw: object) -> dict[str, float] | None:
     """The saved feeling averages when the whole map is sound (string names, finite numbers), else None (absent)."""
     if not isinstance(raw, dict):
@@ -219,6 +228,6 @@ def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
         arc_anchors=arc_anchors,
         energy_level=_energy_level_of(data),
         energy_long_avg=_finite_number(data.get("energy_long_avg")) or 0.0,
-        energy_long_weight=_finite_number(data.get("energy_long_weight")) or 0.0,
+        energy_long_weight=_energy_weight_of(data.get("energy_long_weight")),
         energy_feelings=_energy_feelings_of(data.get("energy_feelings")),
     ), False
