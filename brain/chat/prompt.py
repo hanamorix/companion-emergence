@@ -663,7 +663,7 @@ def _build_body_block(persona_dir: Path) -> str:
     """Render the body block: the saved energy level, temperature, exhaustion +
     six body emotions inline.
 
-    Per spec §4 + §7.3 — fail-soft. Any exception during body_state_from_short
+    Per spec §4 + §7.3, fail-soft. Any exception during body_state_from_short
     or the engine read → block omitted, chat continues. Token cost ~80 (raw
     metadata, no LLM summarization).
 
@@ -695,7 +695,7 @@ def _build_body_block(persona_dir: Path) -> str:
         short = engine.short_values(live_engine.read())
         now = datetime.now(UTC)
         days = days_since_human(now=now, persona_dir=persona_dir)
-        # Chat composer doesn't track session_hours yet — passes 0.0. Bridge daemon callers will hand a real
+        # Chat composer doesn't track session_hours yet, so it passes 0.0. Bridge daemon callers will hand a real
         # value through their own composition path when SP-7 wires it.
         body = body_state_from_short(
             short,
