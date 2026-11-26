@@ -725,6 +725,13 @@ def test_rest_state_from_energy_active_is_false() -> None:
     assert _rest_state_from_energy(10) is False
 
 
+@pytest.mark.no_base_failure(
+    reason=(
+        "the function compares whatever number it is given, on the base commit as well; what #650 changed is that every "
+        "caller now passes the unrounded saved level, which tests/unit/brain/test_energy_readers_one_level.py proves "
+        "through the real reader and which does fail on the base"
+    )
+)
 def test_rest_state_from_energy_compares_the_unrounded_level() -> None:
     """Spec 4: on at 3.0 or below, off at 3.4 (it was on below 3.5 when the level was rounded first)."""
     from brain.initiate.review import _rest_state_from_energy  # type: ignore[attr-defined]

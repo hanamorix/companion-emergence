@@ -125,7 +125,7 @@ def test_consolidation_archive_is_never_rotated() -> None:
 def _persona_dir(tmp_path: Path) -> Path:
     """Minimal persona dir for the supervisor to operate against."""
     p = tmp_path / "test-persona"
-    p.mkdir()
+    p.mkdir(parents=True)
     (p / "active_conversations").mkdir()
     (p / "persona_config.json").write_text('{"provider": "fake", "searcher": "noop"}')
     return p
@@ -1355,29 +1355,29 @@ def test_supervisor_initiate_review_tick_passes_rest_state_active_energy(tmp_pat
     assert captured.get("is_rest_state") is False, f"expected is_rest_state=False for active energy, got: {captured}"
 
 
-@pytest.mark.parametrize(("level", "resting"), [(3.0, True), (3.4, False), (3.5, False), (1.0, True), (10.0, False)])
-def test_supervisor_initiate_review_tick_compares_the_unrounded_saved_level(
-    tmp_path: Path, level: float, resting: bool
-) -> None:
+def test_supervisor_initiate_review_tick_compares_the_unrounded_saved_level(tmp_path: Path) -> None:
     """Spec 4: the gate is on at 3.0 or below and off at 3.4 (it was on below 3.5 when the level was rounded)."""
     from unittest.mock import MagicMock, patch
 
     from brain.bridge.supervisor import _run_initiate_review_tick  # noqa: F811
     from brain.felt_time.state import FeltTimeState, persist
 
-    persona_dir = _persona_dir(tmp_path)
-    persist(FeltTimeState(energy_level=level), persona_dir)
     captured: dict[str, object] = {}
 
     def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False, should_pause=None, paused_out=None):
         captured["is_rest_state"] = is_rest_state
 
-    with (
-        patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
-        patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
-    ):
-        _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
-    assert captured["is_rest_state"] is resting
+    answers: dict[float, object] = {}
+    for index, level in enumerate((3.0, 3.4, 3.5, 1.0, 10.0)):
+        persona_dir = _persona_dir(tmp_path / f"case{index}")
+        persist(FeltTimeState(energy_level=level), persona_dir)
+        with (
+            patch("brain.bridge.supervisor.run_initiate_review_tick", fake_review_tick),
+            patch("brain.bridge.supervisor.compute_user_presence", return_value=None),
+        ):
+            _run_initiate_review_tick(persona_dir, MagicMock(), _CapturingBus())
+        answers[level] = captured["is_rest_state"]
+    assert answers == {3.0: True, 3.4: False, 3.5: False, 1.0: True, 10.0: False}
 
 
 def test_supervisor_initiate_review_tick_rest_state_fail_open(tmp_path: Path) -> None:

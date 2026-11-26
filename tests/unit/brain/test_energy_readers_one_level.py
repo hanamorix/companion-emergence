@@ -33,7 +33,7 @@ class _Bus:
 
 def _persona(tmp_path: Path, level: float) -> Path:
     persona = tmp_path / "persona"
-    persona.mkdir()
+    persona.mkdir(parents=True)
     (persona / "active_conversations").mkdir()
     (persona / "persona_config.json").write_text('{"provider": "fake", "searcher": "noop"}')
     persist(FeltTimeState(energy_level=level), persona)
@@ -89,11 +89,7 @@ def test_all_six_readers_see_the_same_saved_level(tmp_path, monkeypatch, emotion
     assert seen["rest_gate"] == LEVEL  # unrounded
 
 
-@pytest.mark.parametrize(("level", "resting"), [(3.0, True), (3.4, False), (2.0, True), (6.5, False)])
-def test_the_rest_gate_through_the_real_reader_is_on_at_3_and_off_at_3_4(
-    tmp_path, monkeypatch, emotion_engine_stub, level, resting
-):
-    persona = _persona(tmp_path, level)
+def test_the_rest_gate_through_the_real_reader_is_on_at_3_and_off_at_3_4(tmp_path, monkeypatch, emotion_engine_stub):
     captured: dict[str, bool] = {}
 
     def fake_review_tick(persona_dir, *, provider, voice_template, cap_per_tick, user_presence, is_rest_state=False, should_pause=None, paused_out=None):
@@ -101,17 +97,17 @@ def test_the_rest_gate_through_the_real_reader_is_on_at_3_and_off_at_3_4(
 
     monkeypatch.setattr(supervisor, "run_initiate_review_tick", fake_review_tick)
     monkeypatch.setattr(supervisor, "compute_user_presence", lambda persona_dir: None)
-    supervisor._run_initiate_review_tick(persona, FakeProvider(), _Bus())
-    assert captured["rest"] is resting
+    answers = {}
+    for index, level in enumerate((3.0, 3.4, 2.0, 6.5)):
+        persona = _persona(tmp_path / f"case{index}", level)
+        supervisor._run_initiate_review_tick(persona, FakeProvider(), _Bus())
+        answers[level] = captured["rest"]
+    assert answers == {3.0: True, 3.4: False, 2.0: True, 6.5: False}
 
 
-@pytest.mark.parametrize(("level", "pressure_on"), [(1.0, True), (1.4, False), (1.5, False), (6.5, False)])
-def test_unnamed_pressure_through_the_real_tick_is_on_only_at_the_floor(
-    tmp_path, monkeypatch, emotion_engine_stub, level, pressure_on
-):
+def test_unnamed_pressure_through_the_real_tick_is_on_only_at_the_floor(tmp_path, monkeypatch, emotion_engine_stub):
     from brain.bridge import cli_throttle
 
-    persona = _persona(tmp_path, level)
     emotion_engine_stub.readings = {"joy": Reading(short=4.0, long=0.0, difference=0.0, shift=0)}  # no low-arousal channel
     got: list[float] = []
     real_pressure = supervisor.compute_unnamed_pressure
@@ -122,10 +118,15 @@ def test_unnamed_pressure_through_the_real_tick_is_on_only_at_the_floor(
         return value
 
     monkeypatch.setattr(supervisor, "compute_unnamed_pressure", pressure)
-    cli_throttle.reset()
-    supervisor._run_self_model_tick(persona, provider=FakeProvider(), event_bus=_Bus())
-    assert len(got) == 1
-    assert (got[0] > 0.0) is pressure_on
+    answers = {}
+    for index, level in enumerate((1.0, 1.4, 1.5, 6.5)):
+        persona = _persona(tmp_path / f"case{index}", level)
+        cli_throttle.reset()
+        got.clear()
+        supervisor._run_self_model_tick(persona, provider=FakeProvider(), event_bus=_Bus())
+        assert len(got) == 1
+        answers[level] = got[0] > 0.0
+    assert answers == {1.0: True, 1.4: False, 1.5: False, 6.5: False}
 
 
 def test_no_reader_recomputes_the_energy_from_the_feelings_or_the_session(tmp_path, emotion_engine_stub):
