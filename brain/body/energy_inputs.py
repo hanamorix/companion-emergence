@@ -66,6 +66,10 @@ def _interval_rows(persona_dir: Path, interval_start: datetime, now: datetime) -
     """The user and assistant rows after `interval_start` up to `now`, read as `count_chat_turns_since` reads them.
 
     A buffer that cannot be read costs only its own rows for this heartbeat (logged); felt time's tick still runs.
+
+    Accepted edge (spec builder note 8, P4): this reads the active buffers only. A message that compaction archived before
+    the heartbeat that would have read it is missed. That needs the row to be past the protected 40-row tail and 24 hours
+    old (`brain/chat/compaction.py`), so it is rare; the 30-day length read in `_window_rows` does see archived rows.
     """
     from brain.ingest.buffer import read_session_after
 
