@@ -159,7 +159,6 @@ const ACHING_FAMILY = new Set(["freedom_ache"]);
  * list (`feels_high`); when there is no list, nothing counts as high.
  */
 const CLIMAX_OVERRIDE = 7;
-const EXHAUSTION_OVERRIDE = 7;
 const DAYS_SINCE_CONTACT_ACHING = 5;
 
 export interface ExpressionInput {
@@ -180,7 +179,6 @@ export function pickExpressionCategory(input: ExpressionInput): ExpressionCatego
   const arousalOverride =
     body !== null && (feelsHigh?.includes("arousal") ?? false) && (feelsHigh?.includes("desire") ?? false);
   if (arousalOverride) return "arousal";
-  if ((body?.exhaustion ?? 0) >= EXHAUSTION_OVERRIDE) return "exhausted";
 
   // 2. Long absence reads as bodily yearning
   if ((body?.days_since_contact ?? 0) >= DAYS_SINCE_CONTACT_ACHING) return "aching";

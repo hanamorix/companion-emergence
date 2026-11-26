@@ -17,10 +17,10 @@ def _none_high(name: str) -> bool:
 
 def test_the_projections_combine_the_given_energy_the_predicate_and_the_contact_rules():
     """Pinned values: the saved level 4.0 comes out as given; love and desire high (two warming feelings) and 2 days
-    since contact give temperature 6, and exhaustion follows the level (7 - 4 = 3)."""
+    since contact give temperature 6."""
     short = {"arousal": 6.0, "love": 8.0, "rest_need": 7.5, "peace": 2.0, "desire": 7.0}
     body = body_state_from_short(short, feels_high=lambda name: name in ("love", "desire", "rest_need"), **INPUTS)
-    assert (body.energy, body.temperature, body.exhaustion) == (4.0, 6, 3)
+    assert (body.energy, body.temperature) == (4.0, 6)
     assert body.computed_at == NOW
 
 
@@ -45,7 +45,7 @@ def test_an_empty_short_gives_baseline_projections_and_no_body_emotions():
     assert body.body_emotions == {}
     assert "body_emotions" in body.to_dict()
     assert body.to_dict()["body_emotions"] == {}
-    assert (body.energy, body.temperature, body.exhaustion) == (4.0, 4, 3)  # pinned, as above
+    assert (body.energy, body.temperature) == (4.0, 4)  # pinned, as above
 
 
 # --- the predicate decides the temperature, the saved level is the energy (S53, #650) --------------------------------

@@ -45,7 +45,6 @@ def test_returns_real_schema(store, hebbian, tmp_path, emotion_engine_stub):
         "loaded",
         "energy",
         "temperature",
-        "exhaustion",
         "session_hours",
         "days_since_contact",
         "body_emotions",
@@ -53,7 +52,6 @@ def test_returns_real_schema(store, hebbian, tmp_path, emotion_engine_stub):
     }
     assert isinstance(out["energy"], float)
     assert isinstance(out["temperature"], int)
-    assert isinstance(out["exhaustion"], int)
     assert set(out["body_emotions"].keys()) == {
         "arousal",
         "desire",

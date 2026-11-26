@@ -897,6 +897,14 @@ REMOVED: tuple[Removed, ...] = (
         kind="code",
         scope=("brain", "scripts"),
     ),
+    # --- body exhaustion removed (#650 step 5) --------------------------------------------------------------------------------
+    Removed(
+        names=("_UNNAMED_EXHAUSTION_FLOOR", "exhaustion_excess", "body_exhaustion"),
+        why="the body exhaustion reading (`max(0, 7 - energy)`) was removed everywhere: energy alone is shown and drives the self-model's unnamed pressure (on at the floor 1.0); `BodyState.exhaustion`, the prompt text, the tool key and the app's bar and override went with it",
+        ref="#650 body energy, spec section 3 (draft PR #655)",
+        kind="code",
+        scope=("brain",),
+    ),
 )
 
 

@@ -10,7 +10,6 @@ function body(overrides: Partial<BodyState> = {}): BodyState {
   return {
     energy: 6,
     temperature: 5,
-    exhaustion: 0,
     session_hours: 0,
     days_since_contact: 0,
     body_emotions: {},
@@ -118,12 +117,18 @@ describe("expression picker, feels_high null or absent: nothing counts as high",
     expect(pickExpressionFromState(state({ ...loud, feels_high: null }))).toBe("happy");
   });
 
-  it("keeps the climax and exhaustion expressions, which are not governed by the list", () => {
+  it("keeps the climax expression, which is not governed by the list", () => {
     expect(
       pickExpressionCategory({ emotions: {}, body: body({ body_emotions: { climax: 7 } }), feelsHigh: null }),
     ).toBe("climax");
+  });
+
+  it("has no body-reading trigger for the exhausted expression: low energy alone shows idle, a top rest_need still shows exhausted", () => {
     expect(
-      pickExpressionCategory({ emotions: {}, body: body({ exhaustion: 7 }), feelsHigh: null }),
+      pickExpressionCategory({ emotions: {}, body: body({ energy: 1 }), feelsHigh: null }),
+    ).toBe("idle");
+    expect(
+      pickExpressionCategory({ emotions: { rest_need: 6 }, body: body({ energy: 6 }), feelsHigh: null }),
     ).toBe("exhausted");
   });
 });

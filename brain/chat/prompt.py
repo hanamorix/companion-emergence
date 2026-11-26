@@ -113,7 +113,7 @@ def build_system_message(
           consciously call `search_memories` for "remember when we talked
           about X" cases. ``user_input=None`` (or empty / too short) skips
           the block entirely.
-      5. Body block (energy/temperature/exhaustion + body emotions — spec §4)
+      5. Body block (energy, temperature and body emotions; spec §4)
       6. Recent journal block (private — spec §4.3)
       7. Recent growth block (behavioral_log — spec §4.4)
 
@@ -660,7 +660,7 @@ def _build_creative_dna_block(persona_dir: Path) -> str:
 
 
 def _build_body_block(persona_dir: Path) -> str:
-    """Render the body block: the saved energy level, temperature, exhaustion +
+    """Render the body block: the saved energy level, temperature +
     six body emotions inline.
 
     Per spec §4 + §7.3, fail-soft. Any exception during body_state_from_short
@@ -709,10 +709,7 @@ def _build_body_block(persona_dir: Path) -> str:
         return ""
 
     lines = ["── body ──"]
-    lines.append(
-        f"energy: {body.energy:.1f}/10, temperature: {body.temperature}/9, "
-        f"exhaustion: {body.exhaustion}/10"
-    )
+    lines.append(f"energy: {body.energy:.1f}/10, temperature: {body.temperature}/9")
     if body.days_since_contact > 0.5:
         lines.append(f"days since user contact: {body.days_since_contact:.1f}")
 

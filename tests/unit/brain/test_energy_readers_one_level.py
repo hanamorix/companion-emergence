@@ -57,9 +57,9 @@ def test_all_six_readers_see_the_same_saved_level(tmp_path, monkeypatch, emotion
     real_pressure = supervisor.compute_unnamed_pressure
     real_rest = supervisor._rest_state_from_energy
 
-    def pressure(channels, *, body_energy, body_exhaustion):
+    def pressure(channels, *, body_energy):
         seen["self_model"] = body_energy
-        return real_pressure(channels, body_energy=body_energy, body_exhaustion=body_exhaustion)
+        return real_pressure(channels, body_energy=body_energy)
 
     def rest(energy):
         seen["rest_gate"] = energy
@@ -112,8 +112,8 @@ def test_unnamed_pressure_through_the_real_tick_is_on_only_at_the_floor(tmp_path
     got: list[float] = []
     real_pressure = supervisor.compute_unnamed_pressure
 
-    def pressure(channels, *, body_energy, body_exhaustion):
-        value = real_pressure(channels, body_energy=body_energy, body_exhaustion=body_exhaustion)
+    def pressure(channels, *, body_energy):
+        value = real_pressure(channels, body_energy=body_energy)
         got.append(value)
         return value
 

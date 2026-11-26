@@ -140,8 +140,7 @@ _BASELINE: tuple[Emotion, ...] = (
     ),
     Emotion(
         "rest_need",
-        "the body asking for slowness, low stimulation, recovery. Distinct from "
-        "exhaustion (the computed state) — this is the *want*, not the condition.",
+        "the body asking for slowness, low stimulation, recovery.",
         "body",
         0.75,
     ),

@@ -6,7 +6,7 @@ interface Props {
 }
 
 /**
- * Body — the full body block: energy/temp/exhaustion + body emotions
+ * Body — the full body block: energy/temp + body emotions
  * (arousal/desire/climax/touch_hunger/comfort_seeking/rest_need) +
  * session/contact metadata. Matches mockup nell_face_example_2.png.
  */
@@ -19,12 +19,6 @@ export function BodyPanel({ state }: Props) {
         <>
           <Bar label="Energy" value={body.energy} max={10} formatValue={(v) => `${v.toFixed(1)}/10`} />
           <Bar label="Temp" value={body.temperature} max={9} formatValue={(v) => `${v}/9`} />
-          <Bar
-            label="Exhaust"
-            value={body.exhaustion}
-            max={10}
-            formatValue={(v) => `${v}/10`}
-          />
           <Divider />
           <SectionLabel>Body Emotions</SectionLabel>
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>

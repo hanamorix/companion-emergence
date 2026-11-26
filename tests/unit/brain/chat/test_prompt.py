@@ -1709,3 +1709,19 @@ def test_body_block_energy_is_the_saved_level_to_one_decimal(tmp_path, emotion_e
 
     persist(FeltTimeState(energy_level=6.326923076923077), tmp_path)
     assert _body_block_numbers(tmp_path, emotion_engine_stub, {}, set())[0] == "6.3"
+
+
+def test_body_block_line_shows_energy_and_temperature_and_no_exhaustion(tmp_path, emotion_engine_stub):
+    """#650 spec section 3 and A12: the prompt line is exactly energy and temperature, no exhaustion text."""
+    from brain.chat.prompt import _build_body_block
+    from brain.felt_time.state import FeltTimeState, persist
+
+    persist(FeltTimeState(energy_level=6.326923076923077), tmp_path)
+    emotion_engine_stub.high = set()
+    emotion_engine_stub.readings = {}
+    block = _build_body_block(tmp_path)
+    import re
+
+    # the temperature depends on the days since contact, which this fixture does not pin; the line has nothing after it
+    assert re.fullmatch(r"energy: 6\.3/10, temperature: \d/9", block.splitlines()[1])
+    assert "exhaust" not in block.lower()

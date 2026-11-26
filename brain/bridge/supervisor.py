@@ -2496,9 +2496,7 @@ def _self_model_reflect(
         days_since_contact=days,
         now=now,
     )
-    unnamed = compute_unnamed_pressure(
-        short_values, body_energy=body.energy, body_exhaustion=body.exhaustion
-    )
+    unnamed = compute_unnamed_pressure(short_values, body_energy=body.energy)
     new_gap = gap_from_read(reads.read, unnamed_pressure=unnamed)
     new_gap.reset_seen = iso_utc(reads.after) if reads.after is not None else None
 

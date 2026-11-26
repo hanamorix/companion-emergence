@@ -115,7 +115,7 @@ def _baseline() -> tuple[dict[str, float], dict[str, float | str]]:
     return facial, arm_hand
 
 
-def compute_expression(state: EmotionalState, arousal_tier: int, energy: int) -> ExpressionVector:
+def compute_expression(state: EmotionalState, arousal_tier: int, energy: float) -> ExpressionVector:
     """Compute an ExpressionVector from emotional + body state.
 
     Args:

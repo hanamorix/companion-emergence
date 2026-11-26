@@ -77,12 +77,12 @@ def test_build_persona_state_body_block_when_memories_exist(tmp_path: Path) -> N
     for required in (
         "energy",
         "temperature",
-        "exhaustion",
         "session_hours",
         "days_since_contact",
         "body_emotions",
     ):
         assert required in body
+    assert "exhaustion" not in body
     assert isinstance(body["energy"], float)
     assert isinstance(body["body_emotions"], dict)
 
@@ -626,7 +626,7 @@ def test_build_body_omits_absent_body_emotions_and_never_shows_nan(tmp_path: Pat
     body = _build_body(tmp_path, now=datetime(2026, 11, 4, 12, 0, tzinfo=UTC))
     assert body is not None
     assert body["body_emotions"] == {"arousal": 6.0}
-    for key in ("energy", "temperature", "exhaustion", "session_hours", "days_since_contact"):
+    for key in ("energy", "temperature", "session_hours", "days_since_contact"):
         assert not math.isnan(body[key])
 
 

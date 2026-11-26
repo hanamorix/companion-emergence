@@ -2,7 +2,7 @@
 
 Spec: docs/source-spec/2026-04-29-body-state-design.md §3.1.
 
-The contact-gap rules, the clamps, the saved energy level passing through unrounded and the exhaustion derivation are
+The contact-gap rules, the clamps, the saved energy level passing through unrounded and the absence of any exhaustion reading are
 tested here through `body_state_from_short`, the one function that builds a body state. The energy is the level felt
 time saved, handed in by the caller (#650). Which feelings count as high is the engine's predicate (`feels_high`); its
 per-feeling effects are in test_body_state_from_short.py.
@@ -53,7 +53,6 @@ def test_body_state_to_dict_shape():
     bs = BodyState(
         energy=8.0,
         temperature=4,
-        exhaustion=0,
         session_hours=0.0,
         days_since_contact=0.0,
         body_emotions={
@@ -70,7 +69,7 @@ def test_body_state_to_dict_shape():
     assert d["loaded"] is True
     assert d["energy"] == 8
     assert d["temperature"] == 4
-    assert d["exhaustion"] == 0
+    assert "exhaustion" not in d
     assert d["session_hours"] == 0.0
     assert d["days_since_contact"] == 0.0
     assert set(d["body_emotions"].keys()) == {
@@ -121,17 +120,16 @@ def test_temperature_lowest_reachable_is_1():
     assert _body("touch_hunger", days_since_contact=10.0).temperature == 1
 
 
-def test_exhaustion_derivation():
-    # energy 8 → exhaustion max(0, 7-8) = 0
-    assert _body(energy=8.0).exhaustion == 0
+def test_the_body_state_carries_energy_alone_with_no_exhaustion_reading():
+    """#650 spec section 3: energy is the only level shown; there is no exhaustion field and no key."""
+    import dataclasses
 
-
-def test_exhaustion_high_when_energy_low():
-    bs = _body("rest_need", session_hours=10.0, energy=1.0)
-    # energy 1 → exhaustion 6
-    assert bs.energy == 1.0
-    assert bs.exhaustion == 6
-    assert isinstance(bs.exhaustion, int)
+    names = {f.name for f in dataclasses.fields(BodyState)}
+    assert "exhaustion" not in names
+    assert {"energy", "temperature", "session_hours", "days_since_contact", "body_emotions", "computed_at"} == names
+    low = _body("rest_need", session_hours=10.0, energy=1.0)
+    assert low.energy == 1.0
+    assert "exhaustion" not in low.to_dict()
 
 
 # ---------------------------------------------------------------------------

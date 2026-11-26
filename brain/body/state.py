@@ -2,7 +2,7 @@
 
 The brain has a body. Body emotions live in the emotion vocabulary
 (arousal, desire, climax, touch_hunger, comfort_seeking, rest_need).
-The temperature and exhaustion are computed fresh on each call, with no persistence, no cache and no parallel
+The temperature is computed fresh on each call, with no persistence, no cache and no parallel
 state. The energy is not computed here: it is the level felt time carries from one heartbeat to the next
 (`brain.felt_time.state.read_energy_level`), and each caller passes it in.
 
@@ -36,7 +36,7 @@ class BodyState:
     """The computed body view at a moment in time.
 
     Energy 1-10 (the carried level, a float, never rounded here), temperature 1-9 (asymmetric, midpoint 5; OG
-    inheritance), exhaustion derived as max(0, 7 - energy rounded to a whole number).
+    inheritance). Energy is the only level shown.
 
     body_emotions carries the six body-class emotions as a snapshot —
     callers shouldn't have to read them again from the engine.
@@ -44,7 +44,6 @@ class BodyState:
 
     energy: float
     temperature: int
-    exhaustion: int
     session_hours: float
     days_since_contact: float
     body_emotions: dict[str, float]
@@ -61,7 +60,6 @@ class BodyState:
             "loaded": True,
             "energy": round(self.energy, 1),
             "temperature": self.temperature,
-            "exhaustion": self.exhaustion,
             "session_hours": round(self.session_hours, 2),
             "days_since_contact": round(self.days_since_contact, 2),
             "body_emotions": {k: round(v, 1) for k, v in self.body_emotions.items()},
@@ -112,7 +110,6 @@ def _assemble(
     return BodyState(
         energy=energy,
         temperature=temperature,
-        exhaustion=max(0, 7 - round(energy)),
         session_hours=round(session_hours, 2),
         days_since_contact=round(days_since_contact, 2),
         body_emotions=body_emotions,

@@ -261,7 +261,6 @@ export interface PendingWrite {
 export interface BodyState {
   energy: number;
   temperature: number;
-  exhaustion: number;
   session_hours: number;
   days_since_contact: number;
   body_emotions: Record<string, number>;
