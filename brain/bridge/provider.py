@@ -2568,6 +2568,42 @@ def _claude_context_lines(messages: list[ChatMessage], *, user_name: str | None 
         yield f"{when} {body}" if when else body
 
 
+def _ollama_messages(messages: list[ChatMessage], options: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Ollama's ``messages`` list, carrying the time context the Claude CLI path puts in its prompt (#551).
+
+    Each ``user`` message with a parseable ``ts`` starts with its local send time (``_narrative_time``, as on the
+    Claude path). The companion's own messages, tool results and system messages are sent as ``to_dict()`` gives
+    them, so a small model never sees itself writing a timestamp and starts copying it. The per-turn
+    ``volatile_suffix`` (current time, felt time, reply frame) is appended to the latest user message: every chat
+    template keeps a user message, where some drop a system message that is not first. With no user message it is
+    sent as a trailing one. Built fresh from the immutable messages on every call, so a tool loop's follow-up calls
+    send the suffix once each, never stacked.
+    """
+    suffix = (options or {}).get("volatile_suffix")
+    out: list[dict[str, Any]] = []
+    latest_user: dict[str, Any] | None = None
+    for msg in messages:
+        d = msg.to_dict()
+        if msg.role == "user":
+            when = _narrative_time(msg.ts)
+            if when:
+                content = d["content"]
+                if isinstance(content, str):
+                    d["content"] = f"{when} {content}"
+                else:
+                    d["content"] = [{"type": "text", "text": when}, *content]
+            latest_user = d
+        out.append(d)
+    if suffix:
+        if latest_user is None:
+            out.append({"role": "user", "content": suffix})
+        elif isinstance(latest_user["content"], str):
+            latest_user["content"] = f"{latest_user['content']}\n\n{suffix}"
+        else:
+            latest_user["content"] = [*latest_user["content"], {"type": "text", "text": suffix}]
+    return out
+
+
 # ---------------------------------------------------------------------------
 # OllamaProvider — httpx-based, full tool-call support
 # ---------------------------------------------------------------------------
@@ -2586,12 +2622,18 @@ class OllamaProvider(LLMProvider):
     Streaming
     ---------
     ``chat_stream()`` POSTs with ``stream=True`` and yields each content
-    chunk as Ollama emits it. The bridge WS handler (or any other
-    streaming consumer) can pipe these straight to the client without
-    waiting for the full reply. Tool-calling is intentionally not on
+    chunk as Ollama emits it, for a consumer that wants raw text as it
+    arrives. The bridge's ``/stream`` WebSocket does not use it: chat turns
+    carry tools, so ``_StreamingProxy`` calls :meth:`chat` and word-chunks
+    the reply (see ``chat_stream_speaks_events``). Tool-calling is intentionally not on
     the streaming path — pass ``tools=`` through :meth:`chat` instead,
     which returns a structured ChatResponse with parsed tool_calls.
     """
+
+    # chat_stream() yields plain str chunks and takes no tools, so the bridge's
+    # _StreamingProxy must not treat it as an event stream; it sends Ollama
+    # turns through chat() and word-chunks the reply instead (#810).
+    chat_stream_speaks_events = False
 
     def __init__(
         self,
@@ -2634,7 +2676,7 @@ class OllamaProvider(LLMProvider):
         """
         payload: dict[str, Any] = {
             "model": self._model,
-            "messages": [m.to_dict() for m in messages],
+            "messages": _ollama_messages(messages, options),
             "stream": False,
         }
         if tools:
@@ -2746,7 +2788,7 @@ class OllamaProvider(LLMProvider):
         """
         payload: dict[str, Any] = {
             "model": self._model,
-            "messages": [m.to_dict() for m in messages],
+            "messages": _ollama_messages(messages, options),
             "stream": True,
         }
         if options:

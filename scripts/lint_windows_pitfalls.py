@@ -3,7 +3,7 @@
 
 The developer has no Windows host and the `#[cfg(target_os="windows")]` Rust arm
 isn't even compiled on macOS, so Windows subprocess/boot regressions ship
-test-verified-on-macOS-only and are caught in production. This greps brain/ for
+test-verified-on-macOS-only and are caught in production. This greps brain/ and scripts/ for
 the specific, hard-won footguns documented in CLAUDE.md so a re-introduction is
 caught locally.
 
@@ -69,7 +69,10 @@ def _spawns_without_encoding(tree: ast.AST, lines: list[str]) -> list[int]:
 
 
 def _py_files(root: Path):
-    return [p for p in (root / "brain").rglob("*.py") if "__pycache__" not in p.parts]
+    """brain/ and scripts/ (the CI scripts run on Windows runners too); this lint is skipped, since its own
+    docstring names the calls it looks for."""
+    files = [*(root / "brain").rglob("*.py"), *(root / "scripts").rglob("*.py")]
+    return [p for p in files if "__pycache__" not in p.parts and p.resolve() != Path(__file__).resolve()]
 
 
 def scan(root: Path = ROOT) -> list[str]:

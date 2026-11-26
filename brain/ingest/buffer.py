@@ -497,6 +497,52 @@ def _latest_user_ts_in_session_archive(persona_dir: Path, session_id: str) -> da
     return None
 
 
+def _archived_file_session(name: str) -> tuple[str, int] | None:
+    """The session id and rank of an archived conversation file's name, or None for any other name.
+
+    ``<sid>.jsonl`` is the legacy single file (rank -1, before every segment); ``<sid>.<NNN>.jsonl`` is segment NNN. A session id
+    holds no dot, so the first dot ends it."""
+    if not name.endswith(".jsonl"):
+        return None
+    session_id, _, segment = name[: -len(".jsonl")].partition(".")
+    if not _SESSION_ID_RE.fullmatch(session_id):
+        return None
+    if not segment:
+        return session_id, -1
+    if segment.isascii() and segment.isdigit():  # str.isdigit() also accepts "²", which int() rejects
+        return session_id, int(segment)
+    return None
+
+
+def archived_files_written_since(persona_dir: Path, since: datetime) -> list[Path]:
+    """The archived conversation files (every session's legacy file and segments) last written at or after ``since``, in name order.
+
+    A file's rows are no later than its last write, so a file last written before ``since`` holds no turn from ``since`` on and is
+    left out without being opened. Reads only: a missing folder lists as [] and nothing is created. An unlistable folder lists as
+    [], and a file that cannot be inspected is left out, each with a warning."""
+    folder = persona_dir / "archived_conversations"
+    try:
+        names = list_dir(folder)
+    except OSError:
+        warn_throttled(logger, "archived_files_written_since:unlistable", "the archived conversations folder cannot be listed")
+        return []
+    since_ns = (since - _EPOCH) // timedelta(microseconds=1) * 1000
+    out: list[Path] = []
+    for name in names:
+        if _archived_file_session(name) is None:
+            continue
+        try:
+            stat = stat_path(folder / name)
+        except OSError:
+            warn_throttled(
+                logger, "archived_files_written_since:stat", "the archived file %s cannot be inspected; skipped", name
+            )
+            continue
+        if stat is not None and stat.is_file and stat.mtime_ns >= since_ns:
+            out.append(folder / name)
+    return out
+
+
 def _latest_user_ts_in_archive(persona_dir: Path, best: datetime | None) -> datetime | None:
     """The later of ``best`` (the newest user ``ts`` already found, None for none) and the newest archived user ``ts``."""
     # Not ``_archived_conversations_dir``: it creates the folder. A missing folder lists as [].
@@ -508,21 +554,13 @@ def _latest_user_ts_in_archive(persona_dir: Path, best: datetime | None) -> date
             logger, "last_user_turn_ts:unlistable_archive", "last_user_turn_ts: the archived conversations folder cannot be listed"
         )
         return best
-    # The session ids come from the names (``<sid>.jsonl`` legacy, ``<sid>.<NNN>.jsonl`` segments; a session id holds no
-    # dot). Each session's last file is read off this one listing: its largest numbered segment, else the legacy file.
+    # Each session's last file is read off this one listing: its largest numbered segment, else the legacy file.
     last_file: dict[str, tuple[int, str]] = {}
     for name in names:
-        if not name.endswith(".jsonl"):
+        parsed = _archived_file_session(name)
+        if parsed is None:
             continue
-        session_id, _, segment = name[: -len(".jsonl")].partition(".")
-        if not _SESSION_ID_RE.fullmatch(session_id):
-            continue
-        if not segment:
-            rank = -1  # the legacy file comes before every numbered segment
-        elif segment.isascii() and segment.isdigit():
-            rank = int(segment)
-        else:
-            continue
+        session_id, rank = parsed
         if session_id not in last_file or (rank, name) > last_file[session_id]:
             last_file[session_id] = (rank, name)
     # Session ids are not in time order, so the sessions are visited newest file first by modification time (a file's

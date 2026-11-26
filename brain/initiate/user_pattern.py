@@ -31,6 +31,7 @@ from brain.bridge.persisted_cadence import advance, is_due, load_cadence, save_c
 from brain.health.json_io import Recovery, iter_jsonl, read_jsonl, read_jsonl_tail
 from brain.initiate import presence_state
 from brain.utils.log_throttle import warn_throttled
+from brain.utils.time import lenient_utc
 
 log = logging.getLogger(__name__)
 
@@ -223,23 +224,54 @@ def _has_resolution(rows: list[dict]) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _archived_user_turn_times(persona_dir: Path, cutoff: datetime, seen: set[tuple]) -> list[datetime]:
+    """The times at or after ``cutoff`` of the archived user turns whose identity is not in ``seen`` (#804).
+
+    A closed session's buffer is archived in full and then deleted, so most of the 30 days of history is here, not in
+    ``active_conversations/``. A turn can be in more than one archive file, or twice in one: a close repeated after a crash
+    between the append and its commit marker writes the batch again, and a buffer kept because it changed during its close is
+    archived again at the next close. Each turn is counted once, by ``turn_identity``; ``seen`` holds the active rows already
+    counted and gains every archived one. Only files last written since ``cutoff`` are opened. A file that cannot be read
+    ends with a warning and the others still count."""
+    # Imported here, not at the top: brain.ingest pulls the ingest pipeline and the provider stack.
+    from brain.ingest.buffer import archived_files_written_since, turn_identity
+
+    times: list[datetime] = []
+    for path in archived_files_written_since(persona_dir, cutoff):
+        for row in iter_jsonl(path):
+            if row.get("speaker") != "user":  # the #621 rule, as in the active scan
+                continue
+            ts = lenient_utc(row.get("ts"))
+            if ts is None or ts < cutoff:
+                continue
+            identity = turn_identity(row)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            times.append(ts)
+    return times
+
+
 def _build_hour_histogram(
     persona_dir: Path, *, _now: datetime | None = None
 ) -> tuple[list[int] | None, int | None]:
-    """Scan active_conversations/*.jsonl and build the 24-bucket local-hour
-    histogram + active-percentile threshold used by likely-active-at-hour.
+    """Scan active_conversations/*.jsonl and the archived sessions and build the
+    24-bucket local-hour histogram + active-percentile threshold used by
+    likely-active-at-hour (each archived turn counted once, #804).
 
-    Returns (None, None) when there's no conversations dir or fewer than
-    _SCHEDULE_MIN_TURNS turns in the _SCHEDULE_LOOKBACK_DAYS window
-    (insufficient data -> permissive default upstream).
+    Returns (None, None) when there are fewer than _SCHEDULE_MIN_TURNS turns in
+    the _SCHEDULE_LOOKBACK_DAYS window (insufficient data -> permissive default
+    upstream).
     """
     conversations_dir = persona_dir / _ACTIVE_CONVERSATIONS_DIR
-    if not conversations_dir.exists():
-        return None, None
     now = _now or datetime.now(UTC)
     cutoff = now - timedelta(days=_SCHEDULE_LOOKBACK_DAYS)
     hour_counts: list[int] = [0] * 24
     total = 0
+    seen: set[tuple] = set()
+    # Imported here, not at the top: brain.ingest pulls the ingest pipeline and the provider stack.
+    from brain.ingest.buffer import turn_identity
+
     for jsonl_file in conversations_dir.glob("*.jsonl"):
         for row in iter_jsonl(jsonl_file, recover=Recovery.RAISE):
             # Only the user's rows (#621): the kindled's are "assistant", plus
@@ -257,8 +289,12 @@ def _build_hour_histogram(
                     continue
                 hour_counts[ts.astimezone().hour] += 1
                 total += 1
+                seen.add(turn_identity(row))
             except (ValueError, TypeError):
                 continue
+    for ts in _archived_user_turn_times(persona_dir, cutoff, seen):
+        hour_counts[ts.astimezone().hour] += 1
+        total += 1
     if total < _SCHEDULE_MIN_TURNS:
         return None, None
     sorted_counts = sorted(hour_counts)
@@ -353,23 +389,25 @@ def _compute_response_lag_p50(persona_dir: Path) -> float | None:
 def _daily_scan_conversations(
     persona_dir: Path, *, _now: datetime | None = None
 ) -> tuple[list[int] | None, int | None, str | None]:
-    """One pass over active_conversations/*.jsonl for the daily recompute:
-    builds the likely-active hour histogram (30-day lookback) AND finds the
-    max inbound-turn ts across ALL history (no lookback cutoff) in the same
-    loop, for the persisted last-seen timestamp (which silence_days no
-    longer reads: it comes from ``last_user_turn_ts``).
+    """One pass over active_conversations/*.jsonl and the archived sessions for
+    the daily recompute: builds the likely-active hour histogram (30-day
+    lookback, each archived turn counted once, #804) AND finds the max
+    inbound-turn ts across ALL of the active files' history (no lookback
+    cutoff) in the same loop, for the persisted last-seen timestamp (which
+    silence_days no longer reads: it comes from ``last_user_turn_ts``).
 
     Returns (hour_counts, active_threshold, latest_ts_iso) — any of which
-    may be None (no conversations dir, or no qualifying rows).
+    may be None (no qualifying rows).
     """
     conversations_dir = persona_dir / _ACTIVE_CONVERSATIONS_DIR
-    if not conversations_dir.exists():
-        return None, None, None
     now = _now or datetime.now(UTC)
     cutoff = now - timedelta(days=_SCHEDULE_LOOKBACK_DAYS)
     hour_counts: list[int] = [0] * 24
     total = 0
     latest_ts: datetime | None = None
+    seen: set[tuple] = set()
+    # Imported here, not at the top: brain.ingest pulls the ingest pipeline and the provider stack.
+    from brain.ingest.buffer import turn_identity
 
     for jsonl_file in conversations_dir.glob("*.jsonl"):
         for row in iter_jsonl(jsonl_file, recover=Recovery.RAISE):
@@ -392,6 +430,10 @@ def _daily_scan_conversations(
                 continue
             hour_counts[ts.astimezone().hour] += 1
             total += 1
+            seen.add(turn_identity(row))
+    for ts in _archived_user_turn_times(persona_dir, cutoff, seen):
+        hour_counts[ts.astimezone().hour] += 1
+        total += 1
 
     threshold: int | None = None
     if total >= _SCHEDULE_MIN_TURNS:

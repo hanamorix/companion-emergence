@@ -3018,8 +3018,8 @@ ANCHOR_SPLIT_DIVISOR = 2
 # so they only enter the mix at large k (k=7/8, wide/fast-host calls) where
 # a median over many anchors absorbs one elevated score:
 #   - the weather-instrument entry: the project pervasively uses an
-#     "emotional weather" framing elsewhere (a `weather_shift` anchor
-#     detector, the emotion self-model's weather metaphors) that a
+#     "emotional weather" framing elsewhere (the felt-time `weather_shift`
+#     baselines, the emotion self-model's weather metaphors) that a
 #     weather-themed real query could resonate with, even though this entry
 #     itself is pure instrument telemetry, not conversational small talk;
 #   - the library loan-policy entry: the persona has an author/book life, so

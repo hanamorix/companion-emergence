@@ -196,3 +196,17 @@ def test_load_seeds_arc_anchors_from_existing_arc_anchor(tmp_path):
     state, _ = load_or_recover(tmp_path)
     assert len(state.arc_anchors) == 1
     assert state.arc_anchors[0].label == "The Long Work"
+
+
+def test_weather_shift_is_not_an_anchor_type():
+    """#785: the weather-shift anchor never fired, so it is gone everywhere an anchor type is named."""
+    from brain.felt_time.anchors import _SOURCES
+    from brain.felt_time.state import ANCHOR_TYPES, LOG_SOURCES
+    from brain.tools.schemas import SCHEMAS
+
+    assert "weather_shift" not in ANCHOR_TYPES
+    assert "weather_shifts.log.jsonl" not in LOG_SOURCES
+    assert "weather_shift" not in _SOURCES
+    enum = SCHEMAS["pressure_since"]["parameters"]["properties"]["anchor_type"]["enum"]
+    assert "weather_shift" not in enum
+    assert "weather_shift" not in SCHEMAS["felt_time_now"]["description"]
