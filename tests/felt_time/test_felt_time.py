@@ -539,3 +539,51 @@ def test_arc_cap_evicts_by_log_order_even_when_timestamps_disagree(tmp_path):
     ft = FeltTime(persona_dir=tmp_path)
     ft.tick(_neutral_ctx("2026-10-01T10:15:00+00:00"))
     assert [a.label for a in ft.get_state().arc_anchors] == first
+
+
+def test_lived_age_survives_a_dream_logged_by_the_real_dream_writer(tmp_path):
+    """#385 review step 4: the other #384 tests hand-write `ts` rows in the shape the reader
+    expects; this one lets `DreamEngine` write the row exactly as it does on disk today, then
+    ticks. The saved lived age must be kept, never replayed from zero."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.bridge.provider import FakeProvider
+    from brain.engines.dream import DreamEngine
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+
+    now = datetime.now(UTC)
+    saved = FeltTimeState(
+        lived_age_hours=1.25,
+        last_tick_ts=(now - timedelta(minutes=30)).isoformat(),
+        first_tick_ts=(now - timedelta(hours=2)).isoformat(),
+    )
+    persist(saved, tmp_path)
+
+    store = MemoryStore(db_path=tmp_path / "memories.db")
+    seed = Memory.create_new(content="a walk by the river", memory_type="conversation", domain="us")
+    seed.importance = 8.0
+    store.create(seed)
+    DreamEngine(
+        store=store,
+        hebbian=HebbianMatrix(db_path=":memory:"),
+        provider=FakeProvider(),
+        log_path=tmp_path / "dreams.log.jsonl",
+        persona_name="Nell",
+        persona_system_prompt="You are Nell. Reflect on the dream in first person, starting with 'DREAM: '.",
+    ).run_cycle()
+
+    rows = [json.loads(line) for line in (tmp_path / "dreams.log.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["timestamp"] > saved.last_tick_ts  # the dream is newer than the last tick
+
+    ft = FeltTime(persona_dir=tmp_path)
+    assert ft.recovered_from_logs is False
+    assert ft.get_state().lived_age_hours == pytest.approx(1.25)
+
+    ft.tick(_neutral_ctx((now + timedelta(minutes=1)).isoformat()))
+    assert ft.get_state().lived_age_hours > 1.25
+
+    reloaded, recovered = load_or_recover(tmp_path)
+    assert recovered is False
+    assert reloaded.lived_age_hours == pytest.approx(ft.get_state().lived_age_hours)
