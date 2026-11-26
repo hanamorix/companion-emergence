@@ -5,12 +5,12 @@ Spec §2 `state.py` + §3 recovery model.
 
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from brain.health.attempt_heal import save_with_backup
+from brain.health.json_io import read_json_walk
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 from brain.state_compat import from_known_fields
 
@@ -201,16 +201,17 @@ def _state_from_data(data: object) -> FeltTimeState:
     return state
 
 
-def _read_state_file(path: Path) -> FeltTimeState | None:
-    """Read-only: the well-typed state in `path`, or None when it is unreadable,
-    unparseable or wrong-typed."""
+def _validate_state_data(data: object) -> None:
+    """`read_json_walk`'s validator: raise ValueError/TypeError unless `data` builds a well-typed state.
+
+    The walk counts only those two as "this copy is bad" and lets anything else propagate as a validator
+    bug, so the other ways a wrong shape fails `_state_from_data` (`.get` on a non-object, an int too
+    large for a float) are converted here.
+    """
     try:
-        return _state_from_data(json.loads(path.read_text()))
-    except (OSError, ValueError, TypeError, AttributeError, KeyError, OverflowError, RecursionError):
-        return None
-
-
-BACKUP_COUNT = 3  # save_with_backup's default rotation: .bak1 (newest) .. .bak3
+        _state_from_data(data)
+    except (AttributeError, KeyError, OverflowError, RecursionError) as exc:
+        raise TypeError(f"felt-time state has the wrong shape: {exc!r}") from exc
 
 
 def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
@@ -225,17 +226,13 @@ def load_or_recover(persona_dir: Path) -> tuple[FeltTimeState, bool]:
       age 0.0, the recovery honesty contract).
     - Nothing to recover from (a brand-new persona): cold start.
     """
-    state_file = persona_dir / STATE_FILENAME
-    # _read_state_file is None for a missing, unreadable or corrupt file alike. A missing
-    # main file is not "no state": save_with_backup renames live -> .bak1 just before the
-    # new file lands, so a reader in that window must still find the backups.
-    state = _read_state_file(state_file)
-    if state is not None:
-        return state, False
-    for i in range(1, BACKUP_COUNT + 1):
-        bak = state_file.with_name(f"{state_file.name}.bak{i}")
-        if (state := _read_state_file(bak)) is not None:
-            return state, True
+    # The walk treats a missing main file like a corrupt one. A missing main file is not "no
+    # state": save_with_backup renames live -> .bak1 just before the new file lands, so a
+    # reader in that window must still find the backups. It reads bytes as UTF-8 (BOM
+    # allowed), writes nothing, and logs each copy it skips.
+    walk = read_json_walk(persona_dir / STATE_FILENAME, expect=dict, validate=_validate_state_data)
+    if walk.source is not None:
+        return _state_from_data(walk.data), walk.source != "main"
 
     if _newest_log_ts(persona_dir) is not None:
         from brain.felt_time import _replay_from_logs  # local import avoids cycle

@@ -324,6 +324,26 @@ def test_corrupt_state_with_no_baks_and_no_logs_cold_starts(tmp_path):
     assert loaded.anchors == {}
 
 
+def test_state_file_with_a_utf8_bom_loads_as_the_live_file(tmp_path):
+    """A BOM (an editor's or another OS's write) is not corruption: the live file wins, not an older backup."""
+    _persist_generations(tmp_path, [5.0, 7.0])  # main=7.0, .bak1=5.0
+    path = tmp_path / "felt_time_state.json"
+    path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+    loaded, recovered = load_or_recover(tmp_path)
+    assert loaded.lived_age_hours == 7.0
+    assert recovered is False
+
+
+def test_corrupt_state_restored_from_a_backup_is_logged(tmp_path, caplog):
+    """Falling back to an older copy is not silent: the unusable live file is reported."""
+    _persist_generations(tmp_path, [5.0, 7.0])
+    _corrupt(tmp_path / "felt_time_state.json")
+    with caplog.at_level("WARNING"):
+        loaded, _ = load_or_recover(tmp_path)
+    assert loaded.lived_age_hours == 5.0
+    assert any("felt_time_state.json" in r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+
+
 def test_corrupt_state_with_no_baks_replays_from_logs(tmp_path):
     _corrupt(tmp_path / "felt_time_state.json")
     _dream_log(tmp_path)
