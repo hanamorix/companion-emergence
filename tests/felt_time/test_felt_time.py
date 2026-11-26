@@ -587,3 +587,21 @@ def test_lived_age_survives_a_dream_logged_by_the_real_dream_writer(tmp_path):
     reloaded, recovered = load_or_recover(tmp_path)
     assert recovered is False
     assert reloaded.lived_age_hours == pytest.approx(ft.get_state().lived_age_hours)
+
+
+def test_a_log_row_with_a_non_string_ts_never_resets_lived_age(tmp_path):
+    """A row whose `ts` is a number must not become a saved anchor: the loader rejects a
+    non-string anchor ts as corrupt, so saving one would replay lived age from zero on
+    every load after it (cold review of #385)."""
+    saved = FeltTimeState(lived_age_hours=2.0, last_tick_ts=_T0, first_tick_ts="2026-09-30T10:00:00+00:00")
+    persist(saved, tmp_path)
+    (tmp_path / "growth.log.jsonl").write_text(json.dumps({"ts": 1767225600, "title": "t"}) + "\n", encoding="utf-8")
+
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:15:00+00:00"))
+    ticked = ft.get_state().lived_age_hours
+    assert ticked > 2.0
+
+    reloaded, recovered = load_or_recover(tmp_path)
+    assert recovered is False
+    assert reloaded.lived_age_hours == pytest.approx(ticked)

@@ -58,7 +58,9 @@ def extract_all(persona_dir: Path) -> list[Anchor]:
                 continue
             ts = entry.get(src.ts_key)
             label = entry.get(src.label_key)
-            if not ts or not label:
+            # A non-string ts cannot be ordered against ISO strings, and the state loader
+            # rejects a saved anchor whose ts is not a string, so such a row is skipped.
+            if not isinstance(ts, str) or not ts or not label:
                 continue
             anchors.append(
                 Anchor(
