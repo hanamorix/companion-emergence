@@ -534,8 +534,8 @@ RESEARCH_GATE_OPPOSING_CURVE: tuple[tuple[float, float], ...] = (
 # --- body energy as a carried level (#650, spec section 6) ----------------------------------------------------------------
 # Owner-set values, each tracked on #645. `BODY_ENERGY_BASELINE` is read by felt time's state default and the light level
 # accessor (`brain.felt_time.state`); every other `BODY_ENERGY_*` constant is read by the per-heartbeat step
-# (`brain.body.energy`) and its input gathering (`brain.body.energy_inputs`), and `BODY_STATS_BUSIEST_COUNT` has no reader yet
-# (the stats line, build step 6). Read at call time as `dev_constants.NAME`.
+# (`brain.body.energy`) and its input gathering (`brain.body.energy_inputs`); `BODY_STATS_BUSIEST_COUNT` is read by the stats
+# line writer (`brain.ingest.session_stats`). Read at call time as `dev_constants.NAME`.
 # The level a kindled starts at, and that the drift returns to.
 BODY_ENERGY_BASELINE: float = 6.5
 # The level is held to this range (the 1 to 10 scale).

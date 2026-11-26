@@ -589,7 +589,10 @@ def test_summary_only_carries_residual_raw_not_dropped(
             "residual raw turns were dropped — summary_only rollover data loss (r4)"
         )
         assert texts[1:] == ["fresh-user", "fresh-asst", *extra], "every residual raw row is carried, in order"
-        assert read_archive(persona_dir, old_sid) == [], "summary_only carries every raw row, so nothing is archived"
+        archived = read_archive(persona_dir, old_sid)
+        assert [r["type"] for r in archived] == ["session_stats"], (
+            "summary_only carries every raw row, so no turn is archived; the finished file gets only its stats row"
+        )
         # The summary still leads the seed (order preserved).
         assert texts[0] == "[folded]"
         assert old_sid not in list_active_sessions(persona_dir)
@@ -668,7 +671,8 @@ def test_persist_during_summary_only_rollover_window_not_orphaned(
 
 
 def _raw_texts(rows: list[dict]) -> list[str]:
-    return [r["text"] for r in rows if r.get("speaker") != "summary"]
+    # the stats row a finished file ends with (#650 step 6) is not a turn
+    return [r["text"] for r in rows if r.get("speaker") != "summary" and r.get("type") != "session_stats"]
 
 
 def _seed_556(persona_dir: Path, sid: str, *, aged: int = 0, recent: int = 60) -> list[str]:
@@ -1049,3 +1053,95 @@ def test_rollover_holds_buffer_append_lock_to_unlink_556(tmp_path: Path, monkeyp
     assert "RACED-556" not in _raw_texts(read_archive(persona_dir, sid))
 
 
+
+
+# --- the stats line at the end of a finished file (#650 step 6, spec section 5, A15) ---------------------------------
+
+
+def _assert_stats_row_last(archive: list[dict]) -> dict:
+    assert archive and archive[-1].get("type") == "session_stats", "the finished file ends with its stats row"
+    row = archive[-1]
+    assert list(row)[0] == "type", "the row is tagged at its front"
+    assert "speaker" not in row and "ts" not in row
+    assert set(row) == {"type", "avg_sitting_minutes", "busiest"}
+    assert not any(r.get("type") == "session_stats" for r in archive[:-1]), "one stats row"
+    return row
+
+
+def test_weekly_rollover_ends_the_old_archive_with_one_stats_row(tmp_path: Path) -> None:
+    """A15: the weekly rollover (tiers_plus_tail) appends one stats row last in the old session's archive; the 40 carried rows count in it."""
+    from brain.chat.session import reset_registry
+
+    reset_registry()
+    persona_dir = _persona(tmp_path)
+    sid = "sess_stats_weekly"
+    all_texts = _seed_556(persona_dir, sid)  # 60 turns a minute apart: one sitting of 59 minutes
+    try:
+        assert perform_rollover(persona_dir, sid, _PERSONA_NAME, seed_mode="tiers_plus_tail") is not None
+    finally:
+        reset_registry()
+    archive = read_archive(persona_dir, sid)
+    row = _assert_stats_row_last(archive)
+    assert _raw_texts(archive) == all_texts[:-40], "the stats row did not change which turns are archived"
+    assert row["avg_sitting_minutes"] == 59.0, "all 60 rows, the carried 40 included, are in the one sitting"
+    assert sum(len(v) for v in row["busiest"].values()) >= 1
+
+
+def test_stale_resume_rollover_gives_the_archive_only_its_stats_row(tmp_path: Path, monkeypatch) -> None:
+    """A15: a summary_only rollover (the stale-resume path) archives no turn and still finishes the file with a stats row."""
+    from brain.chat import rollover as rollover_mod
+    from brain.chat.session import reset_registry
+
+    reset_registry()
+    persona_dir = _persona(tmp_path)
+    old_sid = "sess_stats_stale"
+    monkeypatch.setattr(rollover_mod, "compact_conversation", lambda *a, **k: None)
+    base = datetime.now(UTC) - timedelta(days=2)
+    ingest_turn(persona_dir, {"session_id": old_sid, "speaker": "summary", "text": "[folded]"})
+    for i in range(4):
+        ingest_turn(
+            persona_dir,
+            {
+                "session_id": old_sid,
+                "speaker": "user" if i % 2 == 0 else "assistant",
+                "text": f"stale-{i}",
+                "ts": _iso(base + timedelta(minutes=10 * i)),
+            },
+        )
+    try:
+        new_sid = perform_rollover(persona_dir, old_sid, _PERSONA_NAME, seed_mode="summary_only", provider=None)
+    finally:
+        reset_registry()
+    assert new_sid is not None
+    archive = read_archive(persona_dir, old_sid)
+    row = _assert_stats_row_last(archive)
+    assert len(archive) == 1, "no turn was archived; the file holds only the stats row"
+    assert row["avg_sitting_minutes"] == 30.0  # four rows ten minutes apart: one sitting of 30 minutes
+
+
+def test_a_stats_write_failure_does_not_stop_the_rollover(tmp_path: Path, monkeypatch, caplog) -> None:
+    """A15 / 5.4: if the stats row cannot be written the error is logged with the session and the rollover completes."""
+    import logging
+
+    from brain.chat.session import reset_registry
+    from brain.ingest import session_stats
+
+    reset_registry()
+    persona_dir = _persona(tmp_path)
+    sid = "sess_stats_fail"
+    all_texts = _seed_556(persona_dir, sid)
+
+    def broken(*a, **k):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(session_stats, "append_archive", broken)
+    try:
+        with caplog.at_level(logging.ERROR, logger="brain.ingest.session_stats"):
+            new_sid = perform_rollover(persona_dir, sid, _PERSONA_NAME, seed_mode="tiers_plus_tail")
+    finally:
+        reset_registry()
+    assert new_sid is not None
+    assert not _old_path(persona_dir, sid).exists(), "the old buffer was still removed"
+    assert _raw_texts(read_session(persona_dir, new_sid)) == all_texts[-40:]
+    assert not any(r.get("type") == "session_stats" for r in read_archive(persona_dir, sid))
+    assert any(sid in rec.getMessage() for rec in caplog.records), "the failure is logged with the session"

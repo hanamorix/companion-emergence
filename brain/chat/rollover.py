@@ -57,6 +57,7 @@ from brain.ingest.buffer import (
     write_cursor,
     write_rolled_to,
 )
+from brain.ingest.session_stats import append_session_stats
 
 logger = logging.getLogger(__name__)
 
@@ -345,6 +346,9 @@ def perform_rollover(
             # retry-looping) unlink out of the registry lock avoids stalling registry ops on
             # other sessions; the old buffer's own append lock is still held, so an appender
             # that bypasses the registry waits for the unlink instead of racing it.
+            # The old conversation file is finished: its stats row goes to the end of its archive. The one writer logs and
+            # returns on a failure (spec 5.4: the rollover completes without the row), so this cannot stop the reap below.
+            append_session_stats(persona_dir, old_sid, turns)
             delete_session_buffer(persona_dir, old_sid)
             delete_cursor(persona_dir, old_sid)
             delete_backoff(persona_dir, old_sid)
