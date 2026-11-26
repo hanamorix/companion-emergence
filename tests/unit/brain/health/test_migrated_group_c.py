@@ -249,6 +249,11 @@ def test_group_c_default_readers_fall_back_on_an_io_fault(tmp_path: Path, caplog
     assert count_recent(pd) == {}
 
 
+@pytest.mark.no_base_failure(
+    reason="the test only lost its second half (the count_words_in_session check, deleted with brain/body/words.py); "
+    "the build_monologue_entries bad-line assertions are byte-for-byte the ones the base test already made, and that "
+    "feed code is untouched by this branch, so the renamed test passes on the base"
+)
 def test_group_c_feed_monologue_survives_bad_lines(tmp_path: Path) -> None:
     from brain.bridge.feed import build_monologue_entries
 
