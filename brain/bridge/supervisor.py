@@ -1874,15 +1874,26 @@ def _run_felt_time_tick(
     cannot cascade into bridge shutdown or take down the heartbeat loop.
     """
     drivers = _derive_intensity_drivers(persona_dir, chat_turns_since_last, wall_clock_s_since_last)
+    from brain.body.energy_inputs import gather_energy_inputs
+
     ft = FeltTime(persona_dir=persona_dir)
+    now = datetime.now(UTC)
+    # The body energy step's inputs (#650, spec 2.4), gathered here and stepped inside `tick`. The interval starts at the
+    # saved `last_tick_ts`, which `tick` overwrites, so it is read first.
+    energy = gather_energy_inputs(
+        persona_dir,
+        interval_start=ft.interval_start(now, wall_clock_s_since_last),
+        now=now,
+    )
     ft.tick(
         TickContext(
-            now_iso=datetime.now(UTC).isoformat(),
+            now_iso=now.isoformat(),
             heartbeats_in_tick=heartbeats_since_last,
             chat_turns_in_tick=chat_turns_since_last,
             reflex_firings_in_tick=reflex_firings_since_last,
             wall_clock_s_in_tick=wall_clock_s_since_last,
             drivers=drivers,
+            energy=energy,
         )
     )
     from brain.felt_time.chat_log import append_chat_tick

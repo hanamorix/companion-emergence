@@ -153,6 +153,9 @@ def test_supervisor_invokes_felt_time_tick_on_heartbeat_cadence(
         def __init__(self, *, persona_dir: Path) -> None:
             tick_calls.append(("init", persona_dir))
 
+        def interval_start(self, now, wall_clock_s: float):
+            return now
+
         def tick(self, ctx: object) -> None:
             tick_calls.append(("tick", ctx))
 
@@ -214,6 +217,9 @@ def test_supervisor_felt_time_tick_fault_isolated(
     class _ExplodingFeltTime:
         def __init__(self, *, persona_dir: Path) -> None:
             pass
+
+        def interval_start(self, now, wall_clock_s: float):
+            return now
 
         def tick(self, ctx: object) -> None:
             raise RuntimeError("felt-time tick exploded")
@@ -311,6 +317,7 @@ def test_run_felt_time_tick_appends_chat_log(tmp_path: Path, monkeypatch: pytest
     from brain.felt_time.chat_log import CHAT_TURNS_LOG_FILENAME
 
     monkeypatch.setattr("brain.bridge.supervisor.FeltTime", MagicMock())
+    monkeypatch.setattr("brain.body.energy_inputs.gather_energy_inputs", MagicMock())
 
     _run_felt_time_tick(
         tmp_path,
@@ -325,6 +332,41 @@ def test_run_felt_time_tick_appends_chat_log(tmp_path: Path, monkeypatch: pytest
     import json as _json
     row = _json.loads(log_path.read_text().strip())
     assert row["turns"] == 4
+
+
+def test_run_felt_time_tick_steps_body_energy_from_the_interval_and_saves_it(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    """The through-path (#650 spec 1.2, 2.4): a message in the interval and a saved feeling reach the persisted level."""
+    import json as _json
+    from datetime import UTC, datetime, timedelta
+
+    from brain.bridge.supervisor import _run_felt_time_tick
+    from brain.emotion.engine import Reading
+    from brain.ingest.buffer import ingest_turn
+
+    emotion_engine_stub.readings = {"joy": Reading(short=3.0, long=3.0, difference=0.0, shift=0)}
+    ingest_turn(
+        tmp_path,
+        {
+            "session_id": "sess_a",
+            "speaker": "assistant",
+            "text": "a few words in a reply",
+            "ts": (datetime.now(UTC) - timedelta(seconds=100)).isoformat(),
+        },
+    )
+    _run_felt_time_tick(
+        tmp_path,
+        wall_clock_s_since_last=900.0,
+        heartbeats_since_last=1,
+        chat_turns_since_last=1,
+        reflex_firings_since_last=0,
+    )
+    saved = _json.loads((tmp_path / "felt_time_state.json").read_text())
+    # Her only message: length factor 1, speaker weight 1, X = 0 (no saved feelings): the base cost at 6.5.
+    assert saved["energy_level"] == pytest.approx(6.5 - 0.375 * (5.0 / 6.5), abs=1e-9)
+    assert saved["energy_feelings"] == {"joy": 3.0}
+    assert saved["energy_long_weight"] == 1.0
 
 
 def test_derive_intensity_drivers_chat_activity_uses_rolling_baseline(tmp_path: Path) -> None:

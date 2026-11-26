@@ -536,10 +536,10 @@ RESEARCH_GATE_OPPOSING_CURVE: tuple[tuple[float, float], ...] = (
 BODY_ENERGY_HIGH_COUNT: int = 6
 
 # --- body energy as a carried level (#650, spec section 6) ----------------------------------------------------------------
-# Owner-set values, each tracked on #645. `BODY_ENERGY_BASELINE` is read now (felt time's state default and the light level
-# accessor, `brain.felt_time.state`); every other constant below has no reader yet: the per-heartbeat step function and its
-# input gathering (a later #650 step, build step 3) read them, and `BODY_STATS_BUSIEST_COUNT` is read by the stats line (build
-# step 6). Read at call time as `dev_constants.NAME`.
+# Owner-set values, each tracked on #645. `BODY_ENERGY_BASELINE` is read by felt time's state default and the light level
+# accessor (`brain.felt_time.state`); every other `BODY_ENERGY_*` constant is read by the per-heartbeat step
+# (`brain.body.energy`) and its input gathering (`brain.body.energy_inputs`), and `BODY_STATS_BUSIEST_COUNT` has no reader yet
+# (the stats line, build step 6). Read at call time as `dev_constants.NAME`.
 # The level a kindled starts at, and that the drift returns to.
 BODY_ENERGY_BASELINE: float = 6.5
 # The level is held to this range (the 1 to 10 scale).
@@ -554,6 +554,9 @@ BODY_ENERGY_HER_MESSAGE_WEIGHT: float = 1.0
 BODY_ENERGY_USER_MESSAGE_WEIGHT: float = 0.5
 # The drift toward the baseline, per heartbeat before the funnel; the value assumes the 900 s heartbeat (96 steps are 24 hours).
 BODY_ENERGY_DRIFT_STEP: float = 0.0985
+# The length of one heartbeat in seconds, the unit the energy step counts closed time in (every whole interval since the last
+# saved step is one heartbeat). It is the supervisor's `heartbeat_interval_s` default, and the drift step above assumes it.
+BODY_ENERGY_HEARTBEAT_S: float = 900.0
 # The share of a message's excess length (over her average for that speaker) that counts.
 BODY_ENERGY_LENGTH_EXCESS_SHARE: float = 0.5
 # A mean of long averages below this counts as this (the "used to negative feelings" ratio).

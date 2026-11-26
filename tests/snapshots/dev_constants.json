@@ -11,6 +11,7 @@
   "BODY_ENERGY_DRAIN_FEELINGS": "('grief', 'memory_grief', 'shame', 'guilt', 'loneliness', 'jealousy', 'touch_hunger', 'rest_need')",
   "BODY_ENERGY_DRIFT_STEP": "0.0985",
   "BODY_ENERGY_FUNNEL_PIVOT": "5.0",
+  "BODY_ENERGY_HEARTBEAT_S": "900.0",
   "BODY_ENERGY_HER_MESSAGE_WEIGHT": "1.0",
   "BODY_ENERGY_HIGH_COUNT": "6",
   "BODY_ENERGY_LENGTH_EXCESS_SHARE": "0.5",
