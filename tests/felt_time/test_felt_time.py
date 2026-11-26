@@ -270,6 +270,13 @@ _EVENT_SOURCES = {
 }
 _T0 = "2026-10-01T10:00:00+00:00"  # last tick of the saved state
 
+_REAL_ROW_ON_BASE = (
+    "pins the dream row the real writer puts on disk today (timestamp, no ts), which main ignores; it goes red if main's staleness check returns with a reader that sees timestamp (the #676-before-#385 order)"
+)
+_HOLDS_ON_BASE = (
+    "pins behaviour main already has (its timestamp fold or replay path gives the same result); guards that this PR's position-based arc fold and kept saved state do not break it"
+)
+
 
 def _append_event(persona_dir: Path, kind: str, label: str, ts: str) -> None:
     filename, label_key = _EVENT_SOURCES[kind]
@@ -350,6 +357,7 @@ def test_saved_state_preserved_across_anchor_event(tmp_path, kind):
     assert loaded.arc_anchors == saved.arc_anchors
 
 
+@pytest.mark.no_base_failure(reason=_HOLDS_ON_BASE)
 def test_saved_state_preserved_across_arc_event_control(tmp_path):
     """arcs.log.jsonl is not in LOG_SOURCES, so this never reset; control for C2."""
     saved = _rich_saved_state(tmp_path, saved_only="soul")
@@ -386,6 +394,7 @@ def test_tick_folds_newer_anchor_into_preserved_state(tmp_path, kind):
     assert persisted["anchors"][kind]["label"] == "new event"
 
 
+@pytest.mark.no_base_failure(reason=_HOLDS_ON_BASE)
 def test_tick_folds_newer_arc_event_exactly_once(tmp_path):
     _rich_saved_state(tmp_path, saved_only="soul")
     _write_arc_event(tmp_path, "arc_opened", "Thread A", "2026-10-01T10:30:00+00:00")
@@ -479,6 +488,7 @@ def test_arc_fold_in_from_previously_persisted_state_adds_only_unfolded(tmp_path
     ]
 
 
+@pytest.mark.no_base_failure(reason=_HOLDS_ON_BASE)
 def test_arc_cap_is_stable_and_idempotent_across_ticks(tmp_path):
     """C12: 25 arc events; first tick keeps the 20 most recent; later ticks do not
     re-add the 5 evicted ones."""
@@ -496,6 +506,7 @@ def test_arc_cap_is_stable_and_idempotent_across_ticks(tmp_path):
         assert [a.label for a in ft.get_state().arc_anchors] == first
 
 
+@pytest.mark.no_base_failure(reason=_HOLDS_ON_BASE)
 def test_event_stamped_exactly_at_last_tick_is_not_folded_again(tmp_path):
     """The anchor scan is strictly newer than the last tick: a row stamped at the
     last tick was already seen by that tick and must not reset pressure again."""
@@ -508,6 +519,7 @@ def test_event_stamped_exactly_at_last_tick_is_not_folded_again(tmp_path):
     assert ft.get_state().pressure.heartbeats == 1
 
 
+@pytest.mark.no_base_failure(reason=_HOLDS_ON_BASE)
 def test_arc_event_newer_than_last_tick_resets_pressure(tmp_path):
     """Unchanged rule, pinned: an arc event stamped after the last tick is a new anchor
     and zeroes pressure like any other anchor."""
@@ -541,6 +553,7 @@ def test_arc_cap_evicts_by_log_order_even_when_timestamps_disagree(tmp_path):
     assert [a.label for a in ft.get_state().arc_anchors] == first
 
 
+@pytest.mark.no_base_failure(reason=_REAL_ROW_ON_BASE)
 def test_lived_age_survives_a_dream_logged_by_the_real_dream_writer(tmp_path):
     """#385 review step 4: the other #384 tests hand-write `ts` rows in the shape the reader
     expects; this one lets `DreamEngine` write the row exactly as it does on disk today, then
@@ -607,6 +620,7 @@ def test_a_log_row_with_a_non_string_ts_never_resets_lived_age(tmp_path):
     assert reloaded.lived_age_hours == pytest.approx(ticked)
 
 
+@pytest.mark.no_base_failure(reason=_HOLDS_ON_BASE)
 def test_nul_repair_of_the_arc_log_does_not_fold_an_arc_twice(tmp_path):
     """#618's one-time repair restores a record a NUL run swallowed, which shifts the log
     positions of the rows after it. An arc already folded must not be folded again at its

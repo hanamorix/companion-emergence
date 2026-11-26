@@ -10,6 +10,10 @@ from brain.felt_time.state import (
     persist,
 )
 
+_LOAD_HOLDS_ON_BASE = (
+    "pins load behaviour main already has (cold start, replay, read-only, tolerant fields); guards that the backup walk and stricter validation keep it"
+)
+
 
 def test_felt_time_state_cold_start_defaults():
     s = FeltTimeState.cold_start()
@@ -108,6 +112,7 @@ def test_saved_state_with_no_last_tick_is_loaded_not_replayed(tmp_path):
     assert loaded.replayed is False
 
 
+@pytest.mark.no_base_failure(reason=_LOAD_HOLDS_ON_BASE)
 def test_missing_state_file_with_logs_replays(tmp_path):
     (tmp_path / "dreams.log.jsonl").write_text(
         '{"ts": "2026-05-17T21:00:00+00:00", "summary": "from the log"}\n'
@@ -119,6 +124,7 @@ def test_missing_state_file_with_logs_replays(tmp_path):
     assert loaded.anchors["dream"].label == "from the log"
 
 
+@pytest.mark.no_base_failure(reason=_LOAD_HOLDS_ON_BASE)
 def test_read_paths_never_write_after_a_replay(tmp_path):
     """C13: a reader that lands on a missing state file (e.g. the save-time rotation
     window) gets a replayed 0.0 in memory only. Nothing is written, so it can never
@@ -316,6 +322,7 @@ def test_corrupt_state_with_all_baks_bad_replays_from_logs(tmp_path):
     assert loaded.anchors["dream"].label == "from the log"
 
 
+@pytest.mark.no_base_failure(reason=_LOAD_HOLDS_ON_BASE)
 def test_corrupt_state_with_no_baks_and_no_logs_cold_starts(tmp_path):
     _corrupt(tmp_path / "felt_time_state.json")
     loaded, recovered = load_or_recover(tmp_path)
@@ -369,7 +376,7 @@ _WRONG_TYPED = [
     {"last_tick_ts": "garbage"},
     {"first_tick_ts": "garbage"},
     {"lived_age_hours": True},
-    {"lived_age_hours": "5"},
+    pytest.param({"lived_age_hours": "5"}, marks=pytest.mark.no_base_failure(reason=_LOAD_HOLDS_ON_BASE)),
     {"lived_age_hours": -5.0},
     {"lived_age_hours": 1e999},  # JSON parses this to inf
     {"lived_age_hours": 10**400},  # float() overflows
@@ -406,6 +413,7 @@ def test_wrong_typed_field_without_baks_falls_back_to_logs_or_cold_start(tmp_pat
     assert loaded.replayed is True and recovered is True
 
 
+@pytest.mark.no_base_failure(reason=_LOAD_HOLDS_ON_BASE)
 def test_wrong_typed_field_with_newer_log_row_does_not_raise(tmp_path):
     """The regression the #384 fix would otherwise introduce: before it, a newer log
     row sent a parseable-but-wrong-typed file to replay; the fix removed that bypass,
@@ -419,6 +427,7 @@ def test_wrong_typed_field_with_newer_log_row_does_not_raise(tmp_path):
     assert recovered is True and loaded.lived_age_hours == 0.0
 
 
+@pytest.mark.no_base_failure(reason=_LOAD_HOLDS_ON_BASE)
 def test_corrupt_paths_write_nothing(tmp_path):
     """C13 extended: the .bak walk and the replay fallback are read-only. Every file,
     including the corrupt ones and the backups, is byte-identical afterwards."""
@@ -461,6 +470,7 @@ def test_deeply_nested_json_state_is_corrupt_not_a_raise(tmp_path):
     assert loaded.lived_age_hours == 5.0
 
 
+@pytest.mark.no_base_failure(reason=_LOAD_HOLDS_ON_BASE)
 def test_tolerant_reader_still_loads_unknown_and_missing_fields(tmp_path):
     """#286 tolerance preserved by the stricter validation: unknown extra keys load, missing optional keys default."""
     persist(FeltTimeState(lived_age_hours=4.0, last_tick_ts="2026-05-17T20:00:00+00:00"), tmp_path)
@@ -510,6 +520,7 @@ def test_missing_state_walks_past_a_bad_bak1(tmp_path):
     assert loaded.lived_age_hours == 3.0
 
 
+@pytest.mark.no_base_failure(reason=_LOAD_HOLDS_ON_BASE)
 def test_missing_state_with_all_baks_bad_replays_from_logs(tmp_path):
     _persist_generations(tmp_path, [3.0, 5.0, 7.0])
     (tmp_path / "felt_time_state.json").unlink()
@@ -522,6 +533,7 @@ def test_missing_state_with_all_baks_bad_replays_from_logs(tmp_path):
     assert loaded.anchors["dream"].label == "from the log"
 
 
+@pytest.mark.no_base_failure(reason=_LOAD_HOLDS_ON_BASE)
 def test_brand_new_persona_without_backups_is_unchanged(tmp_path):
     loaded, recovered = load_or_recover(tmp_path)  # nothing at all
     assert (loaded.lived_age_hours, recovered, loaded.replayed) == (0.0, True, False)
@@ -531,6 +543,7 @@ def test_brand_new_persona_without_backups_is_unchanged(tmp_path):
     assert loaded.anchors["dream"].label == "from the log"
 
 
+@pytest.mark.no_base_failure(reason=_LOAD_HOLDS_ON_BASE)
 def test_missing_state_walk_writes_nothing(tmp_path):
     from brain.felt_time import FeltTime
     from brain.felt_time.tool import felt_time_now
