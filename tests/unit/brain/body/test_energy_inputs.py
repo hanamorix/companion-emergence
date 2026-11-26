@@ -188,6 +188,24 @@ def test_an_unreadable_buffer_costs_only_its_own_rows(tmp_path, emotion_engine_s
     assert any("sess_bad" in r.getMessage() for r in caplog.records)
 
 
+def test_an_unreadable_archive_file_costs_only_its_own_rows(tmp_path, emotion_engine_stub, caplog, monkeypatch):
+    _archive(tmp_path, [_row("user", 10, _ago(days=3), session="sess_good")], session="sess_good")
+    _archive(tmp_path, [_row("user", 1000, _ago(days=3), session="sess_bad")], session="sess_bad")
+    real = energy_inputs.iter_jsonl
+
+    def flaky(path, *args, **kwargs):
+        if path.name.startswith("sess_bad"):
+            raise OSError("sharing violation")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(energy_inputs, "iter_jsonl", flaky)
+    _say(tmp_path, "user", 20, START + timedelta(seconds=10))
+    with caplog.at_level(logging.WARNING):
+        inputs = _gather(tmp_path)
+    assert _lf(inputs) == [(0.5, 1.5)]  # 20 / 10 = 2 (the bad file's 1000 words are not in the average)
+    assert any("sess_bad" in r.getMessage() for r in caplog.records)
+
+
 def test_a_row_with_text_that_is_not_a_string_or_a_time_that_does_not_parse_is_skipped(tmp_path, emotion_engine_stub):
     path = tmp_path / "active_conversations"
     path.mkdir()

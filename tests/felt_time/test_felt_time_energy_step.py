@@ -47,11 +47,19 @@ def _saved(persona_dir: Path) -> dict:
     return json.loads((persona_dir / "felt_time_state.json").read_text())
 
 
-def test_a_fresh_kindled_and_an_old_file_start_at_the_baseline(tmp_path):
+def test_a_fresh_kindled_and_a_file_from_before_the_fields_start_at_the_baseline(tmp_path):
     ft = FeltTime(persona_dir=tmp_path)
     assert ft.get_state().energy_level == 6.5
     ft.tick(_ctx(T0, _inputs(ft.interval_start(T0, 900.0))))
     assert ft.get_state().energy_level == 6.5  # no messages, at the baseline: the drift is 0
+    # A file written before #650 has none of the four fields.
+    path = tmp_path / "felt_time_state.json"
+    data = json.loads(path.read_text())
+    for key in ("energy_level", "energy_long_avg", "energy_long_weight", "energy_feelings"):
+        data.pop(key, None)
+    path.write_text(json.dumps(data))
+    old = FeltTime(persona_dir=tmp_path).get_state()
+    assert (old.energy_level, old.energy_long_weight, old.energy_feelings) == (6.5, 0.0, None)
 
 
 def test_the_step_is_saved_with_the_tick_and_survives_a_reload(tmp_path):

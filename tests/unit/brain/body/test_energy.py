@@ -153,6 +153,16 @@ def test_the_hold_is_applied_once_to_the_sum_not_to_each_term():
     assert result == 1.0
 
 
+def test_a_sum_that_would_dip_below_one_in_the_middle_is_not_held_there():
+    # Messages alone (-4.6875) would take 1.2 below 1, the mood (+9.0 at V_lift 100) brings it back well above: one hold on
+    # the sum leaves the exact sum; a hold after the messages would give 1.0 first and end at the 10 cap.
+    drift = 0.0985 * energy.rise(1.2)
+    result = _step(
+        1.2, short={"joy": 10.0}, high={"joy"}, messages=[HER] * 3, multipliers=UsedTo(v_lift=100.0)
+    )
+    assert result == pytest.approx(1.2 + 9.0 - 3 * 0.375 * energy.drop(1.2) + drift, abs=1e-9)
+
+
 def test_the_level_stays_on_the_scale_and_a_stored_level_off_the_scale_is_held_first():
     assert _step(50.0, short={"joy": 9.0}, high={"joy"}) <= 10.0
     assert _step(0.0, messages=[HER]) == 1.0  # no division by zero in the funnel

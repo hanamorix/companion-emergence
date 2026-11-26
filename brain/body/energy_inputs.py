@@ -19,6 +19,9 @@ from brain.utils.time import lenient_utc
 
 logger = logging.getLogger(__name__)
 
+# The speakers whose rows are messages: hers and the user's (image and summary rows are not).
+_SPEAKERS = ("assistant", "user")
+
 
 @dataclass(frozen=True)
 class _Row:
@@ -37,7 +40,7 @@ def _row_of(raw: dict) -> _Row | None:
     speaker = raw.get("speaker")
     text = raw.get("text")
     ts = lenient_utc(raw.get("ts"))
-    if speaker not in _speaker_weights() or not isinstance(text, str) or ts is None:
+    if speaker not in _SPEAKERS or not isinstance(text, str) or ts is None:
         return None
     return _Row(ts=ts, speaker=speaker, words=len(text.split()), identity=turn_identity(raw))
 
