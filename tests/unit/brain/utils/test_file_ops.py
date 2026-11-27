@@ -472,13 +472,29 @@ def test_stat_path_key_equals_the_key_read_bytes_stat_returns(tmp_path: Path) ->
     assert changed is not None and changed.key != st.key
 
 
+_REAL_STAT = os.stat
+
+
+@pytest.fixture
+def os_stat_restored_before_teardown():
+    """#814: the conftest's autouse fixtures take ``monkeypatch``, so it is undone after every later fixture's teardown.
+    A process-wide ``os.stat`` patch left on ``monkeypatch`` itself therefore breaks those teardowns (Windows CI errored on
+    one). This fixture is set up after ``monkeypatch``, so it tears down while such a patch would still be on."""
+    yield
+    if os.stat is not _REAL_STAT:
+        raise AssertionError("os.stat is still patched at teardown; patch it inside monkeypatch.context() instead")
+
+
 @pytest.mark.parametrize("error", [PermissionError(13, "denied"), OSError(5, "I/O error")])
-def test_stat_path_raises_an_error_other_than_missing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: OSError) -> None:
+def test_stat_path_raises_an_error_other_than_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: OSError, os_stat_restored_before_teardown: None
+) -> None:
     def broken(path, *args, **kwargs):
         raise error
 
-    monkeypatch.setattr(os, "stat", broken)
-    with pytest.raises(type(error)):
+    # Undone before the call ends: a patch left on `monkeypatch` stays on through the later fixtures' teardowns (#814).
+    with monkeypatch.context() as scoped, pytest.raises(type(error)):
+        scoped.setattr(os, "stat", broken)
         file_ops.stat_path(tmp_path)
 
 
