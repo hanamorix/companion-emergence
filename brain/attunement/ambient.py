@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from brain import dev_constants
+from brain.attunement.schemas import LearnedPattern
 from brain.attunement.store import read_current_read, read_learned_patterns
 
 _ATTUNEMENT_RENDER_CAP = 8
@@ -37,6 +38,20 @@ def _is_addressed_recently(last_addressed_at: str | None) -> bool:
         return False
     now = datetime.now(UTC)
     return (now - addressed).total_seconds() < dev_constants.ATTUNEMENT_ADDRESS_COOLDOWN_HOURS * 3600
+
+
+def select_surfaceable_patterns(patterns: list[LearnedPattern]) -> list[LearnedPattern]:
+    """The learned patterns her prompt block can show: forming or known, not addressed within the cooldown, known first
+    then by evidence count, at most `_ATTUNEMENT_RENDER_CAP`. The one selection used by both the prompt block and the
+    attunement detector's live call (#830), so the detector is offered the ids of the patterns she could have named."""
+    surfaceable = [
+        p for p in patterns
+        if p.maturity in {"forming", "known"}
+        and not _is_addressed_recently(p.last_addressed_at)
+    ]
+    _maturity_rank = {"known": 0, "forming": 1}
+    surfaceable.sort(key=lambda p: (_maturity_rank.get(p.maturity, 9), -p.evidence_count))
+    return surfaceable[:_ATTUNEMENT_RENDER_CAP]
 
 
 def build_attunement_block(persona_dir: Path) -> str:
@@ -68,14 +83,7 @@ def build_attunement_block(persona_dir: Path) -> str:
         if read.predicted_arc_shape:
             lines.append(f"Where this seems to be heading: {read.predicted_arc_shape}")
 
-    surfaceable = [
-        p for p in patterns
-        if p.maturity in {"forming", "known"}
-        and not _is_addressed_recently(p.last_addressed_at)
-    ]
-    _maturity_rank = {"known": 0, "forming": 1}
-    surfaceable.sort(key=lambda p: (_maturity_rank.get(p.maturity, 9), -p.evidence_count))
-    surfaceable = surfaceable[:_ATTUNEMENT_RENDER_CAP]
+    surfaceable = select_surfaceable_patterns(patterns)
     if surfaceable:
         if lines:
             lines.append("")

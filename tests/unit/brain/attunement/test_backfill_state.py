@@ -174,6 +174,7 @@ def test_run_backfill_default_detector_threads_identity(tmp_path: Path):
     assert captured, "expected the default detector closure to be invoked"
     assert captured[0]["companion_name"] == tmp_path.name
     assert captured[0]["user_name"] == "Alex"
+    assert "shown_patterns" not in captured[0]  # #830: the backfill replays old turns and is offered no list
 
 
 def test_run_backfill_does_not_complete_when_every_detector_call_errors(tmp_path: Path):
