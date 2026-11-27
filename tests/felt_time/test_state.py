@@ -370,13 +370,16 @@ _WRONG_TYPED = [
     {"arc_anchors": "x"},
     {"horizon_pressure": {"week": 5}},
     {"horizon_pressure": [1]},
+    {"horizon_pressure": "x"},
+    {"anchors": "x"},
+    {"anchors": 5},
     {"last_tick_ts": 12345},
     {"weather_baselines": [1]},
     {"first_tick_ts": 7},
     {"last_tick_ts": "garbage"},
     {"first_tick_ts": "garbage"},
     {"lived_age_hours": True},
-    pytest.param({"lived_age_hours": "5"}, marks=pytest.mark.no_base_failure(reason=_LOAD_HOLDS_ON_BASE)),
+    {"lived_age_hours": "9"},  # differs from .bak1 (5.0), so accepting the string would fail the test
     {"lived_age_hours": -5.0},
     {"lived_age_hours": 1e999},  # JSON parses this to inf
     {"lived_age_hours": 10**400},  # float() overflows
@@ -399,6 +402,25 @@ def test_wrong_typed_field_is_corrupt_not_a_raise(tmp_path, bad):
     (tmp_path / "felt_time_state.json").write_text(json.dumps(data))
     loaded, _ = load_or_recover(tmp_path)  # must not raise
     assert loaded.lived_age_hours == 5.0
+
+
+@pytest.mark.parametrize("exc", [AttributeError, KeyError])
+def test_a_bug_in_the_state_builder_raises_not_resets(tmp_path, monkeypatch, exc):
+    """A bug inside _state_from_data must not read as "every copy is corrupt".
+
+    If the validator turned it into TypeError, main and every backup would be rejected
+    the same way and the loader would replay from lived age 0.0 (the #384 symptom).
+    """
+    import brain.felt_time.state as state_mod
+
+    _persist_generations(tmp_path, [5.0, 7.0])
+
+    def buggy(_state):
+        raise exc("a bug in the builder")
+
+    monkeypatch.setattr(state_mod, "_validate_state", buggy)
+    with pytest.raises(exc):
+        load_or_recover(tmp_path)
 
 
 def test_wrong_typed_field_without_baks_falls_back_to_logs_or_cold_start(tmp_path):

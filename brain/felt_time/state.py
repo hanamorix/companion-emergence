@@ -156,17 +156,24 @@ def _validate_state(state: FeltTimeState) -> None:
             raise TypeError("period_start_ts is not a string")
 
 
-def _state_from_data(data: object) -> FeltTimeState:
-    """Build a FeltTimeState from parsed JSON. Raises ValueError, TypeError,
-    AttributeError or KeyError when the data is not a well-typed state (a wrong-typed
-    field counts as corrupt). Pure: touches no files."""
-    if not isinstance(data, dict):
-        raise TypeError("felt-time state is not a JSON object")
-    weather_baselines = data.get("weather_baselines") or {}
-    if not isinstance(weather_baselines, dict):
-        raise TypeError("weather_baselines is not an object")
+def _object(value: object, key: str) -> dict:
+    """`value` as a JSON object, or TypeError naming `key` (a wrong shape counts as corrupt)."""
+    if not isinstance(value, dict):
+        raise TypeError(f"{key} is not an object")
+    return value
 
-    raw_hp = data.get("horizon_pressure") or {}
+
+def _state_from_data(data: object) -> FeltTimeState:
+    """Build a FeltTimeState from parsed JSON. Raises ValueError or TypeError when the
+    data is not a well-typed state (a wrong-typed field counts as corrupt); every shape
+    is checked here, so any other exception is a bug in this code and propagates.
+    Pure: touches no files."""
+    data = _object(data, "felt-time state")
+    weather_baselines = _object(data.get("weather_baselines") or {}, "weather_baselines")
+
+    raw_hp = _object(data.get("horizon_pressure") or {}, "horizon_pressure")
+    for k, v in raw_hp.items():
+        _object(v, f"horizon_pressure[{k!r}]")
     horizon_pressure = {
         k: HorizonBucket(
             counters=from_known_fields(PressureCounters, v.get("counters") or {}),
@@ -177,9 +184,12 @@ def _state_from_data(data: object) -> FeltTimeState:
     }
 
     raw_arcs = data.get("arc_anchors") or []
+    if not isinstance(raw_arcs, list):
+        raise TypeError("arc_anchors is not a list")
     arc_anchors = [from_known_fields(Anchor, a) for a in raw_arcs]
 
-    anchors = {k: from_known_fields(Anchor, v) for k, v in (data.get("anchors") or {}).items()}
+    raw_anchors = _object(data.get("anchors") or {}, "anchors")
+    anchors = {k: from_known_fields(Anchor, v) for k, v in raw_anchors.items()}
 
     # Seed arc_anchors from anchors["arc"] when upgrading from old state format.
     if not arc_anchors and "arc" in anchors:
@@ -205,12 +215,14 @@ def _validate_state_data(data: object) -> None:
     """`read_json_walk`'s validator: raise ValueError/TypeError unless `data` builds a well-typed state.
 
     The walk counts only those two as "this copy is bad" and lets anything else propagate as a validator
-    bug, so the other ways a wrong shape fails `_state_from_data` (`.get` on a non-object, an int too
-    large for a float) are converted here.
+    bug. `_state_from_data` checks every shape itself, so only the two errors a wrong value can still
+    raise there (an int too large for a float, nesting too deep) are converted here. An AttributeError
+    or KeyError is a bug in the builder and must propagate: converting it would reject main and every
+    backup alike and replay from lived age 0.0 (#384).
     """
     try:
         _state_from_data(data)
-    except (AttributeError, KeyError, OverflowError, RecursionError) as exc:
+    except (OverflowError, RecursionError) as exc:
         raise TypeError(f"felt-time state has the wrong shape: {exc!r}") from exc
 
 
