@@ -867,12 +867,10 @@ def test_a_failed_recall_tick_does_not_cost_the_dream(
     assert engine.log_path.exists()
 
 
-@pytest.mark.no_base_failure(
-    reason="pins that an auto-picked seed still doesn't tick while its neighbours tick once (#587 left that as main has it)"
-)
-def test_an_auto_picked_seed_is_not_ticked_but_its_neighbours_are(
+def test_an_auto_picked_seed_is_ticked_once_like_its_neighbours(
     engine: DreamEngine, store: MemoryStore, hebbian: HebbianMatrix
 ) -> None:
+    """#717: the seed the engine picks for itself was in front of her as much as one asked for by id."""
     seed = _mem("seed", importance=8.0)
     neighbour = _mem("neighbour", importance=4.0)
     store.create(seed)
@@ -882,4 +880,19 @@ def test_an_auto_picked_seed_is_not_ticked_but_its_neighbours_are(
     result = engine.run_cycle()
 
     assert result.seed.id == seed.id and result.dream_text is not None
-    assert _ticks(store, seed.id, neighbour.id) == [(0.0, False), (1.0, True)]
+    assert _ticks(store, seed.id, neighbour.id) == [(1.0, True), (1.0, True)]
+
+
+def test_an_auto_picked_grief_seed_is_ticked_once(engine: DreamEngine, store: MemoryStore) -> None:
+    """#717: a grief_event the engine picks as its seed counts like any other seed (owner ruling, 2026-11-27)."""
+    for i in range(3):
+        store.create(_mem(f"sad {i}", importance=1.0, emotions={"grief": 6.0}))
+    loss = _mem(
+        "the loss", importance=1.0, emotions={"memory_grief": 6.0, "grief": 5.0}, memory_type="grief_event", domain="grief"
+    )
+    store.create(loss)
+
+    result = engine.run_cycle()
+
+    assert result.seed.id == loss.id and result.dream_text is not None
+    assert _ticks(store, loss.id) == [(1.0, True)]
