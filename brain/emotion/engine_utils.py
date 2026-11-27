@@ -885,10 +885,9 @@ def close_days(state: EngineState, t: datetime) -> None:
     Accepted edges (`docs/source-spec/2026-10-28-emotion-rework-ThinkerOfThoughts-half-design.md` section 6):
 
     * A system clock set forward and then corrected: this function closes the open day and sets `active_day` to the far-future
-      day, and then day closes stop until real time reaches that day, so the shift stays frozen at its last value and, with
-      no day closing, the change-log files the drain would delete pile up. The deletion half belongs to the drain (it
-      anchors on the active day as it stood before its closes). The open design call, telling a corrected clock from a long
-      absence, needs a chosen number or a new rule; it is tracked in #660.
+      day, as it would after a long absence (the two look the same here). The drain's rewind brings it back once the clock is
+      corrected (`rewind_future_day`, #660, `docs/source-spec/2026-11-27-660-clock-forward-unfreeze-design.md`); the jump itself
+      is not undone: the day it closed early stays closed and the weights stay unaged across the skipped days.
     * An entry dated in a day that has already closed cannot undo the zero already folded for it: that day holds both the zero
       and the entry.
     """
@@ -920,3 +919,46 @@ def close_days(state: EngineState, t: datetime) -> None:
     if state.last_update is not None:
         state.last_update += _day_start(today) - after
     state.active_day = today
+
+
+def _rewind_target(state: EngineState, clock: datetime) -> str | None:
+    """The open day a rewind to `clock` would set, or None when the rewind is not due or would change nothing (#660)."""
+    if state.active_day is None:
+        return None
+    real = day_of(clock)
+    if real >= state.active_day:
+        return None
+    days = [d.day for e in state.emotions.values() for d in e.snapshot]
+    kept = [day for day in days if day <= real]
+    target = max(real, _add_days(max(kept), 1)) if kept else real
+    if target == state.active_day and len(kept) == len(days):
+        return None
+    return target
+
+
+def rewind_due(state: EngineState, clock: datetime) -> bool:
+    """True when :func:`rewind_future_day` at `clock` would change `state`. Pure: changes nothing (the drain's quick skip)."""
+    return _rewind_target(state, clock) is not None
+
+
+def rewind_future_day(state: EngineState, clock: datetime) -> bool:
+    """Bring the open day back after a clock set forward and then corrected (#660). Pure: mutates `state`, writes nothing.
+
+    `clock` must be read while the caller holds the engine lock: only a clock read before a wait for the lock can see a time
+    earlier than the last save, so a clock read under it is earlier than the open day only after a corrected clock. With `R` the
+    day of `clock`, when `R` is earlier than `active_day`: every snapshot day later than `R` is dropped (those days never
+    happened); `active_day` becomes the later of `R` and the day after the newest remaining snapshot day (snapshot days stay in
+    strictly increasing order); and every `last_entry_day` later than that is pulled back to it (validation refuses one later
+    than `active_day`). Returns whether anything changed: a due rewind that would change nothing changes nothing and returns
+    False. The jump itself is not undone (`docs/source-spec/2026-11-27-660-clock-forward-unfreeze-design.md`).
+    """
+    target = _rewind_target(state, clock)
+    if target is None:
+        return False
+    real = day_of(clock)
+    for e in state.emotions.values():
+        e.snapshot = [d for d in e.snapshot if d.day <= real]
+        if e.last_entry_day is not None and e.last_entry_day > target:
+            e.last_entry_day = target
+    state.active_day = target
+    return True

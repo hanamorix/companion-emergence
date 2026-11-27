@@ -81,6 +81,8 @@ from brain.emotion.engine_utils import (
     larger_rowid,
     memory_feelings,
     resolve_emotions,
+    rewind_due,
+    rewind_future_day,
     shift_for,
     source_modifier,
 )
@@ -544,7 +546,10 @@ class EmotionEngine:
         Planning B31 SW4), the first rebuild at the next start deciding from the database's x10 record. A direct apply passes `events` (its own, with
         `drain=False`) and writes no queue and reads none except the catch-up's one read. `now` is held to the loaded
         `saved_at` for the whole step, so a clock read before a wait for the lock cannot rewind the state, and `saved_at`
-        never moves backwards (a clock set back does not drag it back, by design).
+        never moves backwards (a clock set back does not drag it back, by design), with one exception: a clock set forward
+        and then corrected (#660). The step first runs `rewind_future_day` with a clock read under the lock; when it changes the
+        state, the step runs at that clock (so `saved_at` comes back), the rewind counts as no day close (it prunes nothing),
+        and the state is saved.
         """
         persona = self.persona_dir
         when = lenient_utc(now)
@@ -558,6 +563,7 @@ class EmotionEngine:
         skip_ids: frozenset[str] = frozenset()
         queue_read: engine_files.QueueRead | None = None
         caught_up = False
+        rewound = False
         pre_day = state.active_day if state is not None else None  # the active day as it stood BEFORE this step's own closes
         if state is None:
             if self._switched(loaded):
@@ -574,7 +580,15 @@ class EmotionEngine:
                 return
             state = EngineState()
         else:
-            if state.saved_at is not None:
+            # A clock set forward and then corrected left the open day and `saved_at` in the future: bring them back, from a
+            # clock read here, under the lock (#660). Otherwise `now` is held to `saved_at` as before.
+            clock = lenient_utc(self._now()) or now
+            clock = max(now, clock)
+            rewound = rewind_future_day(state, clock)
+            if rewound:
+                now = clock
+                pre_day = state.active_day  # a rewind is not a day close: it prunes no change-log file
+            elif state.saved_at is not None:
                 now = max(now, state.saved_at)
             if loaded.source == "main":
                 self._catch_up_failed = False  # a readable main state ends a failure (a state repaired outside the engine)
@@ -636,7 +650,7 @@ class EmotionEngine:
         # A stored position over an empty queue is stale (the queue was emptied and the save of position 0 did not follow):
         # save it as 0 so the next reply's lines are not skipped (the maintainer's narrowing of S22, see `_empty_and_remember`).
         stale_position = drain and queue_read.end_line == 0 and state.queue_line > 0  # type: ignore[union-attr]
-        if not (lines_read or day_closed or caught_up or stale_position or (not drain and applied)):
+        if not (lines_read or day_closed or caught_up or rewound or stale_position or (not drain and applied)):
             if drain and queue_read is not None and queue_read.end_line > 0:
                 self._empty_and_remember(state)  # a retry of an emptying that failed before
             elif drain:
@@ -723,7 +737,8 @@ class EmotionEngine:
         state = loaded.state
         if state is None or loaded.source != "main" or state.active_day is None:
             return False
-        return day_of(now) <= state.active_day
+        # A due rewind of a corrected clock (#660) is decided under the lock, so it is never skipped here.
+        return day_of(now) <= state.active_day and not rewind_due(state, now)
 
     # --- reads: change nothing, take no lock ---------------------------------------------------------
 
