@@ -281,6 +281,7 @@ def _download(cache: Path, name: str, data: bytes) -> None:
     (blobs / f"{name}.incomplete").write_bytes(data)
 
 
+@pytest.mark.no_base_failure(reason="#808 test infrastructure: it checks this file's own snapshot helpers, not brain code")
 def test_a_model_download_into_a_cache_inside_the_data_home_is_not_a_leak(tmp_path):
     """#808: on Windows platformdirs puts the cache inside the data home (`<data>\\Cache`), and the suite leaves the cache shared on
     purpose (see `test_the_model_cache_stays_where_it_is`), so another worker's model download is not this test writing there."""
@@ -295,6 +296,7 @@ def test_a_model_download_into_a_cache_inside_the_data_home_is_not_a_leak(tmp_pa
     assert not _changed(real, before, set(), cache=cache)
 
 
+@pytest.mark.no_base_failure(reason="#808 test infrastructure: it checks this file's own snapshot helpers, not brain code")
 def test_a_write_beside_a_cache_inside_the_data_home_is_still_a_leak(tmp_path):
     """Only the cache's own subtree is left out: a sibling whose name merely starts like it, and a top-level file, still count."""
     real = tmp_path / "home"
@@ -309,6 +311,7 @@ def test_a_write_beside_a_cache_inside_the_data_home_is_still_a_leak(tmp_path):
     assert _changed(real, before, set(), cache=cache)
 
 
+@pytest.mark.no_base_failure(reason="#808 test infrastructure: it checks this file's own snapshot helpers, not brain code")
 def test_a_cache_outside_the_data_home_leaves_nothing_out(tmp_path):
     """macOS and Linux keep the cache outside the data home, so a folder named `Cache` inside the data home is compared like any other."""
     real = tmp_path / "home"
