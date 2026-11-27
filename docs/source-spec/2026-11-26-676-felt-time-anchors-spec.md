@@ -25,7 +25,9 @@ Felt time is meant to notice the marked moments of the persona's life (dreams, g
 
 ### Dream labels [D5, D6]
 
-The label of a dream is the `content` that `MemoryStore.get(dream_id, bump=False)` returns on `<persona>/memories.db`; a faded memory's summary is used as returned [D5, D20]. The lookup runs first. Only when it returns `None` (a hard-deleted or unknown id), the row has no string `dream_id`, or `memories.db` cannot be opened on that tick, does the dream count with an empty label; a missing `memories.db` counts as unopenable and is never created, the store case logs a warning, and a later tick never relabels that anchor [D6, D20].
+The label of a dream comes first from `daemon_state.json` `last_dream.summary`, when that record's parsed timestamp is at or after the newest dream row's. The heartbeat writes that record in the same heartbeat, just after the log row, so in the normal case the label is there on the first tick and `memories.db` is not opened [D26]. Otherwise the label is the `content` that `MemoryStore.get(dream_id, bump=False)` returns on `<persona>/memories.db`; a faded memory's summary is used as returned [D5, D20]. The lookup runs first. Only when it returns `None` (a hard-deleted or unknown id), the row has no string `dream_id`, or `memories.db` cannot be opened on that tick, does the dream count with an empty label; a missing `memories.db` counts as unopenable and is never created, and the store case logs a warning [D6, D20].
+
+A new dream's memory is still in the pending queue when felt time first sees the dream. `route_write` enqueues it, and the next heartbeat's consolidation commits it. So while a stored dream anchor has an empty label and is still the newest dream row, each tick looks it up again, and the label appears about one heartbeat later. A dream that is no longer the newest is never relabelled. A dream that deduplication dropped stays unlabelled [D23]. A leading `DREAM: ` is dropped from the label [D24].
 
 `extract_all` and `scan_since` stay pure: they never open `memories.db`, and a dream anchor leaves them with its label unresolved (its `dream_id` travels with it, not persisted). The lookup runs only on the tick path, when a tick stores a dream anchor, so every stored dream anchor is resolved exactly once [D16]. A rebuild from logs (`_replay_from_logs`, inside the read-only loader) stores only arc anchors; dream, growth and soul are filled by the next tick under D7, so the loader never opens `memories.db` [D16]. An empty dream label is valid: #385's `_check_anchor` (`brain/felt_time/state.py`) requires only that `label` is a string, the pre-#385 loader does not check it, and `felt_time_now` returns `""` [D6, D16].
 
@@ -41,7 +43,7 @@ On every tick, for each of dream, growth and soul, felt time takes the newest co
 
 ### Pressure [D11, D12, D18]
 
-A row taken under D7 restarts the current stretch (`pressure.apply_tick` with a non-empty `new_anchors`) only when its parsed time is strictly after the last tick's parsed time; several in one tick restart it once [D11, D12]. A row taken from older history does not restart it. With no last tick (a fresh persona, or the first tick after a rebuild) no row of any type, arcs included, restarts it, and the stretch counts from that tick's own heartbeats and turns [D12]. Arc rows keep today's fold and labels, compared by parsed time and restarting the stretch under the same rule; while D9 holds, the narrative pass opens no new arc [DERIVED D18]. Horizon buckets and lived age are unchanged.
+A row taken under D7 restarts the current stretch (`pressure.apply_tick` with a non-empty `new_anchors`) only when its parsed time is strictly after the last tick's parsed time; several in one tick restart it once [D11, D12]. One exception: on the tick where her anchors go from holding no dream, growth or soul anchor to holding one, the stretch restarts once, whatever D12 says for that tick. Her saved counters have never been reset, so they would otherwise show months of activity under "since the dream" [D25]. A row taken from older history does not restart it. With no last tick (a fresh persona, or the first tick after a rebuild) no row of any type, arcs included, restarts it, and the stretch counts from that tick's own heartbeats and turns [D12]. Arc rows keep today's fold and labels, compared by parsed time and restarting the stretch under the same rule; while D9 holds, the narrative pass opens no new arc [DERIVED D18]. Horizon buckets and lived age are unchanged.
 
 ### Prompt and tool [D6, D13]
 
@@ -88,17 +90,19 @@ Every test runs in a temp `KINDLED_HOME` and drives the real writers. The live p
 - **D2:** an `emotion_added` row and an `arc_added` row each become the growth anchor, labelled by `name`. An `arc_pruned_by_brain` row never does.
 - **D3, D4:** a crystallised, non-dry-run audit row becomes the soul anchor, labelled by `candidate_text`. Accept-without-id, dry-run, defer, reject and parse-error rows never do.
 - **D5:** a dream run through `DreamEngine` with `FakeProvider` becomes the dream anchor, labelled with the dream memory's content. The memory's recall count is unchanged.
+- **D23:** a dream written by `DreamEngine` is stored with label `""` on the same heartbeat's tick. After the next heartbeat's consolidation, the following tick fills the label, with no `DREAM: ` prefix [D24]. An older dream with an empty label is never relabelled.
+- **D25:** a persona whose saved counters are high and whose anchors are empty gets its anchors filled from history, and the stretch restarts once on that tick.
 - **D6:** with the dream memory deleted, the dream still becomes the anchor with label `""`. The prompt line is exactly `  last dream: <ago>`, where `<ago>` is today's hours-or-days form.
 - **D19:** a crystallised row with `crystallization_id` `""`, or with `dry_run` missing, never becomes the soul anchor.
 - **D20, D21:** a faded dream memory labels with its summary; a row without `dream_id` counts unlabelled; with `memories.db` absent, no file is created; a label with a line break renders on one line.
 - **D22:** two rows with equal parsed times: the later in the file wins; a stored anchor with an unparseable `ts` is replaced on the next tick.
-- **D7, D12:** a persona with saved state and only older rows gets the newest of each type as its anchors on the next tick, with pressure counters not reset; a second tick changes nothing. A row stamped before the last tick but absent from it is taken on the next tick without a reset. A fresh persona's first tick, and the first tick after a rebuild with arc rows present, take the newest rows and reset nothing.
+- **D7, D12:** a persona with saved state and only older rows gets the newest of each type as its anchors on the next tick, with pressure counters not reset; a second tick changes nothing. A row stamped before the last tick but absent from it is taken on the next tick without a reset. A fresh persona's first tick takes the newest rows and restarts the stretch once, because its anchors first fill then (D25).
 - **D9:** with real dream, growth (with `evidence_memory_ids` naming real memories) and soul rows present, `_run_narrative_memory_pass` opens no arc, appends nothing to `arcs.log.jsonl`, and writes no grief memory. The growth row is the guard: an adapter restored with the corrected file names would seed an arc from it, so the test fails.
 - **D10, D12:** a `Z` row and a `+00:00` row in the same second order correctly when one has no fraction. A row with no timezone is skipped.
 - **D11:** a new soul row after the last tick restarts the stretch, and three in one tick restart it once. **Measured pre-ship (guarded-change):** a replay of the reference persona's real log timestamps, read-only, reports the distribution of stretch lengths, so the owner can see how long stretches would run.
 - **D13:** the prompt block's text for fixed state is byte-identical to today's apart from the dream-fallback line (D6) and D21's line-break rule.
 - **D15, D16:** with the state file and its backups missing and real dream rows present, `load_or_recover` rebuilds from the logs instead of cold-starting, stores no dream, growth or soul anchor, and does not open `memories.db`; the next tick fills all three. With only `arc_pruned_by_brain` growth rows it cold-starts; with only arc rows it rebuilds with those arc anchors.
-- **D16, D6:** with `memories.db` unopenable, a new dream becomes the anchor with label `""` and a warning is logged; after the store recovers, the anchor keeps `""`.
+- **D16, D6:** with `memories.db` unopenable, a new dream becomes the anchor with label `""` and a warning is logged; after the store recovers, the next tick fills the label while that dream is still the newest [D23].
 - **D17:** a soul row with empty `candidate_text` never becomes the soul anchor.
 - **D14:** for each source, the real writer, then the supervisor's felt-time tick, then `_build_felt_time_block` shows its `last …` line.
 
@@ -111,5 +115,9 @@ Every test runs in a temp `KINDLED_HOME` and drives the real writers. The live p
 - Merge order with #655, which edits `load_or_recover` and `FeltTimeState` in `state.py`, as D15 does here.
 
 ## Deferred
+
+- **Known states, accepted (guarded-change stage 3):**
+  - dream and soul labels are stored in full in `felt_time_state.json` (and its backups) and returned in full by `felt_time_now`; only the prompt cuts at 40;
+  - a newest dream that deduplication dropped, or whose consolidation is deferred until a newer dream arrives, stays unlabelled. While it is the newest, it is looked up on each tick.
 
 - **Narrative arcs and grief from dream, growth and soul moments** need the second spec. It builds the per-moment lived-age stamp together with its reader and reconnects narrative memory to `_SOURCES` [D1, D8, D9]; what it does with moments from before it ships, and with soul's repeated labels, is the second spec's decision.
