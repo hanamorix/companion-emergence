@@ -1,0 +1,88 @@
+{
+  "seed": 20260517,
+  "parts_dir": "parts",
+  "out_dir": ".",
+  "total_rows": 19621,
+  "rows_before_dedup": 19461,
+  "dedup_dropped": 48,
+  "skipped_lines": {
+    "malformed_json": 0,
+    "missing_required_field": 0
+  },
+  "per_memory_type_counts": {
+    "monologue": 3680,
+    "fact": 3402,
+    "observation": 2726,
+    "monologue_emotion": 1910,
+    "monologue_soul_candidate": 2702,
+    "decision": 762,
+    "monologue_trace": 1930,
+    "heartbeat": 592,
+    "note": 692,
+    "research": 675,
+    "feeling": 206,
+    "dream": 96,
+    "question": 92,
+    "making": 56,
+    "initiate_outbound": 44,
+    "event": 20,
+    "journal_entry": 16,
+    "file_write": 12,
+    "insight": 8
+  },
+  "per_window_counts": {
+    "1": 1161,
+    "2": 1846,
+    "3": 702,
+    "4": 1733,
+    "5": 941,
+    "6": 1391,
+    "7": 1158,
+    "8": 601,
+    "9": 1836,
+    "10": 1044,
+    "11": 1391,
+    "12": 1838,
+    "13": 823,
+    "14": 1505,
+    "15": 1054,
+    "16": 597
+  },
+  "per_day_stats": {
+    "min": 64,
+    "mean": 180.0091743119266,
+    "max": 402
+  },
+  "active_count": 19614,
+  "fading_count": 6656,
+  "inactive_count": 7,
+  "day_span": {
+    "min": 1,
+    "max": 109
+  },
+  "augmentation": {
+    "script": "augment_db.py",
+    "seed": 20261110,
+    "base_sha256": "f0a4def9fb77bd009e75ce2571914a4c964204cf246a799fba8ae6542f4c69da",
+    "base_commit": "d8eedb76",
+    "output_sha256": "887bbc55c9bcfb23e1d692f5b3a2310a2f6b8ef8bfcb4adedcd95eb57f95d655",
+    "rows_added": {
+      "rest_need": 48,
+      "arousal": 40,
+      "climax": 30,
+      "touch_hunger": 45,
+      "creative_hunger": 45
+    },
+    "near_zero": [
+      "vulnerability",
+      "amusement",
+      "worry"
+    ],
+    "low_with_spikes": [
+      "loneliness",
+      "defiance",
+      "curiosity",
+      "joy"
+    ]
+  }
+}
