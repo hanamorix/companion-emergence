@@ -696,8 +696,8 @@ def test_cs4_json_io_has_no_second_atomic_writer_or_backup_rotation() -> None:
             if isinstance(node, ast.Call):
                 dotted = ast.unparse(node.func)
                 assert dotted not in forbidden, f"{fn.name}: {dotted}"
-                if dotted == "os.fsync":  # only the append path syncs a file itself
-                    assert fn.name == "append_jsonl", f"{fn.name}: a second atomic writer"
+                if dotted == "os.fsync":  # only the one append path (behind append_jsonl and append_text, #781) syncs a file itself
+                    assert fn.name == "_append_payload", f"{fn.name}: a second atomic writer"
     assert ".bak{i + 1}" not in src, "a backup rotation loop"
     assert "save_with_backup_text(" in src
 

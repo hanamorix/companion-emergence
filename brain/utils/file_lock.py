@@ -66,7 +66,7 @@ def file_lock(path: Path, *, blocking: bool = True) -> Iterator[bool]:
     """
     lock_path = path.with_suffix(path.suffix + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    fh: IO[bytes] = open(lock_path, "ab")
+    fh: IO[bytes] = open(lock_path, "ab")  # append: ok -- opens the lock file to flock it; nothing is written
     try:
         if _IS_WINDOWS:
             acquired = _windows_lock_acquire(fh, blocking=blocking)

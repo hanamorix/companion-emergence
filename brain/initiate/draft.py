@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from brain import prompt_strings
-from brain.health.json_io import read_json, write_json
+from brain.health.json_io import append_text, read_json, write_json
+from brain.utils.file_lock import file_lock
 
 logger = logging.getLogger(__name__)
 
@@ -47,16 +48,14 @@ def append_draft_fragment(
         dt = datetime.now(UTC)  # not local time: a naive stamp means UTC in this repo (#485)
     header = f"## {dt.strftime('%Y-%m-%d %H:%M')} ({source})"
 
-    # Idempotency check.
-    if path.exists():
-        existing = path.read_text(encoding="utf-8")
-        if header in existing:
-            return
-
     block = f"\n\n{header}\n\n{body}\n"
     try:
-        with path.open("a", encoding="utf-8") as f:
-            f.write(block)
+        # The idempotency check and the append share the file's lock, so two writers with the same header
+        # cannot both pass the check; the append is fsynced (#781).
+        with file_lock(path):
+            if path.exists() and header in path.read_text(encoding="utf-8"):
+                return
+            append_text(path, block, lock="held")
     except OSError as exc:
         logger.warning("draft fragment append failed for %s: %s", path, exc)
 

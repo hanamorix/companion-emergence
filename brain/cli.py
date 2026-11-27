@@ -4066,11 +4066,14 @@ def _log_crash(exc: BaseException, argv: list[str] | None) -> None:
     import traceback
 
     try:
+        # Imported here, inside the try: the crash path imports as little as it can, and an import failure must not
+        # mask the crash.
+        from brain.health.json_io import append_text
+
         log_dir = get_log_dir()
         log_dir.mkdir(parents=True, exist_ok=True)
-        with (log_dir / "cli-crash.log").open("a", encoding="utf-8") as f:
-            f.write(f"\n=== crash argv={argv} ===\n")
-            traceback.print_exception(type(exc), exc, exc.__traceback__, file=f)
+        text = f"\n=== crash argv={argv} ===\n" + "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+        append_text(log_dir / "cli-crash.log", text)  # one locked, fsynced write (#781)
     except Exception:
         pass  # never let crash-logging mask the original failure
 

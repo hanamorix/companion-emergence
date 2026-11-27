@@ -297,7 +297,7 @@ def spawn_detached(
     reports alive, and ``poll()`` is also what reaps it.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    log_fh = open(log_path, "ab")  # noqa: SIM115
+    log_fh = open(log_path, "ab")  # noqa: SIM115  # append: ok -- the bridge child's stdout/stderr stream, not a record file
     python, env = bridge_python()
     popen_extra: dict[str, object] = {} if env is None else {"env": env}
     cmd = [python, *_runner_argv(persona_dir, idle_shutdown_seconds, client_origin)]

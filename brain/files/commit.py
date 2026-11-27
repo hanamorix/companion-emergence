@@ -41,7 +41,7 @@ def _open_final(name, op: str, dir_fd: int | None) -> int:
     try:
         if op == "create":
             return os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _BINARY, 0o666, dir_fd=dir_fd)
-        return os.open(name, os.O_RDWR | os.O_APPEND | _NOFOLLOW | _BINARY, dir_fd=dir_fd)
+        return os.open(name, os.O_RDWR | os.O_APPEND | _NOFOLLOW | _BINARY, dir_fd=dir_fd)  # append: ok -- the file tool's own guarded accessor
     except FileExistsError as exc:  # something appeared at a create target after it was checked
         raise _TargetChangedError(f"refused: {name} appeared after it was checked") from exc
     except OSError as exc:
@@ -345,7 +345,7 @@ def _open_target(path: Path, op: str, expect: os.stat_result | None, persona_dir
         if op == "append" and st.st_size > 0:  # #100: don't run the new block into the last line
             os.lseek(fd, -1, os.SEEK_END)
             needs_separator = os.read(fd, 1) != b"\n"
-        return os.fdopen(fd, "a" if op == "append" else "w", encoding="utf-8"), needs_separator
+        return os.fdopen(fd, "a" if op == "append" else "w", encoding="utf-8"), needs_separator  # append: ok -- the file tool's own guarded accessor
     except BaseException:
         os.close(fd)
         raise
