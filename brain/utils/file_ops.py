@@ -112,10 +112,18 @@ def delete_file(path: str | Path) -> None:
 def _remove_tree(path: str | Path) -> None:
     if os.path.islink(path):
         raise NotADirectoryError(f"{path} is a symbolic link: delete_tree does not follow it")
-    try:
-        shutil.rmtree(path)
-    except FileNotFoundError:
-        return  # already gone, or removed meanwhile by another process
+    attempts = dev_constants.FILE_RETRY_ATTEMPTS
+    for n in range(1, attempts + 1):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            if not os.path.lexists(path):
+                return  # already gone, or removed meanwhile by another process
+            # A child vanished mid-delete and the folder is still there: Python 3.12's rmtree stops at that point, so
+            # carry on with what is left (#657). The error is raised if it keeps happening.
+            if n == attempts:
+                raise
 
 
 def delete_tree(path: str | Path) -> None:
