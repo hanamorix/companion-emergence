@@ -20,7 +20,9 @@ Today none of this happens on a real persona. Arcs never open, because anchors n
 
 `_run_narrative_memory_pass` (`brain/bridge/supervisor.py`) gets its anchor sweep back. It reads moments through felt time's one source map (`brain/felt_time/anchors.py::_SOURCES`, `extract_all`), with #676's counting rules and parsed times [DERIVED D13]. It takes only dream, growth and soul moments, never `arcs.log.jsonl` rows [DERIVED D18].
 
-Because #676 keeps `extract_all` pure, a dream moment arrives with its label unresolved. The pass resolves it itself, as #676 does: the label is the content of `MemoryStore.get(dream_id, bump=False)`, and it is empty when that returns `None` or `memories.db` cannot be opened. The moment then opens no arc, and the cursor still moves [DERIVED D18; #676 D6]. For seed ids, the pass reads the row named by each moment's `source_ref`. It uses the same reader and valid-row indexing as `extract_all` (`iter_jsonl_skipping_corrupt`), so a corrupt line never shifts a reference [DERIVED D20].
+Because #676 keeps `extract_all` pure, a dream moment arrives with its label unresolved. The pass resolves it itself, as #676 does: the label is the content of `MemoryStore.get(dream_id, bump=False)`, with a leading `DREAM: ` dropped (#676 D24) [D18].
+
+A new dream's memory stays in the pending queue until the next heartbeat's consolidation promotes it, and this pass can run inside that window (a heartbeat can run between forgetting's items, and this pass follows forgetting). When `memories.db` has no memory for the dream, the pass uses felt time's stored dream label, if felt time's stored dream anchor is that same log row (same `source_ref` and `ts`) and its label is not empty. #676 fills that label from the heartbeat's last-dream record [D21]. When neither gives a label, the moment opens no arc, and the cursor still moves [D18, D21, D11]. That happens to a dream felt time never labelled: a CLI dream read before the next felt tick, a second dream pending behind a newer one, or a dream whose felt tick failed. A newest dream that deduplication dropped still has felt time's label, so it opens an arc whose `dream_id` member never resolves; that member adds no feelings [DERIVED from D21]. For seed ids, the pass reads the row named by each moment's `source_ref`. It uses the same reader and valid-row indexing as `extract_all` (`iter_jsonl_skipping_corrupt`), so a corrupt line never shifts a reference [DERIVED D20].
 
 One new field in `arcs_state.json` (`brain/narrative_memory/state.py`), `anchor_cursor_iso`, is the anchor sweep's own cursor. It defaults to `None`, and `save_state` and `load_or_recover` read and write it by name [D19].
 
@@ -31,6 +33,8 @@ One new field in `arcs_state.json` (`brain/narrative_memory/state.py`), `anchor_
 - **Reading twice.** A row written between the sweep time and the read is read twice. The second read seeds the same memories, so it adds nothing to that arc, except re-adding a seed that the 50-member cap evicted [D4].
 - **Missed row.** A row stamped before the sweep time but appended after the read (a growth event builds its timestamp just before appending) is missed. This window of milliseconds is accepted [D4].
 - **Recovery.** `last_pass_ts_iso` keeps its role in the state-recovery check against `arcs.log.jsonl` and is not the anchor cursor [D4]. A rebuild from `arcs.log.jsonl` (`_replay_from_log`) sets `anchor_cursor_iso` to the newest parsed event time (`ts_iso`) in that log [D19]. That log is written only on open, member and close events, so its newest time can be days behind the last pass. A rebuild can therefore re-read days of moments. That adds nothing to the arcs they reached, except re-adding seeds the 50-member cap evicted. When the log is empty, the cursor is `None` and the cutover reruns, so moments since the real cutover never become arcs [D19].
+- **A pass that failed halfway.** The pass appends its log events as it goes and saves the state only at the end. Loading the state also rebuilds it from `arcs.log.jsonl` when the log is ahead of it: the log has an open arc (an `arc_opened` event with no `arc_closed` for the same arc) that the state lacks, or shows closed an arc the state still holds open. A state arc the log does not know is kept, as today when the log is missing. So a pass that failed after appending events is rebuilt from its own events on the next load, and the same moment never opens a second arc. The rebuilt open arcs weigh 0 until the next pass recomputes them; the `arc_closed` event records the closed arc's weight and dominant feeling, so closed arcs keep theirs [D22, D9].
+- **A rebuilt cursor after a failed pass.** If the failed pass had appended events stamped at pass time, the newest event time is later than that pass's sweep time, so a moment written in the seconds between the log read and those events is never taken. Accepted [D19, D22].
 
 Each moment taken is stamped with her lived age at that pass, as candidate members are stamped today [D3]. Its seed members join at that age, and the arc's `lived_age_at_open` is that age. No file or writer is added [D3].
 
@@ -56,16 +60,16 @@ So two open arcs never share a title [D7]. Felt time's title-keyed arc lines (`b
 
 ### Titles [D10, D11]
 
-An arc's title is its moment's label (#676: dream memory text, growth `name`, soul `candidate_text`) with each line break replaced by a space; `\r\n` counts as one [D10]. Its total length is at most `ARC_TITLE_MAX_CHARS` (60, in `brain/dev_constants.py`). When the label is longer, it is cut at the last word boundary within the first 59 characters, trailing spaces are dropped, and it ends with `…` [D10]. A label longer than 60 with no word boundary in its first 59 characters is cut at 59 characters plus `…` [D11]. The stored `Arc.title` is that string, and every surface shows it [D10]:
+An arc's title is its moment's label (#676: dream memory text, growth `name`, soul `candidate_text`) with each line break replaced by a space; `\r\n` counts as one [D10]. Its total length is at most `ARC_TITLE_MAX_CHARS` (60, in `brain/dev_constants.py`). When the label is longer, it is cut at the last word boundary within the first 59 characters, trailing spaces are dropped, and it ends with `…` [D10]. When the 60th character is a space, the first 59 already end on a word and are kept whole; a space with nothing before it is not a word boundary [DERIVED from D10]. A label longer than 60 with no word boundary in its first 59 characters is cut at 59 characters plus `…` [D11]. The stored `Arc.title` is that string, and every surface shows it [D10]:
 - the `arc_opened` event in `arcs.log.jsonl`, which felt time's arc anchors and `_replay_from_log` read;
 - the arcs ambient block;
 - `get_narrative_threads` and `get_arc_detail`;
 - the grief block;
-- the arc-close grief memory, via `arc_close_phrase`. A moment with an empty label opens no arc, but it may extend one by its seeds [D11].
+- the arc-close grief memory, via `arc_close_phrase`. A moment with an empty label opens no arc, but it may extend one by its seeds; a label of only spaces counts as empty [D11].
 
 ### Weight while open [D9]
 
-On every pass, each open arc's strongest member emotion is recomputed with `_compute_arc_close_emotion_inputs`, the same function the close uses. The result is saved on the arc as `max_member_emotion_normalised` and `dominant_non_grief_emotion` [D9]. When the store cannot be opened or the recompute raises, the arc keeps its saved values and the pass goes on [D9]. Time's heaviness (`brain/felt_time/lived_age.py::narrative_weight`, fed by the supervisor's drivers) and forgetting's fade gate read the saved value. The close recomputes it fresh, as today [D9].
+On every pass, each open arc's strongest member emotion is recomputed with `_compute_arc_close_emotion_inputs`, the same function the close uses. The result is saved on the arc as `max_member_emotion_normalised` and `dominant_non_grief_emotion` [D9]. When the recompute raises, the arc keeps its saved values and the pass goes on [D9]. When the pass cannot open `memories.db` at all, open arcs keep their saved values and no arc closes that pass, because a close reads the members' feelings and writes its grief there. A stale arc then closes, with its grief, on the next pass that can read the store; the rest of the pass goes on [D23]. Time's heaviness (`brain/felt_time/lived_age.py::narrative_weight`, fed by the supervisor's drivers) and forgetting's fade gate read the saved value. The close recomputes it fresh, as today [D9].
 
 ### Fading [D5]
 
@@ -130,6 +134,9 @@ Every test runs in a temp `KINDLED_HOME` with the real writers. The live persona
 
 - **D2:** with older moments present, the first pass sets `anchor_cursor_iso` and opens nothing, even with lived age unknown; a later moment opens an arc; an older one never does.
 - **D18:** an `arc_opened` row in `arcs.log.jsonl` never becomes a moment; a dream opens an arc titled from its memory text; a dream whose memory is gone opens no arc.
+- **D21:** a dream whose memory is still in the pending queue at the pass takes its title from felt time's stored label for that same row, without `DREAM: `; with neither label, it opens no arc.
+- **D22:** a pass that raises after appending an `arc_opened` event leaves no saved arc; the next load rebuilds it from the log, and the next pass opens no second arc for the same moment. A state holding an open arc the log does not know is not rebuilt. An arc closed before a rebuild keeps its weight.
+- **D23:** with `memories.db` unopenable, a stale arc stays open that pass with its saved weight and closes, with grief, on the next pass that can read the store.
 - **D19:** a state file without the field loads with `None`; after a rebuild from `arcs.log.jsonl`, the cursor is the log's newest event time, and a moment after it still opens an arc.
 - **D20:** with a corrupt line before a dream row, the dream still seeds its own memories.
 - **D3:** an arc opened at a pass has `lived_age_at_open` equal to felt time's lived age at that pass.
@@ -162,4 +169,5 @@ Every test runs in a temp `KINDLED_HOME` with the real writers. The live persona
 - **#676's D9 acceptance** ("opens no arc … writes no grief") is superseded by this spec's D17 once this ships.
 
 - **Volume limits.** You decide whether to cap open arcs or change the numbers after seeing the D8 replay, before it ships [D7, D8, D12].
+- **Known states.** A dream felt time never labelled opens no arc (D21). A felt-time cold start reads as lived age 0.0, which counts as known, so a pass in that state stamps 0.0; after #385 that needs every felt-time backup to be unreadable. An unreadable moment log makes every pass raise, so no arc closes until the file is readable; the log line repeats each pass.
 - **Members-only fade protection.** Holding an open arc's own members against fading, rather than all memories, is not built [D5].
