@@ -211,7 +211,10 @@ prevent.
   projects only `session_id`+`created_at`). New endpoints/fields must not leak the body.
 - **Provenance:** `kindled_peer` memories stay peer-marked at every recall render point.
 - **Background discipline:** every peer provider call takes a `cli_throttle` background slot and
-  yields to interactive chat; peer work counts against the shared global daily budget.
+  yields to interactive chat; peer work counts against its own per-peer daily provider cap
+  (`KINDLED_LINK_DAILY_PROVIDER_CAP`, 60 a day, `try_reserve_provider` in `brain/kindled_link/store.py`).
+  *Corrected 2026-11-27 (#799): this line used to say "the shared global daily budget"; no shared budget
+  exists for background model calls.*
 - **Caps:** 60s outbound gap, 24/session, 6h session cooldown, 20/day outbound, 60/day provider,
   inbound flood cap — all enforced on the live path, not just unit-tested.
 - **State recovery:** half-finished outbound is re-gated, never blind-resent; a draft not
@@ -245,7 +248,8 @@ peer memories; the panel reads transcript/holds/relay-health.
 - **Relay outage** — bounded retries + backoff already in `RelayClient`; the tick must treat
   `RelayUnavailableError` as a degraded state (surface it), never a crash (fault-isolated block).
 - **Regression risk to the shared subscription** — a new always-on background consumer. Gated by
-  off-by-default + `should_yield` + the shared daily budget; advisory cost metrics watched at
+  off-by-default + `should_yield` + the per-peer daily provider cap (there is no shared daily
+  budget, #799); advisory cost metrics watched at
   stage 8.
 
 ## 8. Acceptance criteria

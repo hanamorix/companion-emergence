@@ -197,8 +197,9 @@ VERDICT `spawn:` from §5.3 — research-born tangents, origin `"side_quest"`.
 - Output (strict JSON, `extract_json_object`): ≤3 proposed new interests (origin `"sweep"`)
   + ≤3 proposed retirements (active → dormant). Same dedupe + below-threshold seeding
   as 6.1. Retirement only sets `status` — never deletes, never touches notes.
-- Runs inside `background_slot`, counts against a small daily budget, fail-soft on
-  every error.
+- Runs inside `background_slot` on a weekly cadence (`SWEEP_INTERVAL_HOURS` = 168), fail-soft on
+  every error. *Corrected 2026-11-27 (#799): this line used to say it "counts against a small daily
+  budget"; no daily budget was built for the sweep.*
 
 ### 6.4 Bootstrap fix
 

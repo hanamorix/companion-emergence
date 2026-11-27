@@ -9,8 +9,8 @@ Filtered candidates demote to draft_space.md.
 Model tier: Haiku 4.5 by default; escalates to Sonnet 4.6 on
 low-confidence/parse-fail. Failure modes are dispatched by type per spec §E.
 
-D bypasses the v0.0.9 daily cost cap entirely — it's the editorial layer,
-not a budget claimant.
+No daily cap limits D's model calls: D keeps no count of its own, and
+background model calls have no shared daily budget (#799).
 """
 
 from __future__ import annotations
