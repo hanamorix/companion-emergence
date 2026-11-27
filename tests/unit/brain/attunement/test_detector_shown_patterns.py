@@ -143,6 +143,7 @@ def test_live_call_is_given_the_selection_recomputed_when_it_runs(tmp_path: Path
         # an earlier run stamps a pattern after this record was queued and before it runs
         mark_addressed(tmp_path, ["stamped-later"], now_iso=_now_iso())
         _drain_pass2_queue(tmp_path)
+    assert mock_detector.call_count == 1
     shown = mock_detector.call_args.kwargs["shown_patterns"]
     assert [p.id for p in shown] == ["stays"]
 
