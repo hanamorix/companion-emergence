@@ -59,14 +59,30 @@ def _live_personas(root: Path) -> set[str]:
     return live
 
 
-def _outside(snap: dict[str, tuple[int, int] | None], personas: set[str]) -> dict[str, tuple[int, int] | None]:
-    """`snap` without the files of `personas`, and without `claude-config/` (their `claude` calls write it) while any is live; the
-    persona directory keys stay, so removing one still shows."""
+def _cache_prefix(root: Path, cache: Path) -> str | None:
+    """The model cache's path under `root` with a trailing slash, when the cache lies inside `root` (Windows: platformdirs puts it at
+    `<data home>\\Cache`), else None. The suite leaves the cache shared on purpose (`test_the_model_cache_stays_where_it_is`), so any
+    worker's model download writes there (#808)."""
+    root, cache = root.resolve(), cache.resolve()
+    if root not in cache.parents:
+        return None
+    return cache.relative_to(root).as_posix() + "/"
+
+
+def _outside(
+    snap: dict[str, tuple[int, int] | None], personas: set[str], cache_prefix: str | None = None
+) -> dict[str, tuple[int, int] | None]:
+    """`snap` without the files of `personas`, and without `claude-config/` (their `claude` calls write it) while any is live, and
+    without the model cache's subtree when it lies inside the data home (`cache_prefix`, #808); the persona directory keys stay, so
+    removing one still shows."""
 
     def theirs(k: str) -> bool:
         return (k.startswith("personas/") and k.split("/")[1] in personas) or (bool(personas) and k.startswith("claude-config/"))
 
-    return {k: v for k, v in snap.items() if k.endswith("/") or not theirs(k)}
+    def cached(k: str) -> bool:
+        return cache_prefix is not None and k.startswith(cache_prefix)
+
+    return {k: v for k, v in snap.items() if k.endswith("/") or not (theirs(k) or cached(k))}
 
 
 def _is_under(path: Path, root: Path) -> bool:
@@ -106,15 +122,17 @@ def test_building_the_app_leaves_the_real_data_home_untouched(tmp_path, monkeypa
     monkeypatch.delenv("KINDLED_HOME", raising=False)
     monkeypatch.delenv("NELLBRAIN_HOME", raising=False)
     real = REAL_PLATFORM_DIRS['user_data_path']
+    cache = _cache_prefix(real, REAL_PLATFORM_DIRS["user_cache_path"])
     live_before, before = _live_personas(real), _snapshot(real)
     persona = tmp_path / "p"
     persona.mkdir()
     app = build_app(persona_dir=persona, client_origin="tests")
     with TestClient(app):
         pass
-    # #600: a persona whose supervisor was live at either check writes its own files; everything else must be untouched
+    # #600: a persona whose supervisor was live at either check writes its own files; #808: so does any worker's model download into
+    # a cache inside the data home (Windows); everything else must be untouched
     live = live_before | _live_personas(real)
-    assert _outside(_snapshot(real), live) == _outside(before, live)
+    assert _outside(_snapshot(real), live, cache) == _outside(before, live, cache)
     # the lifespan did write its tunables file: into the test's own home
     assert (paths.get_home() / "tunables.toml").exists()
 
@@ -130,10 +148,12 @@ def _bridge_record(persona_dir: Path, pid_token: str | None) -> None:
     )
 
 
-def _changed(real: Path, before: dict, live_before: set[str]) -> bool:
-    """What the isolation test asserts: a change outside the personas whose supervisor was live at either check."""
+def _changed(real: Path, before: dict, live_before: set[str], cache: Path | None = None) -> bool:
+    """What the isolation test asserts: a change outside the personas whose supervisor was live at either check, and outside the model
+    cache when it lies inside the data home."""
     live = live_before | _live_personas(real)
-    return _outside(_snapshot(real), live) != _outside(before, live)
+    prefix = _cache_prefix(real, cache) if cache is not None else None
+    return _outside(_snapshot(real), live, prefix) != _outside(before, live, prefix)
 
 
 @pytest.mark.no_base_failure(reason="#600 test infrastructure: it checks this file's own snapshot helpers, not brain code")
@@ -250,6 +270,55 @@ def test_a_top_level_write_is_still_a_leak(tmp_path):
     before = _snapshot(real)
     (real / "tunables.toml").write_text("x = 22\n")
     assert _changed(real, before, set())
+
+
+def _download(cache: Path, name: str, data: bytes) -> None:
+    """A model download as huggingface_hub lays it out: a lock, then a growing `.incomplete` blob."""
+    (cache / ".locks" / "models--org--m").mkdir(parents=True, exist_ok=True)
+    (cache / ".locks" / "models--org--m" / f"{name}.lock").write_bytes(b"")
+    blobs = cache / "models--org--m" / "blobs"
+    blobs.mkdir(parents=True, exist_ok=True)
+    (blobs / f"{name}.incomplete").write_bytes(data)
+
+
+@pytest.mark.no_base_failure(reason="#808 test infrastructure: it checks this file's own snapshot helpers, not brain code")
+def test_a_model_download_into_a_cache_inside_the_data_home_is_not_a_leak(tmp_path):
+    """#808: on Windows platformdirs puts the cache inside the data home (`<data>\\Cache`), and the suite leaves the cache shared on
+    purpose (see `test_the_model_cache_stays_where_it_is`), so another worker's model download is not this test writing there."""
+    real = tmp_path / "home"
+    cache = real / "Cache"
+    _download(cache, "abc", b"a")
+    before = _snapshot(real)
+
+    _download(cache, "abc", b"abcd")  # the download grows
+    _download(cache, "def", b"x")  # and another starts
+    (cache / "models--org--m" / "blobs" / "abc.incomplete").rename(cache / "models--org--m" / "blobs" / "abc")  # one finishes
+    assert not _changed(real, before, set(), cache=cache)
+
+
+@pytest.mark.no_base_failure(reason="#808 test infrastructure: it checks this file's own snapshot helpers, not brain code")
+def test_a_write_beside_a_cache_inside_the_data_home_is_still_a_leak(tmp_path):
+    """Only the cache's own subtree is left out: a sibling whose name merely starts like it, and a top-level file, still count."""
+    real = tmp_path / "home"
+    cache = real / "Cache"
+    cache.mkdir(parents=True)
+    before = _snapshot(real)
+    (real / "Cache-notes.txt").write_text("x")
+    assert _changed(real, before, set(), cache=cache)
+
+    before = _snapshot(real)
+    (real / "tunables.toml").write_text("x = 1\n")
+    assert _changed(real, before, set(), cache=cache)
+
+
+@pytest.mark.no_base_failure(reason="#808 test infrastructure: it checks this file's own snapshot helpers, not brain code")
+def test_a_cache_outside_the_data_home_leaves_nothing_out(tmp_path):
+    """macOS and Linux keep the cache outside the data home, so a folder named `Cache` inside the data home is compared like any other."""
+    real = tmp_path / "home"
+    (real / "Cache").mkdir(parents=True)
+    before = _snapshot(real)
+    _download(real / "Cache", "abc", b"a")
+    assert _changed(real, before, set(), cache=tmp_path / "elsewhere" / "Cache")
 
 
 def test_the_isolated_dirs_keep_the_appauthor_distinction():
