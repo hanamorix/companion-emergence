@@ -42,6 +42,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from dataclasses import replace as dc_replace
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -541,20 +542,24 @@ def run_folded(
                 persona_dir, provider, event_bus, last_heartbeat_at, heartbeat_interval_s
             )
             # Stage-6 red-team MAJOR, fixed (ram-spike-fix INC-7, S21):
-            # `_heartbeat_and_felt_time` now returns None WITHOUT doing
-            # anything when a chat reply is in flight (the new start
+            # `_heartbeat_and_felt_time` returns None WITHOUT doing
+            # anything when a chat reply is in flight (the start
             # check) — advancing `last_heartbeat_at` unconditionally in
             # that case would restart this whole 15-min countdown on a
             # tick that did no work, so a chat session busy enough to
             # almost always have a reply in flight near the 15-min mark
             # could defer the heartbeat far past its own interval,
-            # indefinitely. Only advance on an ACTUAL attempt (non-None
-            # return) — a skipped tick leaves `last_heartbeat_at`
+            # indefinitely. Only advance when the heartbeat RAN (any
+            # non-None return) — a skipped tick leaves `last_heartbeat_at`
             # untouched, so the very next supervisor loop pass (seconds
             # away, not 15 minutes) re-checks immediately instead of
-            # waiting out a full fresh interval.
+            # waiting out a full fresh interval. A pass whose felt-time
+            # step raised (#832) also ran the heartbeat, so it advances
+            # too and waits its normal interval; it has no drivers, so the
+            # cached ones stay.
             if _heartbeat_attempt_result is not None:
-                _last_intensity_drivers = _heartbeat_attempt_result
+                if _heartbeat_attempt_result is not _HeartbeatRan.FELT_TIME_FAILED:
+                    _last_intensity_drivers = _heartbeat_attempt_result
                 last_heartbeat_at = time.monotonic()
 
     def _between_items() -> bool:
@@ -1789,21 +1794,30 @@ def _maybe_run_kindled_link_tick(persona_dir, *, provider, now=None):
         logger.exception("supervisor kindled-link tick raised")
 
 
+class _HeartbeatRan(Enum):
+    """Result of a heartbeat pass whose felt-time step raised (#832): the heartbeat tick already ran, so the pass counts
+    as run (the caller waits the normal interval), but there are no intensity drivers to cache."""
+
+    FELT_TIME_FAILED = "felt_time_failed"
+
+
 def _heartbeat_and_felt_time(
     persona_dir: Path,
     provider: LLMProvider,
     event_bus: EventBus,
     last_heartbeat_at: float,
     heartbeat_interval_s: float,
-) -> IntensityDrivers | None:
+) -> IntensityDrivers | _HeartbeatRan | None:
     """Run a heartbeat tick then a felt-time tick, wiring real counters.
 
     `heartbeat_interval_s` is the loop's own heartbeat interval; the body energy step counts closed time in it.
 
     Extracted so tests can call this directly and spy on _run_felt_time_tick
     without driving the full run_folded loop. Fault-isolated: heartbeat
-    errors are caught and reflex_n defaults to 0; felt-time errors are
-    caught and None is returned. The caller updates last_heartbeat_at.
+    errors are caught and reflex_n defaults to 0; a felt-time error is
+    logged and `_HeartbeatRan.FELT_TIME_FAILED` is returned (the heartbeat
+    ran, #832). None means nothing ran (a reply is in flight). The caller
+    updates last_heartbeat_at for any non-None result.
 
     Start check (S21, C9(b)): does not start a pass — heartbeat OR
     felt-time — while a chat reply is being generated, checked once here;
@@ -1855,7 +1869,7 @@ def _heartbeat_and_felt_time(
         )
     except Exception:
         logger.exception("supervisor felt-time tick raised")
-        return None
+        return _HeartbeatRan.FELT_TIME_FAILED
 
 
 def _run_felt_time_tick(

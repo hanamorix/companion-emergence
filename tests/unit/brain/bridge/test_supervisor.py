@@ -336,6 +336,72 @@ def test_run_folded_retries_heartbeat_soon_after_a_skip_not_a_full_interval(
     )
 
 
+def test_run_folded_waits_the_interval_after_a_heartbeat_whose_felt_time_step_raised(
+    tmp_path: Path,
+) -> None:
+    """#832: a heartbeat that ran counts as run even when its felt-time step raises.
+
+    Uses the REAL `_heartbeat_and_felt_time` with `_run_heartbeat_tick` stubbed and `_run_felt_time_tick` returning
+    drivers once, then raising. The `last_heartbeat_at` value handed to each call is recorded (deterministic, no
+    wall-clock margin): the call after the raise must be handed an ADVANCED value, as after a success (on the old
+    code the raise looked like a skip, the value stayed put and the whole heartbeat re-ran at every hook call).
+    The cached intensity drivers must survive the failed pass (a failed pass has none to replace them with)."""
+    from brain.bridge import supervisor as sup
+    from brain.felt_time.lived_age import IntensityDrivers
+
+    persona_dir = _persona_dir(tmp_path)
+    stop = threading.Event()
+    seen: list[float] = []
+    tick_calls: list[int] = []
+    good = IntensityDrivers(emotional_intensity=0.5)
+    captured: dict = {}
+    real_function = sup._heartbeat_and_felt_time
+    real_build = sup._build_gated_jobs
+
+    def fake_felt_time(*_a, **_k):
+        tick_calls.append(1)
+        if len(tick_calls) == 1:
+            return good
+        raise RuntimeError("felt-time tick fails")
+
+    def recording(persona_dir_arg, provider, event_bus, last_heartbeat_at, interval):
+        seen.append(last_heartbeat_at)
+        return real_function(persona_dir_arg, provider, event_bus, last_heartbeat_at, interval)
+
+    def capturing_build(**kwargs):
+        captured["drivers"] = kwargs["intensity_drivers"]
+        return real_build(**kwargs)
+
+    def runner():
+        with (
+            patch.object(sup, "_heartbeat_and_felt_time", side_effect=recording),
+            patch.object(sup, "_run_heartbeat_tick", return_value=None),
+            patch.object(sup, "_run_felt_time_tick", side_effect=fake_felt_time),
+            patch.object(sup, "_build_gated_jobs", side_effect=capturing_build),
+        ):
+            run_folded(
+                stop,
+                persona_dir=persona_dir,
+                provider=FakeProvider(),
+                event_bus=EventBus(),
+                tick_interval_s=0.05,
+                heartbeat_interval_s=0.3,
+            )
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    try:
+        assert _wait_until(lambda: len(seen) >= 3, timeout=_STARTUP_BUDGET_S), "fewer than 3 heartbeat attempts seen"
+    finally:
+        stop.set()
+        finish_threads(t)
+    assert not t.is_alive()
+    # Call 1 ran and succeeded, call 2 ran and its felt-time step raised, call 3 follows each: both advanced.
+    assert seen[1] > seen[0], "last_heartbeat_at was not advanced after a successful heartbeat"
+    assert seen[2] > seen[1], "last_heartbeat_at was not advanced after a heartbeat whose felt-time step raised (#832)"
+    assert captured["drivers"]() is good, "a failed felt-time step must leave the cached intensity drivers alone"
+
+
 def test_heartbeat_failure_does_not_break_supervisor_loop(tmp_path: Path) -> None:
     """A heartbeat exception is fault-isolated; supervisor keeps ticking.
 
