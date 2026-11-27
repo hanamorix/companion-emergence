@@ -1268,10 +1268,39 @@ def append_jsonl(
     An unclean machine stop can leave a just-appended record as NUL bytes (#618), so appends are fsynced unless
     the caller passes ``fsync=False`` with a ``# fsync off:`` comment giving the reason.
     """
-    path = _as_path(path)
+    payload = _payload(records, nonfinite)
+    return _append_payload(_as_path(path), payload, lock=lock, fsync=fsync, on_error=on_error)
+
+
+def append_text(
+    path: Path,
+    text: str,
+    *,
+    lock: Literal["block", "try", "held"] = "block",
+    fsync: bool = True,
+    on_error: Literal["raise", "log"] = "raise",
+) -> int | None:
+    """Append ``text`` (encoded as UTF-8) to a text file in ONE write; return the bytes written, or None if nothing was.
+
+    The text counterpart of :func:`append_jsonl`, for append-only files that are not JSONL (``draft_space.md``, the
+    CLI crash log) (#781). Same lock, torn-tail newline, fsync and ``on_error`` rules: an unclean machine stop can
+    leave a just-appended block as NUL bytes (#618), so appends are fsynced unless the caller passes ``fsync=False``
+    with a ``# fsync off:`` comment giving the reason.
+    """
+    return _append_payload(_as_path(path), text.encode("utf-8"), lock=lock, fsync=fsync, on_error=on_error)
+
+
+def _append_payload(
+    path: Path,
+    payload: bytes,
+    *,
+    lock: Literal["block", "try", "held"],
+    fsync: bool,
+    on_error: Literal["raise", "log"],
+) -> int | None:
+    """The one append path behind :func:`append_jsonl` and :func:`append_text` (lock, torn tail, fsync, errors)."""
     if lock not in ("block", "try", "held"):
         raise ValueError(f"lock must be 'block', 'try' or 'held', not {lock!r}")
-    payload = _payload(records, nonfinite)
     if not payload:
         return 0
     try:
@@ -1293,7 +1322,7 @@ def append_jsonl(
         with stack:
             if not acquired:
                 return None
-            with open(path, "ab+") as fh:
+            with open(path, "ab+") as fh:  # append: ok -- the shared append accessor itself (#781)
                 prefix = b""
                 if _tail_is_torn(fh):
                     prefix = b"\n"

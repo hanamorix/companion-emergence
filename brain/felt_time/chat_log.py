@@ -5,14 +5,13 @@ Written on every heartbeat tick (including zero-turn ticks) so the
 """
 from __future__ import annotations
 
-import json
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from brain.health.json_io import append_jsonl
 from brain.health.jsonl_reader import iter_jsonl_skipping_corrupt
 from brain.health.log_rotation import trim_jsonl_by_age
-from brain.utils.file_lock import file_lock
 
 log = logging.getLogger(__name__)
 
@@ -25,19 +24,16 @@ _COLD_START_MIN = 3
 def append_chat_tick(persona_dir: Path, *, ts: datetime, turns: int) -> None:
     """Append one heartbeat-tick row to chat_turns.log.jsonl.
 
-    Best-effort: OSError is logged, not raised, so a write failure cannot
-    crash the felt-time tick that calls this.
+    Best-effort: an OSError is logged, not raised, so a write failure cannot
+    crash the felt-time tick that calls this. Through the shared durable appender
+    (#781): under the log's lock, so the trim's rewrite (which replaces the file)
+    cannot swallow a row appended while it ran (#477), and fsynced, so an unclean
+    stop cannot leave the row as NUL bytes (#618).
     """
     persona_dir.mkdir(parents=True, exist_ok=True)
     log_path = persona_dir / CHAT_TURNS_LOG_FILENAME
     entry = {"ts": ts.astimezone(UTC).isoformat(), "turns": turns}
-    try:
-        # Under the log's lock so the trim's rewrite (which replaces the file) cannot swallow
-        # a row appended while it ran (#477).
-        with file_lock(log_path), log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
-    except OSError:
-        log.debug("chat_log: append failed", exc_info=True)
+    append_jsonl(log_path, entry, on_error="log")
 
 
 def _trim_old_entries(entries: list[dict], *, cutoff: datetime) -> list[dict]:

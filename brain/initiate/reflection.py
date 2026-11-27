@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Literal
 
 from brain import prompt_strings
+from brain.health.json_io import append_text
 from brain.health.parse_failures import record_parse_failure
 from brain.initiate.d_call_schema import DCallRow, make_d_call_id
 from brain.initiate.schemas import InitiateCandidate
@@ -436,7 +437,6 @@ def demote_to_draft_space(
     persona_dir.mkdir(parents=True, exist_ok=True)
     draft_path = persona_dir / "draft_space.md"
     try:
-        with draft_path.open("a", encoding="utf-8") as f:
-            f.write("\n" + frontmatter + body_excerpt + "\n")
+        append_text(draft_path, "\n" + frontmatter + body_excerpt + "\n")  # locked and fsynced (#781)
     except OSError as exc:
         logger.warning("draft-space demote failed for %s: %s", draft_path, exc)
