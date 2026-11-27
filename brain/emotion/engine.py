@@ -4,7 +4,7 @@ Every public call exists with its final signature, so the code that calls the en
 engine behind every call exists.
 
 Real now:
-- `half_life`, the lookup of an emotion's half-life in days (the persona's vocabulary file, then
+- `half_life`, the lookup of an emotion's half-life in days (her vocabulary through `vocabulary_access.lookup`, then
   `dev_constants.EMOTION_HALF_LIFE_DAYS`, then `EMOTION_DEFAULT_HALF_LIFE_DAYS`), and `is_live()`, which is True once the
   state holds `switch_over_at` (nothing writes it until the switch-over; there is no switch file: "switched" is read off the
   state, `engine_files.switch_over_state`). A state that exists but cannot be read is not switched (owner 2026-11-05); only a
@@ -46,7 +46,8 @@ The switch-over and the live engine (Engine 6, #584):
 - `memory_feelings(memory)` is the one read of a memory's feelings, peak and score (`engine_utils.memory_feelings` with this
   engine's half-lives, switch time and clock). Its fade is the same one copy `faded_value` uses.
 - `needs_recovery()` and `recovery_rebuild()`: a live persona whose state is missing or unreadable is rebuilt from its rows.
-- `fold_change` also writes a change-log line once the persona is live.
+- `fold_change` also writes a change-log line once the persona is live (after the queue append succeeded) and returns a
+  `HookOutcome`: whether the change reached the queue, and the failure class when it did not.
 
 Callers use the receiver form `engine.engine_for(persona_dir).<call>` and import the module
 (`from brain.emotion import engine`), not its names, so one patch reaches every call site.
@@ -59,13 +60,20 @@ import logging
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, NoReturn
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
 
 from brain import dev_constants
-from brain.emotion import engine_files, engine_rebuild, nudge_scale_fix, persona_loader, vocabulary
+from brain.emotion import (
+    engine_files,
+    engine_rebuild,
+    nudge_scale_fix,
+    persona_loader,
+    vocabulary,
+    vocabulary_file,
+)
 from brain.emotion.engine_files import VocabularyHalfLives
 from brain.emotion.engine_utils import (
     EngineState,
@@ -152,7 +160,29 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
-def _never_raises(hook: Callable[..., None]) -> Callable[..., None]:
+@dataclass(frozen=True)
+class HookOutcome:
+    """What `fold_change` (and the guard after a swallowed failure) tells its caller about one change.
+
+    `queued` is True only when the change reached the queue (the append that makes it reach her emotions). When it is
+    False, `failure` says why, and only then: it is `LockTimeoutError` (the engine lock wait ran out), `OSError` (the
+    engine's folder or a file refused us, or the queue append returned False) or `Exception` (a bug in the hook). `failure`
+    None with `queued` False is a change dropped whole because none of its names can be held; nothing failed.
+
+    `failure` is the class that picks the caller's reason row. `error` and `file` are the detail for the caller's log line,
+    and only ever accompany a `failure`: `error` is the exception the guard swallowed (its class, text, filename and
+    traceback); `file` is the file a queue append that RETURNED False was appending to (the append swallows its own error
+    and says only "False"; the cause is in the engine's own log line, which can be throttled). Neither takes part in
+    equality, so two outcomes are equal when `queued` and `failure` are.
+    """
+
+    queued: bool
+    failure: type[BaseException] | None = None
+    error: BaseException | None = field(default=None, compare=False)
+    file: Path | None = field(default=None, compare=False)
+
+
+def _never_raises(hook: Callable[..., Any]) -> Callable[..., Any]:
     """Make a hook unable to raise into the write that called it (E6.9): the one guard of all four hooks.
 
     Three outcomes. A `LockTimeoutError` is the engine lock not coming within its wait (a drain, a rebuild or a wedged
@@ -160,12 +190,16 @@ def _never_raises(hook: Callable[..., None]) -> Callable[..., None]:
     folder or the lock's file refusing us (a read-only or full disk, a share that went away). It stays true for every write
     until the cause is fixed, so it is logged once per interval, without a traceback (`count_throttled`). Anything else is a
     bug in the hook: one error line with the traceback, every time.
+
+    The guard returns what the hook returned, and after a swallowed failure a `HookOutcome(False, <the class of the
+    outcome above>, <the exception>)`: `LockTimeoutError`, `OSError` or `Exception`. Only `fold_change` has a caller that reads it
+    (`reconcile_self_read`); the other three hooks and the extractor's call ignore it.
     """
 
     @functools.wraps(hook)
-    def guarded(self: EmotionEngine, *args: object, **kwargs: object) -> None:
+    def guarded(self: EmotionEngine, *args: object, **kwargs: object) -> Any:
         try:
-            hook(self, *args, **kwargs)
+            return hook(self, *args, **kwargs)
         except LockTimeoutError as exc:
             # Before `except OSError`: `LockTimeoutError` IS an `OSError` (a `TimeoutError`), and a lock wait that ran out is
             # not a disk fault. Its own throttle key, so neither line hides the other.
@@ -177,6 +211,7 @@ def _never_raises(hook: Callable[..., None]) -> Callable[..., None]:
                 hook.__name__,
                 exc,
             )
+            return HookOutcome(False, LockTimeoutError, exc)
         except OSError as exc:
             count_throttled(
                 logger,
@@ -187,8 +222,10 @@ def _never_raises(hook: Callable[..., None]) -> Callable[..., None]:
                 type(exc).__name__,
                 exc,
             )
-        except Exception:
+            return HookOutcome(False, OSError, exc)
+        except Exception as exc:
             logger.error("emotion engine: %s failed; its event is lost", hook.__name__, exc_info=True)
+            return HookOutcome(False, Exception, exc)
 
     return guarded
 
@@ -228,7 +265,7 @@ class EmotionEngine:
         if kind is None:
             self._apply_start_if_needed(memory.created_at)
             return
-        emotions = self._resolved_faded(memory)
+        emotions = self._resolved_faded(memory, check_names=False)  # the store checked the row before writing it
         if not emotions:  # nothing to fold, but the row's date still reaches the persona's start (B02.6)
             self._apply_start_if_needed(memory.created_at)
             return
@@ -249,7 +286,7 @@ class EmotionEngine:
         kind = counted_kind(memory)
         if kind is None:
             return
-        emotions = self._resolved_faded(memory)
+        emotions = self._resolved_faded(memory, check_names=False)  # the store checked the emotions before writing them
         if not emotions:
             return
         self._apply(
@@ -264,11 +301,20 @@ class EmotionEngine:
         )
 
     @_never_raises
-    def fold_change(self, emotions: Mapping[str, float], at: datetime | None, source: str) -> None:
-        amounts = resolve_emotions(emotions, signed=True)
+    def fold_change(self, emotions: Mapping[str, float], at: datetime | None, source: str) -> HookOutcome:
+        """Queue a signed chat change and say whether it reached the queue (`HookOutcome`); never raises (`_never_raises`).
+
+        A change with no name her vocabulary can hold is dropped whole: `HookOutcome(False)`, nothing failed. A queue append
+        that returned False is `HookOutcome(False, OSError, file=<the queue file>)` (the append logged why). A failure the
+        guard swallows is its outcome, carrying the exception itself. The kindled-facing tool (`reconcile_self_read`) reads this; the extractor's call ignores it.
+        """
+        amounts = resolve_emotions(emotions, signed=True, check=self.persona_dir)
         if not amounts:  # an empty change folds nothing
-            return
-        self._queue(Event(kind="change", at=at if at is not None else self._now(), emotions=amounts, source=source))
+            return HookOutcome(False)
+        queued = self._queue(Event(kind="change", at=at if at is not None else self._now(), emotions=amounts, source=source))
+        if queued:
+            return HookOutcome(True)
+        return HookOutcome(False, OSError, file=engine_files.queue_path(self.persona_dir))
 
     @_never_raises
     def on_memory_shown(self, memory: Memory, at: datetime | None) -> None:
@@ -288,19 +334,21 @@ class EmotionEngine:
             )
         )
 
-    def _resolved_faded(self, memory: Memory) -> dict[str, float]:
+    def _resolved_faded(self, memory: Memory, *, check_names: bool = True) -> dict[str, float]:
         """The memory's emotions as the engine folds them: faded, names canonical, each held to 0-10, bad values dropped.
 
         A name whose faded value cannot be worked out is left out with a log line, so one bad name does not stop the others.
-        The memory is read, never changed. This is `memory_feelings(memory).feelings`, as a copy.
+        The memory is read, never changed. This is `memory_feelings(memory, check_names=check_names).feelings`, as a copy.
+        `check_names=False` is for a row the store has just checked, and for a stored row replayed under the lock (spec section 7:
+        an unknown name on a stored memory is kept, and no call to the bridge is made under the lock).
         """
-        return dict(self.memory_feelings(memory).feelings)
+        return dict(self.memory_feelings(memory, check_names=check_names).feelings)
 
     @staticmethod
     def _stored_climax(memory: Memory) -> float:
         """The memory's STORED climax value (the climax test is on the stored value, the fold uses the faded one), 0.0 if none."""
         stored = {name: value for name, value in memory._stored_emotions.items() if isinstance(name, str) and vocabulary.canonical_name(name) == "climax"}
-        return resolve_emotions(stored).get("climax", 0.0)
+        return resolve_emotions(stored, check="tidy").get("climax", 0.0)  # `climax` is a framework name: nothing to ask
 
     def _modifier(self, memory: Memory, kind: str, *, trust_memo: dict[str, float] | None = None) -> float:
         """The source modifier: trust is asked for a peer memory that names its peer, and is 0.0 otherwise.
@@ -317,10 +365,11 @@ class EmotionEngine:
     def _trust_in(self, peer_id: str, memo: dict[str, float] | None) -> float:
         """How far the persona trusts `peer_id`, the one place that calls `engine_files.peer_trust`.
 
-        The kindled-link accessor answers 0.0 for no database, no row, a database error or an unreadable row. Anything else it
-        raises (an `OSError` from a permission fault on its database path) becomes 0.0 here, the lowest weight, with a throttled
-        warning: a raise would drop a hook's event (`_never_raises`), fail a catch-up, or, inside a rebuild's replay, skip the
-        peer's row for good (a first rebuild cannot repair that later).
+        The kindled-link accessor answers 0.0 for no database, no row, a database error or an unreadable row. Any read fault in it,
+        a permission fault on its database path included, is answered 0.0 there, so this guard is a second safety net:
+        anything else it raises becomes 0.0 here, the lowest weight, with a throttled warning: a raise would drop a hook's
+        event (`_never_raises`), fail a catch-up, or, inside a rebuild's replay, skip the peer's row for good (a first rebuild
+        cannot repair that later).
         """
         if memo is not None and peer_id in memo:
             return memo[peer_id]
@@ -363,23 +412,34 @@ class EmotionEngine:
         if self._start_needed(created_at):
             self._apply(Event(kind="start", at=created_at))
 
-    def _queue(self, event: Event) -> None:
-        """Append `event` (a showing or a chat change) to the queue, holding the engine's lock for the append only.
+    def _queue(self, event: Event) -> bool:
+        """Append `event` (a showing or a chat change) to the queue, holding the engine's lock for the append only. True if it was queued.
 
         Accepted edge (E2, R12, owner 2026-10-21: "treat it as a fairly minor edge case, noted in code"): an entry can be lost
         (a failed append, a hook that raised, a lock wait that timed out, a crash between the commit and this append, a line
         damaged by an unclean stop). `state_lock` is the bounded acquisition: a hook's caller does not wait for ever, and the
         guard (`_never_raises`) handles its `LockTimeoutError`. It is not recovered. A lost entry is a minor edge while
         appends succeed; a fault that persists loses every entry for as long as it lasts, and the log line is then the only
-        signal. `append_event` logs a failed append and returns False; nothing more is done with that here.
+        signal. `append_event` logs a failed append and returns False; that result is returned here, and `fold_change` passes
+        it on to its caller (a chat change that was not queued is reported, not folded).
 
-        A chat change of a LIVE persona also goes to the change log first, inside the same lock hold: a rebuild replays it
-        from there, because the queue is emptied at a rebuild.
+        A chat change of a LIVE persona also goes to the change log, inside the same lock hold, AFTER the queue append
+        succeeded: a rebuild replays it from there, because the queue is emptied at a rebuild. The queue comes first so a
+        change that did not reach the queue leaves nothing in either file, and the caller's retry cannot leave a second copy.
+        Accepted edges that remain (E7.18, `engine_rebuild.py`, and design 2.10: "the change still folds through the queue, so
+        only a later rebuild loses it"): the change-log append failing alone, or a crash between the two appends, leaves the
+        change folding live with no change-log line. A failure of the change-log step is logged and never turns a queued
+        change into a reported loss.
         """
         with engine_files.state_lock(self.persona_dir):
-            if event.kind == "change" and self.is_live():
-                engine_files.append_change(self.persona_dir, event)
-            engine_files.append_event(self.persona_dir, event)
+            to_log = event.kind == "change" and self.is_live()
+            queued = engine_files.append_event(self.persona_dir, event)
+            if queued and to_log:
+                try:
+                    engine_files.append_change(self.persona_dir, event)
+                except Exception:  # noqa: BLE001  the change is queued: report that, and say here what was lost
+                    logger.error("emotion engine: the change log line of a queued change was not written", exc_info=True)
+            return queued
 
     # --- the direct apply and the batch scope --------------------------------------------------------
 
@@ -487,7 +547,7 @@ class EmotionEngine:
 
     def _replay_emotions(self, memory: Memory) -> Mapping[str, float]:
         """What the catch-up folds for a stored row: its faded emotions when it counts, nothing when it does not."""
-        return self._resolved_faded(memory) if counted_kind(memory) is not None else {}
+        return self._resolved_faded(memory, check_names=False) if counted_kind(memory) is not None else {}
 
     def _replay_modifier_with_memo(self) -> Callable[[Memory], float]:
         """The `modifier_of` of ONE catch-up or rebuild: a peer's trust is asked once, the memo is a dict of this call.
@@ -775,7 +835,7 @@ class EmotionEngine:
         if refresh is None:
             return
         try:
-            refresh(engine_files.vocabulary_path(self.persona_dir))
+            refresh(vocabulary_file.vocabulary_path(self.persona_dir))
         except Exception as exc:
             failure = f"{type(exc).__name__}: {exc}"
             if failure not in self._refresh_logged:
@@ -837,18 +897,22 @@ class EmotionEngine:
         `KeyError` naming the memory id and the emotion when the memory has no such emotion: "absent" is for the caller to decide.
         """
         switched = self._switch_over_at if self.is_live() else None  # set by `is_live`
-        value = faded_emotion(memory, emotion, self.half_life, switched, self._now())
-        return resolve_emotions({emotion: value}).get(vocabulary.canonical_name(emotion), 0.0)
+        value = faded_emotion(memory, emotion, self._half_lives_for(memory), switched, self._now())
+        return resolve_emotions({emotion: value}, check=self.persona_dir).get(vocabulary.canonical_name(emotion), 0.0)
 
-    def memory_feelings(self, memory: Memory) -> MemoryFeelings:
+    def memory_feelings(self, memory: Memory, *, check_names: bool = True) -> MemoryFeelings:
         """The one read of a memory's feelings, peak and score, with this engine's half-lives, switch time and clock.
 
         `engine_utils.memory_feelings` with `half_life`, the switch-over time this instance has seen (None before the switch
         and when the state cannot be read: nothing fades) and the clock as it is now. The feelings are worked out on first
         access, at the time read here. The memory is read, never changed, and no store is read.
+
+        The names of the memory are checked against her vocabulary (`resolve_emotions`, one lookup for the whole memory) unless
+        `check_names` is False (see `_resolved_faded`).
         """
         switched = self._switch_over_at if self.is_live() else None  # set by `is_live`
-        return memory_feelings(memory, self.half_life, switched, self._now())
+        check = self.persona_dir if check_names else "tidy"
+        return memory_feelings(memory, self._half_lives_for(memory), switched, self._now(), check)
 
     def feels_high(self, name: str) -> bool:
         """Whether the feeling `name` is high now: the one predicate the readers that used to fire on a fixed level call.
@@ -881,19 +945,40 @@ class EmotionEngine:
     def half_life(self, emotion: str) -> float:
         """The emotion's half-life in days.
 
-        The name is made canonical first (`vocabulary.canonical_name`), because the persona file's
-        names are made canonical the same way. Order: the persona's vocabulary file (an entry with a
-        numeric half-life; a null entry is "never fades" and the lookup goes on), then
+        The name is made canonical first (`vocabulary.canonical_name`), because her vocabulary is matched
+        by the tidied name. Order: her vocabulary, through the lookup (`engine_files.VocabularyHalfLives`: a persona entry
+        with a numeric half-life; a null entry is "never fades" and the lookup goes on; a framework name has none), then
         `dev_constants.EMOTION_HALF_LIFE_DAYS`, then `dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS`.
         """
         name = vocabulary.canonical_name(emotion)
-        persona = self._vocabulary.get(name)
+        return self._half_life_of(name, self._vocabulary.get_many([name]).get(name))
+
+    @staticmethod
+    def _half_life_of(name: str, persona: float | None) -> float:
+        """The order of `half_life` once her vocabulary has answered: that number, else the table, else the default."""
         if persona is not None:
             return persona
         table = dev_constants.EMOTION_HALF_LIFE_DAYS.get(name)
         if table is not None:
             return table
         return dev_constants.EMOTION_DEFAULT_HALF_LIFE_DAYS
+
+    def _half_lives_for(self, memory: Memory) -> Callable[[str], float]:
+        """The half-life lookup for ONE memory's feelings: her vocabulary is asked once, for every name the memory holds.
+
+        The first call asks (one lookup for the whole memory, never one per name: spec section 5); a memory whose names are all
+        framework names, or whose feelings are never read, asks nothing. The answer is not kept past this memory.
+        """
+        persona: dict[str, float] | None = None
+
+        def half_life(emotion: str) -> float:
+            nonlocal persona
+            if persona is None:
+                persona = self._vocabulary.get_many(memory._stored_emotions)
+            name = vocabulary.canonical_name(emotion)
+            return self._half_life_of(name, persona.get(name))
+
+        return half_life
 
     # --- the daily pass and recovery ---------------------------------------------------------------
 

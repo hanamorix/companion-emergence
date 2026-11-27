@@ -785,6 +785,55 @@ REMOVED: tuple[Removed, ...] = (
             "brain/memory/store.py",
         ),
     ),
+    # --- the predefined `body_grief` feeling (#652) -----------------------------------------------------------------------
+    Removed(
+        names=("body_grief",),
+        why="a feeling like this comes from the kindled naming it herself, so it is not predefined: it left the migrator's canonical personal-emotions list and the body temperature rule; a persona whose memories carry it keeps it as an ordinary feeling through the vocabulary repair",
+        ref="#652 (draft PR #656)",
+        kind="code",
+    ),
+    # --- the research gate's emotion setting (#653) ------------------------------------------------------------------------
+    Removed(
+        names=("research_emotion_threshold",),
+        why="the research gate asks the emotion engine's own reading of high (`feels_high`) and holds no level of its own, so the setting had no reader and left HeartbeatConfig; an old heartbeat_config.json that still holds the key loads and drops it on the next save",
+        ref="#653 (draft PR #656)",
+        kind="code",
+    ),
+    # --- the emotion backfill job (#747) -----------------------------------------------------------------------------------
+    Removed(
+        names=(
+            "run_emotion_backfill",
+            "has_emotion_backfill_work",
+            "should_run_emotion_backfill",
+            "EmotionBackfillState",
+            "_make_default_tagger",
+            "has_active_without_emotions",
+            "emotion_backfill",
+            "emotion_backfill_state.json",
+            "emotion_backfill_budget.json",
+        ),
+        why="the emotion backfill is a step of the consolidation gate (a written or recalled memory without feelings is tagged by `tag_if_feelingless`), so the idle job with its cursor, daily cap, pacing, yield-to-chat and two state files is gone; the tagger now lives in brain/ingest/emotion_tagger.py and its prompt-string section is `[ingest.emotion_tagger]`",
+        ref="#747 (draft PR #656)",
+        kind="code",
+    ),
+    Removed(
+        names=("ingest.emotion_backfill",),
+        why="the tagger's prompt-string section is `[ingest.emotion_tagger]`; the old section name belonged to the removed backfill job",
+        ref="#747 (draft PR #656)",
+        scope=("brain/prompt_strings.toml", "brain/ingest/emotion_tagger.py"),
+    ),
+    Removed(
+        names=("brain/ingest/emotion_backfill.py",),
+        why="the emotion backfill module was deleted with the job (#747)",
+        ref="#747 (draft PR #656)",
+        kind="file",
+    ),
+    Removed(
+        names=("emotion_backfill",),
+        why="the app's status label for the removed emotion backfill job (#747)",
+        ref="#747 (draft PR #656)",
+        scope=("app/src",),
+    ),
     # --- the old max-pool aggregate leaves the writers' off branches (B1 PR 7), so Engine 7 can delete it ----------------
     Removed(
         names=("aggregate_state", "compute_body_state"),
@@ -812,6 +861,72 @@ REMOVED: tuple[Removed, ...] = (
         names=("_StoppedWhileWaitingError", "stop_requested", "stop_requested_seen"),
         why="the stop check of the engine-lock wait: the bridge's start-up no longer rebuilds in-process, the rebuild process (`nell supervisor rebuild`) waits for the lock with no stop check and no limit (`_locked_rebuild(wait_for_lock=True)`), so the `stop_requested` parameters, the stopped-while-waiting error and the test stub's `stop_requested_seen` list went (`stop_requested_at`, the bridge's stop time, is a different name)",
         ref="Engine 6 S107 HS8 (#633, Planning B55)",
+        kind="code",
+    ),
+    # --- one tidier and one gate for feeling names (#801) ----------------------------------------------------------------------
+    Removed(
+        names=("_is_valid_name", "_INVALID_NAME_CHARS"),
+        why="the growth scheduler's own name check (refused only / \\ { } and empty) is replaced by `vocabulary.gate_name`, the one gate of a feeling name",
+        ref="#801 (draft PR #803), build step 1",
+        kind="code",
+        scope=("brain/growth/scheduler.py",),
+    ),
+    # --- one shared writer of her vocabulary file (#741, #801 step 3) -----------------------------------------------------------
+    Removed(
+        names=("_append_to_vocabulary", "_atomic_write_vocab", "_merge_variant_entries", "_register_from_data", "_vocab_schema_validator", "_default_vocab_factory", "_DEFAULT_VOCAB", "_VOCABULARY_BACKUPS"),
+        why="every change to her vocabulary file goes through `brain/emotion/vocabulary_file.py`: the scheduler's append, the vocabulary repair's atomic write and twin merge (now `merge_twin_entries`), the loader's own register helper, schema validator and default factory, and the swap's bare backup count (the shared `backup_count`) went",
+        ref="#741 / #801 (draft PR #803), build step 3",
+        kind="code",
+    ),
+    Removed(
+        names=("_SEPARATOR_RUN",),
+        why="the tagger's own separator step is removed: `vocabulary.canonical_name` is the one tidier (the same name now lives in `brain/emotion/vocabulary.py`, so the scope is the tagger file alone)",
+        ref="#801 (draft PR #803), build step 1",
+        kind="code",
+        scope=("brain/ingest/emotion_tagger.py",),
+    ),
+    # --- the bridge owns her vocabulary; other readers use the lookup (#801 step 4) ---------------------------------------------
+    Removed(
+        names=("_VOCABULARY_FILENAME", "vocabulary_path", "_StatKey", "_Entry", "_Fault", "_emotions_list", "_classify", "_refresh"),
+        why="the engine's half-life lookup no longer reads her vocabulary file (its stat-key cache, entry classifier and file-name helper went): `VocabularyHalfLives` asks `vocabulary_access.lookup`, and the one join of her file's name to a persona folder is `vocabulary_file.vocabulary_path`",
+        ref="#801 (draft PR #803), build step 4",
+        kind="code",
+        scope=("brain/emotion/engine_files.py",),
+    ),
+    # --- the check on feeling names replaces the old filters (#801 step 5) ---------------------------------------------------
+    Removed(
+        names=("_filter_to_registered", "list_by_emotion", "valid_emotions", "_load_read_only"),
+        why="the registered-name filters of the extractor, the tagger and ingest are replaced by the check on a memory's feeling names (`MemoryStore.checked`, `resolve_emotions`, `vocabulary_access.names_used`), which adds a name that passes the gate; `list_by_emotion` had no caller; the read-only load is the public `vocabulary_access.load_read_only`",
+        ref="#801 (draft PR #803), build step 5",
+        kind="code",
+    ),
+    # --- one spelling of her file's name (#803 step 17) -------------------------------------------------------------------------
+    Removed(
+        names=("_VOCABULARY_FILE",),
+        why="the walker's own copy of her vocabulary file's name went: the name is spelled once, as `vocabulary.VOCABULARY_FILENAME`, and tests/unit/test_vocabulary_bypass_guards.py fails on the literal anywhere else in brain/",
+        ref="#803 step 17 (bypass guards)",
+        kind="code",
+        scope=("brain/health/walker.py",),
+    ),
+    # --- core feelings are never in her file; the #648 swap is gone (#801 step 7) --------------------------------------------------
+    Removed(
+        names=("vocabulary_swap", "run_vocabulary_swap_648", "_SWAPPED_NAMES", "_swap_file", "vocabulary_swap_648.json"),
+        why="the one-time #648 swap of four entries is replaced by section 8 of #801: a core feeling is never written to her vocabulary file, and `vocabulary_file.remove_core_entries` removes any entry the file holds for one at every bridge start-up and in the rebuild step; no marker file is kept, and an old `vocabulary_swap_648.json` is left on disk and never read",
+        ref="#741 / #801 (draft PR #803), build step 7",
+        kind="code",
+    ),
+    # --- the merge of saved feelings is one function over all the twins (#801 step 10) ---------------------------------------------
+    Removed(
+        names=("merge_emotion_states", "_merged_average"),
+        why="saved keys that land on one name are merged by one function over the list of twins (`engine_utils.merge_twin_emotion_states`), not pairwise in file order, so no twin weighs more for its place in the file; the window cut and the per-day run build it shares with `close_days` are `cut_snapshot_window` and `run_record_after`",
+        ref="#741 / #801 (draft PR #803), build step 10 (SV6)",
+        kind="code",
+    ),
+    # --- every process's copy of her vocabulary follows the file (#803 step 15, VC2) ------------------------------------------------
+    Removed(
+        names=("register_entries", "_READ_ONLY_LOADED"),
+        why="every load of her vocabulary file is one exact reload (`vocabulary_file.reload_entries`, `reload`: names the file no longer holds are removed, an unchanged file changes nothing), and the read-only copy's own stat-key dict is folded into the one check every copy goes through (`vocabulary.follow_file`)",
+        ref="#741 / #801 (draft PR #803), build step 15 (VC2)",
         kind="code",
     ),
 )

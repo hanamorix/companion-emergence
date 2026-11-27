@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, replace
 from typing import Any
 
 from brain.memory.store import Memory, _coerce_utc, clamp_importance
@@ -43,11 +44,18 @@ class SkippedMemory:
     raw_snippet: str  # truncated human-readable excerpt of the original
 
 
-def transform_memory(og: dict[str, Any]) -> tuple[Memory | None, SkippedMemory | None]:
+def transform_memory(
+    og: dict[str, Any], checked: Callable[[Memory], Memory] | None = None
+) -> tuple[Memory | None, SkippedMemory | None]:
     """Transform a single OG memory dict into a new Memory.
 
     Returns (memory, None) on success, (None, SkippedMemory) on skip.
-    Never raises — all malformed input surfaces as a SkippedMemory.
+    Never raises on malformed input: all of it surfaces as a SkippedMemory.
+
+    `checked` is the store's check on a memory's feelings (`MemoryStore.checked`), or None for a caller that keeps the names it
+    brings. When given, it runs once on the memory built here (a skipped row never reaches it), the returned memory carries the
+    checked feelings, and a legacy row with no numeric importance gets its importance from those kept feelings. An exception the
+    check raises (it can ask the bridge or take the vocabulary file's lock) is not caught here.
     """
     og_id = og.get("id")
     if not og_id or not isinstance(og_id, str):
@@ -130,13 +138,16 @@ def transform_memory(og: dict[str, Any]) -> tuple[Memory | None, SkippedMemory |
     # start at the bottom of the scale. A numeric-but-oversized OG value
     # (e.g. 50.0) is clamped, same as every other create_new/from_stored_row
     # boundary (finding #4).
+    #
+    # #803 step 13: a legacy importance that is derived (no numeric value in the row) comes from the feelings the store's check KEEPS,
+    # not from the raw ones, so a feeling the check drops, or two spellings it averages, leave no trace in it. The check is handed in
+    # (`checked`, the store's own) and runs here, on the memory built below, so the importance is decided where it is made.
     importance_raw = og.get("importance")
-    if isinstance(importance_raw, (int, float)) and not isinstance(importance_raw, bool):
+    importance_given = isinstance(importance_raw, (int, float)) and not isinstance(importance_raw, bool)
+    if importance_given:
         importance = clamp_importance(importance_raw)
-    elif emotions:
-        importance = float(_calc_importance_from_emotions(emotions))
     else:
-        importance = 4.0
+        importance = _derived_importance(emotions)
 
     # tags: only accept a real list. list("mytag") would explode a string
     # into ['m','y','t','a','g']; list({"a":1}) would pull dict keys. Both
@@ -158,7 +169,19 @@ def transform_memory(og: dict[str, Any]) -> tuple[Memory | None, SkippedMemory |
         active=bool(og.get("active", True)),
         metadata=metadata,
     )
+    if checked is not None:
+        mem = checked(mem)
+        if not importance_given:
+            # the kept feelings as stored on the checked copy, through the memory's public serialised form
+            mem = replace(mem, importance=_derived_importance(mem.to_dict()["emotions"]))
     return mem, None
+
+
+def _derived_importance(emotions: dict[str, float]) -> float:
+    """The importance of a legacy row that has none: the OG bucket of its feelings, or a moderate 4.0 when it has none."""
+    if emotions:
+        return float(_calc_importance_from_emotions(emotions))
+    return 4.0
 
 
 def _snippet(og: dict[str, Any], max_len: int = 120) -> str:

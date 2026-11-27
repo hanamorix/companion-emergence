@@ -371,8 +371,9 @@ def _make_emotion_memory(store, *, channel: str, value: float, days_ago: float):
     store.create(m)
 
 
-def test_derive_intensity_drivers_emotional_intensity_high_deviation(tmp_path: Path) -> None:
+def test_derive_intensity_drivers_emotional_intensity_high_deviation(tmp_path: Path, register_feelings) -> None:
     """A memory with sorrow far above the 15-memory baseline saturates the driver."""
+    register_feelings("sorrow", persona_dir=tmp_path)  # a feeling her vocabulary holds beyond the framework's own
     from brain.bridge.supervisor import _dormant_emotional_intensity
     from brain.felt_time.state import FeltTimeState, persist
     from brain.memory.store import MemoryStore

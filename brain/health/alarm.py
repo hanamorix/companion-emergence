@@ -5,13 +5,14 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from brain.emotion.vocabulary import VOCABULARY_FILENAME
 from brain.health.anomaly import AlarmEntry
 from brain.health.json_io import Recovery, iter_jsonl, read_jsonl_tail
 from brain.utils.time import parse_iso_utc
 
 _IDENTITY_FILES = frozenset(
     {
-        "emotion_vocabulary.json",
+        VOCABULARY_FILENAME,
         "interests.json",
         "reflex_arcs.json",
         "voice.md",

@@ -128,36 +128,9 @@ def test_pass2_queue_defers_when_not_idle(monkeypatch, tmp_path: Path) -> None:
     pass2_queue.reset()
 
 
-def test_emotion_backfill_yields_when_not_idle(monkeypatch, tmp_path: Path) -> None:
-    from brain.bridge import cli_throttle
-    from brain.ingest.emotion_backfill import run_emotion_backfill
-    from brain.memory.store import Memory, MemoryStore
-
-    monkeypatch.setattr(cli_throttle, "is_chat_idle", lambda **_: False)
-
-    store = MemoryStore(str(tmp_path / "memories.db"), integrity_check=False)
-    m = Memory.create_new(
-        content="a memory long enough to clear the embed min-chars floor",
-        memory_type="conversation",
-        domain="us",
-    )
-    store.create(m)
-    store.close()
-
-    calls = {"n": 0}
-
-    def tagger(_memory):
-        calls["n"] += 1
-        return {"loneliness": 7.0}
-
-    state = run_emotion_backfill(tmp_path, tagger_fn=tagger, cap=50, delay_s=0)
-    assert calls["n"] == 0
-    assert state.status != "complete"
-
-
 # The full 2-plan §3.2 caller enumeration (file:line as the plan states them),
-# minus the 3 callers already given dedicated runtime tests above
-# (self_model/articulate.py, chat/pass2_queue.py, ingest/emotion_backfill.py)
+# minus the 2 callers already given dedicated runtime tests above
+# (self_model/articulate.py, chat/pass2_queue.py)
 # and the supervisor.py session-snapshot/prune block (its own dedicated
 # runtime test lives in test_supervisor.py). Stage-6 code red-team MINOR
 # (label-audit gap): C4(c)'s own wording ("every caller... a test flips a

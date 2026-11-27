@@ -57,7 +57,7 @@ def _persona(tmp_path: Path, *rows: Memory) -> Path:
     store = MemoryStore(tmp_path / "memories.db")
     try:
         for memory in rows:
-            store.create(memory, fold=False)
+            store.create(memory, fold=False, check_names=False)  # fixture rows stand for rows an older version stored
     finally:
         store.close()
     return tmp_path

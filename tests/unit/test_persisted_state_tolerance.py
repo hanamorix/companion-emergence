@@ -114,17 +114,6 @@ def test_felt_time_anchors_and_pressure(tmp_path):
     assert state.horizon_pressure["day"].prev_counters == counters
 
 
-def test_emotion_backfill_state(tmp_path):
-    from brain.ingest import emotion_backfill as eb
-
-    es = eb.EmotionBackfillState(started_at="2026-09-26T00:00:00Z", total_memories=10,
-                                 tagged_memories=4, last_cursor="m4", status="running",
-                                 schema_version="1")
-    eb._save_state(tmp_path, es)
-    _add_future_field(eb._state_path(tmp_path))
-    assert eb._load_state(tmp_path) == es
-
-
 def test_emotional_snapshot():
     from brain.initiate.schemas import EmotionalSnapshot
 

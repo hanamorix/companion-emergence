@@ -90,7 +90,8 @@ def _long_text(marker: str, *, size: int = 1600) -> str:
 
 
 def _gate(tmp, store, hebbian, provider):
-    return run_consolidation(store, persona_dir=tmp, hebbian=hebbian, provider=provider)
+    # No emotion tagger: these tests count and read the judge's calls, and a tagger built from the provider would add its own.
+    return run_consolidation(store, persona_dir=tmp, hebbian=hebbian, provider=provider, emotion_tagger=lambda _m: {})
 
 
 @pytest.mark.parametrize("verdict", _NEW_VERDICTS)

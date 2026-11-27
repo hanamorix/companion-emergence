@@ -1,0 +1,123 @@
+"""Ratchet: only the shared module writes her vocabulary file (#741, #801 section 4, criterion 3).
+
+`brain/emotion/vocabulary_file.py` is the one writer of `emotion_vocabulary.json` (json_io's own corrupt-file recovery adds no
+name and mentions no vocabulary path). This test scans every call in `brain/` that writes a file (`write_json`,
+`write_text`, `os.replace`, `shutil.copy`, `open(..., "w")` and the like) and flags one whose arguments, keywords or receiver
+mention `vocab` (a `vocab_path`, a `vocabulary_path(...)`, `emotion_vocabulary.json`). A hit outside the
+shared module is a failure unless the file is in `KNOWN_EXCEPTIONS`. The list is empty: every writer, the rebuild step's removal of
+core entries and the migrator's first vocabulary file included, calls the shared module (spec section 9). A file added to the list
+must still hold a hit, so the list cannot go stale.
+
+The scan is by name: a write whose arguments never mention `vocab` (a bare `path` parameter) is not seen. The spies on `write_json`
+for the rebuild step and the migrator (spec criterion 10) are the complement:
+`tests/unit/brain/migrator/test_migrator_vocabulary_first.py` and `tests/bridge/test_core_entries_removed_startup.py`. So is
+`tests/unit/test_vocabulary_bypass_guards.py`, which pins every use of the path function and the file-name constant by where the
+path comes from, whatever the write call is named (#803 step 17). `open` is a write when a mode letter string in either of its first
+two positions starts with w, a or x or holds a `+` (`open(p, "w")`, `p.open("w")`, `p.open(mode="r+")`). Not seen: `os.open(p, os.O_WRONLY)`
+and a mode held in a variable.
+"""
+
+from __future__ import annotations
+
+import ast
+import re
+from collections.abc import Mapping
+
+import pytest
+
+from tests.source_tree import tree_asts
+
+SHARED_MODULE = "brain/emotion/vocabulary_file.py"
+
+# file -> why it may write her vocabulary file outside the shared module. Empty: none does.
+KNOWN_EXCEPTIONS: dict[str, str] = {}
+
+# Calls that write a file or put one in place.
+_WRITE_NAMES = frozenset(
+    {"write_json", "write_jsonl", "save_bytes_atomic", "write_text", "write_bytes", "replace", "rename", "copy", "copy2", "copyfile", "move"}
+)
+_WRITE_MODES = ("w", "a", "x")
+_MODE_LETTERS = re.compile(r"[rwxabt+U]+")
+
+
+def _call_name(call: ast.Call) -> str:
+    func = call.func
+    if isinstance(func, ast.Attribute):
+        return func.attr
+    if isinstance(func, ast.Name):
+        return func.id
+    return ""
+
+
+def _is_write_open(call: ast.Call) -> bool:
+    """An `open` call with a write mode. The mode is the second argument of `open(path, mode)` / `io.open(path, mode)` and the
+    first of `Path.open(mode)`, so both positions are looked at whatever the receiver is; a string counts as a mode only when it is
+    made of mode letters (a file name that starts with w, a or x is not one)."""
+    if _call_name(call) != "open":
+        return False
+    modes = [a.value for a in call.args[:2] if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+    modes += [k.value.value for k in call.keywords if k.arg == "mode" and isinstance(k.value, ast.Constant) and isinstance(k.value.value, str)]
+    return any(_MODE_LETTERS.fullmatch(m) and (m[:1] in _WRITE_MODES or "+" in m) for m in modes)
+
+
+def vocabulary_write_hits(trees: Mapping[str, ast.Module]) -> dict[str, list[int]]:
+    """{file: [line, ...]} of write calls whose arguments, keywords or receiver mention `vocab` (case-insensitive)."""
+    hits: dict[str, list[int]] = {}
+    for rel, tree in trees.items():
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not (_call_name(node) in _WRITE_NAMES or _is_write_open(node)):
+                continue
+            parts = [ast.unparse(a) for a in node.args] + [ast.unparse(k.value) for k in node.keywords] + [ast.unparse(node.func)]
+            if any("vocab" in p.lower() for p in parts):
+                hits.setdefault(rel, []).append(node.lineno)
+    return hits
+
+
+@pytest.mark.no_base_failure(reason="a ratchet over the whole tree: on the old code the writers it flags are all moved or listed, so it is a guard against new writers, not a fix")
+def test_only_the_shared_module_writes_her_vocabulary_file() -> None:
+    hits = vocabulary_write_hits(tree_asts("brain"))
+    unexpected = {rel: lines for rel, lines in hits.items() if rel != SHARED_MODULE and rel not in KNOWN_EXCEPTIONS}
+    assert not unexpected, (
+        "Code other than brain/emotion/vocabulary_file.py writes her vocabulary file: "
+        + "; ".join(f"{rel}:{lines}" for rel, lines in sorted(unexpected.items()))
+        + ". Use vocabulary_file.add / replace_fields / merge / remove."
+    )
+    stale = sorted(rel for rel in KNOWN_EXCEPTIONS if rel not in hits)
+    assert not stale, f"these known exceptions no longer write her vocabulary file, remove them from KNOWN_EXCEPTIONS: {stale}"
+
+
+@pytest.mark.no_base_failure(reason="a self-test of the scanner function on synthetic trees; it does not read the product tree, so it passes on any base that has this file")
+def test_the_scanner_finds_a_synthetic_offender_and_ignores_a_state_file_write() -> None:
+    offender = ast.parse("from x import write_json\ndef f(vocab_path, data):\n    write_json(vocab_path, data, backups=3)\n")
+    keyword_only = ast.parse("def g(path, data):\n    write_json(path, data, backups=_VOCABULARY_BACKUPS)\n")
+    receiver = ast.parse("def h(p):\n    vocabulary_path(p).write_text('x')\n")
+    opened = ast.parse("def o(vocab_path):\n    open(vocab_path, 'w')\n")
+    unrelated = ast.parse("def s(path, state):\n    write_json(path, state, indent=2)\n")
+    reads = ast.parse("def r(vocab_path):\n    return open(vocab_path).read()\n")
+    trees = {"a.py": offender, "b.py": keyword_only, "c.py": receiver, "d.py": opened, "e.py": unrelated, "f.py": reads}
+    assert set(vocabulary_write_hits(trees)) == {"a.py", "b.py", "c.py", "d.py"}
+
+
+@pytest.mark.parametrize(
+    ("source", "is_write"),
+    [
+        ("vocab_path.open('w')", True),
+        ("vocab_path.open(mode='w')", True),
+        ("vocab_path.open('a', encoding='utf-8')", True),
+        ("io.open(vocab_path, 'w')", True),
+        ("open(vocab_path, mode='x')", True),
+        ("vocab_path.open('r+')", True),
+        ("vocab_path.open('rb+')", True),
+        ("vocab_path.open('r')", False),
+        ("vocab_path.open()", False),
+        ("open(vocab_path)", False),
+        ("open('wiki.txt')", False),
+        ("vocab_path.open('wiki.txt')", False),
+    ],
+)
+@pytest.mark.no_base_failure(reason="a self-test of the open-mode reader on synthetic source; it does not read the product tree")
+def test_the_open_mode_is_read_from_either_position(source: str, is_write: bool) -> None:
+    call = ast.parse(source).body[0].value  # type: ignore[attr-defined]
+    assert _is_write_open(call) is is_write
+    # and through the whole scanner, which also needs `vocab` in the call's text
+    assert bool(vocabulary_write_hits({"x.py": ast.parse(source)})) is (is_write and "vocab" in source)

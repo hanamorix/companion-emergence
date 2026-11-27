@@ -49,37 +49,39 @@ def test_get_returns_none_for_unknown() -> None:
     assert vocabulary.get("nonsense") is None
 
 
-def test_list_all_contains_baseline_26() -> None:
-    """The baseline vocabulary ships 26 emotions (11 core + 11 complex + 4 body).
+def test_list_all_contains_baseline_30() -> None:
+    """The baseline vocabulary ships 30 emotions (12 core + 14 complex + 4 body).
 
-    memory_grief added in Phase 0.2 of the grief feature (v0.0.15-alpha.1).
+    memory_grief added in Phase 0.2 of the grief feature (v0.0.15-alpha.1); contentment, peace, calm and groundedness in #648.
     """
     all_emotions = vocabulary.list_all()
-    assert len(all_emotions) == 26
+    assert len(all_emotions) == 30
     assert all(isinstance(e, Emotion) for e in all_emotions)
 
 
-def test_by_category_core_has_eleven() -> None:
-    """The 'core' category has 11 emotions."""
+def test_by_category_core_has_twelve() -> None:
+    """The 'core' category has 12 emotions (contentment added in #648)."""
     core = vocabulary.by_category("core")
-    assert len(core) == 11
+    assert len(core) == 12
     names = {e.name for e in core}
     assert "love" in names
     assert "joy" in names
     assert "grief" in names
+    assert "contentment" in names
 
 
-def test_by_category_complex_has_eleven() -> None:
-    """The 'complex' category has 11 emotions.
+def test_by_category_complex_has_fourteen() -> None:
+    """The 'complex' category has 14 emotions.
 
-    memory_grief added in Phase 0.2 of the grief feature (v0.0.15-alpha.1).
+    memory_grief added in Phase 0.2 of the grief feature (v0.0.15-alpha.1); peace, calm and groundedness in #648.
     """
     complex_ = vocabulary.by_category("complex")
-    assert len(complex_) == 11
+    assert len(complex_) == 14
     names = {e.name for e in complex_}
     assert "nostalgia" in names
     assert "curiosity" in names
     assert "memory_grief" in names
+    assert {"peace", "calm", "groundedness"} <= names
 
 
 def test_baseline_excludes_nell_specific() -> None:
@@ -89,11 +91,11 @@ def test_baseline_excludes_nell_specific() -> None:
 
 
 def test_baseline_count_after_split() -> None:
-    """Framework baseline ships exactly 26 emotions (11 core + 11 complex + 4 body).
+    """Framework baseline ships exactly 30 emotions (12 core + 14 complex + 4 body).
 
-    memory_grief added in Phase 0.2 of the grief feature (v0.0.15-alpha.1).
+    memory_grief added in Phase 0.2 of the grief feature (v0.0.15-alpha.1); contentment, peace, calm and groundedness in #648.
     """
-    assert len(vocabulary._BASELINE) == 26
+    assert len(vocabulary._BASELINE) == 30
 
 
 def test_canonical_personal_anchor_pull_is_identity_level() -> None:
@@ -104,13 +106,12 @@ def test_canonical_personal_anchor_pull_is_identity_level() -> None:
     assert anchor.decay_half_life_days is None
 
 
-def test_canonical_personal_emotions_has_five() -> None:
-    """The migrator's canonical personal-emotions fixture has the 5 known names."""
+def test_canonical_personal_emotions_has_four() -> None:
+    """The migrator's canonical personal-emotions fixture has the 4 known names (`body_grief` is not predefined, #652)."""
     from brain.emotion._canonical_personal_emotions import _CANONICAL
 
     assert set(_CANONICAL.keys()) == {
         "anchor_pull",
-        "body_grief",
         "emergence",
         "creative_hunger",
         "freedom_ache",
@@ -221,6 +222,161 @@ def test_canonical_name_sorts_blend_parts() -> None:
     assert canonical_name("Love-Grief_blend") == "grief_love_blend"
 
 
+@pytest.mark.parametrize(
+    "spelling",
+    ["c__b_a_blend", "_c_b__a_blend", "c_b_a__blend", "a_c__b_blend", "__a_b_c__blend"],
+)
+def test_three_part_blend_with_doubled_leading_or_trailing_separators_sorts_its_real_parts(spelling: str) -> None:
+    from brain.emotion.vocabulary import canonical_name
+
+    assert canonical_name(spelling) == "a_b_c_blend"
+
+
+def test_get_finds_a_registered_blend_by_a_doubled_separator_spelling() -> None:
+    e = vocabulary.Emotion(
+        name="love_grief_blend",
+        description="x",
+        category="persona_extension",
+        decay_half_life_days=14.0,
+        intensity_clamp=10.0,
+    )
+    vocabulary.register(e)
+    try:
+        stored = vocabulary.get("grief_love_blend")
+        assert stored is not None
+        for spelling in ("love_grief__blend", "love__grief_blend", "_love_grief_blend"):
+            assert vocabulary.get(spelling) is stored
+    finally:
+        vocabulary._unregister("grief_love_blend")
+
+
+def test_pool_by_canonical_name_pools_a_doubled_separator_spelling_with_its_twin() -> None:
+    from brain.emotion.vocabulary import pool_by_canonical_name
+
+    # the larger value comes first for one pair and last for the other, so neither first-wins nor last-wins passes
+    values = {"love_grief__blend": 6.0, "grief_love_blend": 2.0, "_gold_iron_blend": 1.0, "iron_gold_blend": 4.0}
+
+    assert pool_by_canonical_name(values) == {"grief_love_blend": 6.0, "gold_iron_blend": 4.0}
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("love_grief__blend", "grief_love_blend"),
+        ("love__grief_blend", "grief_love_blend"),
+        ("_love_grief_blend", "grief_love_blend"),
+        ("Love__Grief_Blend", "grief_love_blend"),
+        ("-love-grief--blend", "grief_love_blend"),
+        # the ends are trimmed first, so a bare "blend" is left and it has no "_blend" suffix to sort
+        ("__blend", "blend"),
+        ("_blend", "blend"),
+        # #801: every run of characters that are not letters or digits is one underscore, and the ends are trimmed
+        ("name____name", "name_name"),
+        ("name___name", "name_name"),
+        ("grief love blend", "grief_love_blend"),
+        ("Grief Love Blend", "grief_love_blend"),
+        ("love/grief_blend", "grief_love_blend"),
+        ("grief --/ love blend", "grief_love_blend"),
+        ("  _joy-- ", "joy"),
+        ("comfort seeking", "comfort_seeking"),
+        ("a+b/c", "a_b_c"),
+        ("Grün Gefühl", "grün_gefühl"),
+    ],
+)
+def test_canonical_name_changed_outputs_are_pinned(name: str, expected: str) -> None:
+    from brain.emotion.vocabulary import canonical_name
+
+    assert canonical_name(name) == expected
+
+
+def test_canonical_name_gives_one_name_to_every_spelling_the_issue_pins() -> None:
+    from brain.emotion.vocabulary import canonical_name
+
+    assert canonical_name("name____name") == canonical_name("name_name")
+    assert canonical_name("Grief Love Blend") == canonical_name("grief_love_blend") == "grief_love_blend"
+    assert canonical_name("love_grief__blend") == canonical_name("grief_love_blend")
+
+
+@pytest.mark.no_base_failure(reason="pins the 30 baseline names, which the widening leaves unchanged, so it passes on the old code by design")
+def test_canonical_name_leaves_the_baseline_names_unchanged() -> None:
+    from brain.emotion.vocabulary import _BASELINE, canonical_name
+
+    assert len(_BASELINE) == 30
+    for emotion in _BASELINE:
+        assert canonical_name(emotion.name) == emotion.name
+
+
+@pytest.mark.no_base_failure(reason="tidying a tidied name changing nothing is a property the old tidier also had for these inputs and the new one must keep, so it passes on the old code by design")
+@pytest.mark.parametrize(
+    "name",
+    ["Grief Love Blend", "name____name", "İyi", "  _a-b ", "love_grief__blend", "---", "", "x/y_blend", "__blend", "Á b"],
+)
+def test_canonical_name_is_idempotent(name: str) -> None:
+    from brain.emotion.vocabulary import canonical_name
+
+    once = canonical_name(name)
+    assert canonical_name(once) == once
+
+
+# --- the gate (#801) ----------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("raw", ["", "---", " / ", "___", "x" * 101, "x/" * 51])
+def test_gate_name_refuses_an_empty_or_too_long_name_and_logs_why(raw: str, caplog: pytest.LogCaptureFixture) -> None:
+    from brain.utils import log_throttle
+
+    log_throttle._last.clear()
+    with caplog.at_level("DEBUG", logger="brain.emotion.vocabulary"):
+        assert vocabulary.gate_name(raw) is None
+    records = [r for r in caplog.records if r.name == "brain.emotion.vocabulary"]
+    assert len(records) == 1 and records[0].levelname == "WARNING"
+    message = records[0].getMessage()
+    assert "refused" in message and ("empty" in message or "over the limit of 100" in message)
+    assert raw.strip() == "" or raw not in message  # the length is logged, never the name
+
+
+def test_gate_name_accepts_a_100_character_name_and_returns_the_tidied_form() -> None:
+    assert vocabulary.gate_name("x" * 100) == "x" * 100
+    assert vocabulary.gate_name("Comfort Seeking") == "comfort_seeking"
+    assert vocabulary.gate_name("joy") == "joy"
+    assert vocabulary.gate_name("grief_love__blend") == "grief_love_blend"
+
+
+def test_gate_name_measures_the_tidied_name_not_the_raw_one() -> None:
+    # 150 raw characters tidy to 99: the cap is on the name that would be stored
+    raw = "-" * 50 + "y" * 99 + "-" * 1
+    assert vocabulary.gate_name(raw) == "y" * 99
+
+
+def test_the_cap_is_the_dev_constant() -> None:
+    from brain import dev_constants
+
+    assert dev_constants.EMOTION_NAME_MAX_CHARS == 100
+
+
+@pytest.mark.no_base_failure(reason="pins canonical_name's outputs for names without an empty blend part, which the #800 fix leaves unchanged, so every row passes on the old code by design; the rows the fix changes are in test_canonical_name_changed_outputs_are_pinned")
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("joy", "joy"),
+        ("Joy", "joy"),
+        (" Present-ness ", "present_ness"),
+        ("Anticipatory-Grief", "anticipatory_grief"),
+        ("love_grief_blend", "grief_love_blend"),
+        ("Love-Grief_blend", "grief_love_blend"),
+        ("grief_love_blend", "grief_love_blend"),
+        ("comfort_seeking", "comfort_seeking"),
+        ("blend", "blend"),
+        ("joy2", "joy2"),
+        ("", ""),
+    ],
+)
+def test_canonical_name_outputs_are_pinned(name: str, expected: str) -> None:
+    from brain.emotion.vocabulary import canonical_name
+
+    assert canonical_name(name) == expected
+
+
 def test_get_resolves_variant_spellings_to_registered_entry() -> None:
     from brain.emotion import vocabulary
 
@@ -239,7 +395,8 @@ def test_get_resolves_variant_spellings_to_registered_entry() -> None:
         vocabulary._unregister("anticipatory_grief")
 
 
-def test_register_stores_under_canonical_name() -> None:
+def test_register_keeps_the_entrys_own_spelling_and_get_finds_it_by_any_spelling() -> None:
+    """#801 section 3: an entry keeps the spelling it was registered with (her file's spelling); a lookup matches by the tidied form."""
     from brain.emotion import vocabulary
 
     e = vocabulary.Emotion(
@@ -252,10 +409,56 @@ def test_register_stores_under_canonical_name() -> None:
     vocabulary.register(e)
     try:
         stored = vocabulary.get("grief_love_blend")
-        assert stored is not None
-        assert stored.name == "grief_love_blend"
+        assert stored is e
+        assert stored.name == "love_grief_blend"
+        assert vocabulary.get("Love Grief Blend") is e
     finally:
         vocabulary._unregister("grief_love_blend")
+    assert vocabulary.get("love_grief_blend") is None
+
+
+def test_an_entry_with_a_non_tidied_spelling_is_listed_and_found_as_spelled() -> None:
+    from brain.emotion import vocabulary
+
+    e = vocabulary.Emotion(
+        name="Comfort Seeking Two",
+        description="x",
+        category="persona_extension",
+        decay_half_life_days=14.0,
+        intensity_clamp=10.0,
+    )
+    vocabulary.register(e)
+    try:
+        assert [x.name for x in vocabulary.list_all() if x is e] == ["Comfort Seeking Two"]
+        assert [x.name for x in vocabulary.by_category("persona_extension") if x is e] == ["Comfort Seeking Two"]
+        for spelling in ("comfort_seeking_two", "COMFORT-SEEKING-TWO", "Comfort Seeking Two", " comfort  seeking two "):
+            assert vocabulary.get(spelling) is e
+    finally:
+        vocabulary._unregister("comfort_seeking_two")
+    assert vocabulary.get("Comfort Seeking Two") is None
+
+
+def test_a_second_spelling_of_a_registered_name_is_refused_and_the_first_stays() -> None:
+    from brain.emotion import vocabulary
+
+    first = vocabulary.Emotion("Quiet Dread", "first", "persona_extension", 3.0)
+    second = vocabulary.Emotion("quiet_dread", "second", "persona_extension", 4.0)
+    vocabulary.register(first)
+    try:
+        with pytest.raises(ValueError, match="already registered"):
+            vocabulary.register(second)
+        assert vocabulary.get("quiet_dread") is first
+    finally:
+        vocabulary._unregister("quiet_dread")
+
+
+@pytest.mark.no_base_failure(reason="the baseline names were already tidied, so the registry returned them unchanged on the old code too; this pins that they stay so")
+def test_the_baseline_entries_keep_their_names() -> None:
+    from brain.emotion import vocabulary
+
+    for e in vocabulary._BASELINE:
+        assert vocabulary.get(e.name) is e
+        assert e.name == vocabulary.canonical_name(e.name)
 
 
 def test_pool_by_canonical_name_collapses_spellings_to_the_max() -> None:

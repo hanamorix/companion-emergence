@@ -34,7 +34,8 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, date, datetime, time, timedelta
 from functools import cached_property
-from typing import TYPE_CHECKING, NamedTuple, get_args
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal, NamedTuple, get_args
 
 from brain import dev_constants
 from brain.emotion.vocabulary import canonical_name
@@ -536,17 +537,31 @@ def source_modifier(memory: Memory, trust: float) -> float:
     return _MODIFIER_FLOOR + _MODIFIER_SPAN * rating / _RATING_SCALE
 
 
-def resolve_emotions(raw: Mapping[str, object], *, signed: bool = False) -> dict[str, float]:
+Check = Path | Literal["registry", "tidy"]
+
+
+def resolve_emotions(raw: Mapping[str, object], *, signed: bool = False, check: Check) -> dict[str, float]:
     """The one step that turns an emotion map into the names and values the engine folds.
 
-    Names become canonical (`vocabulary.canonical_name`); two spellings of one name become one entry whose value is the
-    average of the two (this is not the reader's "keep the larger"); then each value is held to 0-10. A value that is not a
-    finite number is dropped with a log line. `signed=True` is for a change's amounts: the sign is kept and nothing is held.
+    First the check on her vocabulary (spec section 6), by `check`: a persona folder asks her vocabulary for that persona
+    (`vocabulary_access.names_used`: a name it does not hold and cannot add is discarded); `"registry"` asks this process's registry
+    only; `"tidy"` makes no check (a stored row replayed under the engine's lock, a row the store has just checked). Then names
+    become canonical (`vocabulary.canonical_name`; the result is keyed by the tidied name); two spellings of one name become one
+    entry whose value is the average of the two (this is not the reader's "keep the larger"); then each value is held to 0-10.
+    A value that is not a finite number is dropped with a log line. `signed=True` is for a change's amounts: the sign is kept and
+    nothing is held.
     """
+    used: dict[str, str | None] | None = None
+    if check != "tidy":
+        from brain.emotion import vocabulary_access
+
+        used = vocabulary_access.names_used(None if check == "registry" else check, [n for n in raw if isinstance(n, str)])
     groups: dict[str, list[float]] = {}
     for name, value in raw.items():
         if not isinstance(name, str):
             logger.warning("dropping an emotion whose name %r is not text", name)
+            continue
+        if used is not None and used.get(name) is None:
             continue
         try:
             number = None if isinstance(value, bool) or not isinstance(value, (int, float)) else float(value)
@@ -565,6 +580,18 @@ def resolve_emotions(raw: Mapping[str, object], *, signed: bool = False) -> dict
 # --- the one read of a memory's feelings ------------------------------------------------------------------------------
 
 
+def _stored_value(memory: Memory, emotion: str) -> float:
+    """The memory's stored value for `emotion`: under that exact name, else the mean over the names that tidy the same. KeyError if none."""
+    stored = memory._stored_emotions
+    if emotion in stored:
+        return stored[emotion]
+    wanted = canonical_name(emotion)
+    matches = [v for n, v in stored.items() if isinstance(n, str) and canonical_name(n) == wanted]
+    if not matches:
+        raise KeyError(f"memory {memory.id} has no stored value for emotion {emotion!r}")
+    return matches[0] if len(matches) == 1 else sum(matches) / len(matches)
+
+
 def faded_emotion(
     memory: Memory,
     emotion: str,
@@ -581,11 +608,12 @@ def faded_emotion(
     stored before the switch-over was never faded by the engine, and is not faded for the time before it); `now` and
     `half_lives` are used only then. It reads no store. Raises `KeyError` naming the memory id and the emotion when the memory
     has no such emotion: "absent" is for the caller to decide.
+
+    The stored value is found by the name as stored, else by tidied name (a row holding `Joy` answers for `joy`; several
+    spellings of one name answer with their average). No check on her vocabulary is made here: that is `resolve_emotions`, run
+    once per memory by `MemoryFeelings.feelings`, never once per name.
     """
-    try:
-        stored = memory._stored_emotions[emotion]
-    except KeyError:
-        raise KeyError(f"memory {memory.id} has no stored value for emotion {emotion!r}") from None
+    stored = _stored_value(memory, emotion)
     created = lenient_utc(memory.created_at)
     if switch_over_at is None or created is None:
         # Accepted edge (HR4, P4): a persona `ensure_engine_ready` left not live (an unreadable state with a memories.db
@@ -619,6 +647,7 @@ class MemoryFeelings:
     _half_lives: Callable[[str], float] | None = field(repr=False, compare=False)
     _switch_over_at: datetime | None = field(repr=False, compare=False)
     _now: datetime | None = field(repr=False, compare=False)
+    _check: Check = field(default="registry", repr=False, compare=False)
 
     @cached_property
     def feelings(self) -> dict[str, float]:
@@ -628,7 +657,7 @@ class MemoryFeelings:
                 faded[name] = faded_emotion(self._memory, name, self._half_lives, self._switch_over_at, self._now)
             except Exception:
                 logger.warning("emotion engine: no faded value for %r of memory %s; left out", name, self._memory.id, exc_info=True)
-        return resolve_emotions(faded)
+        return resolve_emotions(faded, check=self._check)
 
 
 def memory_feelings(
@@ -636,6 +665,7 @@ def memory_feelings(
     half_lives: Callable[[str], float] | None,
     switch_over_at: datetime | None,
     now: datetime | None,
+    check: Check = "registry",
 ) -> MemoryFeelings:
     """The one pure read of a memory's feelings, peak and score; it needs no engine running.
 
@@ -643,6 +673,10 @@ def memory_feelings(
     the current time. A reader with no engine (an in-memory store, salience, the prompt) passes None for all three: with
     `switch_over_at` None nothing fades and the stored values come back held (`half_lives` and `now` are unused). A stored
     negative reads as 0 in `feelings` and `peak`.
+
+    `check` is the check on her vocabulary that `feelings` makes (`resolve_emotions`): the default, `"registry"`, is for a reader with no
+    persona folder, which can only ask this process's registry; the engine passes its persona folder (one lookup for the whole
+    memory) or `"tidy"` for a row it replays under its lock.
     """
     return MemoryFeelings(
         peak=_held_or_zero(memory._stored_peak),
@@ -651,6 +685,7 @@ def memory_feelings(
         _half_lives=half_lives,
         _switch_over_at=switch_over_at,
         _now=now,
+        _check=check,
     )
 
 
@@ -872,6 +907,29 @@ def feels_high_from(short: float, shift: int, snapshot: Sequence[SnapshotDay]) -
 # --- the day close ---------------------------------------------------------------------------------------------------
 
 
+def cut_snapshot_window(days: Sequence[SnapshotDay], latest: str) -> list[SnapshotDay]:
+    """The snapshot days fewer than `EMOTION_LONG_HALF_LIFE_D` calendar days before `latest`: the one window cut.
+
+    `close_days` calls it with the day it closes and the merge of saved feelings (`merge_twin_emotion_states`) with its latest day.
+    """
+    window = dev_constants.EMOTION_LONG_HALF_LIFE_D
+    return [d for d in days if _days_between(d.day, latest) < window]
+
+
+def run_record_after(days: Sequence[SnapshotDay], index: int, day: str, long: float) -> RunRecord | None:
+    """The run record for `day`, whose long average is `long`, when it follows `days[index]`: the one per-day run build.
+
+    A zero move for each calendar day between `days[index]` and `day`, then the day's own move, through the run tracker seeded
+    by the record kept on `days[index]`. None when no run is in progress. `close_days` calls it before it appends the closing day
+    and the merge of saved feelings calls it for each merged day after the oldest.
+    """
+    previous = days[index]
+    off_days = [Move(_add_days(previous.day, n), 0.0) for n in range(1, _days_between(previous.day, day))]
+    moves = [*off_days, Move(day, long - previous.long)]
+    current = run_tracker(moves, seed=_seed_for(days, index)).current
+    return None if current is None else RunRecord(current.start_day, current.direction, current.last_with_day)
+
+
 def close_days(state: EngineState, t: datetime) -> None:
     """Close the open active day when `t` falls on a later day. Pure: mutates `state`, writes nothing, takes no flag.
 
@@ -903,20 +961,54 @@ def close_days(state: EngineState, t: datetime) -> None:
     needs_zero = [name for name, e in state.emotions.items() if e.long.weight > 0.0 and e.last_entry_day != closing]
     for name in needs_zero:
         _fold(state, name, _QUIET_DAY_VALUE, _QUIET_DAY_VALUE, _QUIET_DAY_WEIGHT, after, zero=True)
-    window = dev_constants.EMOTION_LONG_HALF_LIFE_D
     for e in state.emotions.values():
         if e.long.weight <= 0.0:
             continue
-        previous = e.snapshot[-1] if e.snapshot else None
-        run: RunRecord | None = None
-        if previous is not None:
-            off_days = [Move(_add_days(previous.day, n), 0.0) for n in range(1, _days_between(previous.day, closing))]
-            moves = [*off_days, Move(closing, e.long.avg - previous.long)]
-            current = run_tracker(moves, seed=_seed_for(e.snapshot, len(e.snapshot) - 1)).current
-            if current is not None:
-                run = RunRecord(current.start_day, current.direction, current.last_with_day)
+        run = run_record_after(e.snapshot, len(e.snapshot) - 1, closing, e.long.avg) if e.snapshot else None
         e.snapshot.append(SnapshotDay(closing, e.short.avg, e.long.avg, e.last_entry_day == closing, run))
-        e.snapshot = [d for d in e.snapshot if _days_between(d.day, closing) < window]
+        e.snapshot = cut_snapshot_window(e.snapshot, closing)
     if state.last_update is not None:
         state.last_update += _day_start(today) - after
     state.active_day = today
+
+
+def merge_twin_emotion_states(twins: Sequence[EmotionState]) -> EmotionState:
+    """One feeling's saved state made from all the saved keys that land on one name (#801 section 7). Pure: no input is changed.
+
+    The short and the long average are each the weighted mean over all the twins with the weights added: each later twin is
+    folded into a copy of the first by `_fold_average`, so every weight counts alike wherever the twin sits in the file; all
+    weights 0 keeps the first twin and a twin of weight 0 adds nothing. The latest `last_entry_day` across the twins is kept (a
+    missing one loses). The snapshots are joined by day: a day held by several twins gets the plain mean of their short values and
+    of their long values, and counts as felt if any twin felt it (a twin of weight 0 still counts here: its days are days she
+    lived); then `cut_snapshot_window` keeps the days within the window of the latest day. The oldest kept day keeps the run record
+    it was stored with (the first twin in file order that holds that day with one: nothing before it is known); every later day
+    gets its run from `run_record_after`, the same build `close_days` uses, seeded by the previous merged day's record.
+    """
+    if not twins:
+        raise ValueError("merge_twin_emotion_states needs at least one twin")
+    first = twins[0]
+    short = Average(first.short.avg, first.short.weight)
+    long = Average(first.long.avg, first.long.weight)
+    for twin in twins[1:]:
+        _fold_average(short, twin.short.avg, twin.short.weight)
+        _fold_average(long, twin.long.avg, twin.long.weight)
+    held: dict[str, list[SnapshotDay]] = {}
+    for twin in twins:
+        for day in twin.snapshot:
+            held.setdefault(day.day, []).append(day)
+    days = [
+        SnapshotDay(
+            key,
+            sum(d.short for d in same) / len(same),
+            sum(d.long for d in same) / len(same),
+            any(d.felt for d in same),
+            next((d.run for d in same if d.run is not None), None),
+        )
+        for key, same in sorted(held.items())
+    ]
+    if days:
+        days = cut_snapshot_window(days, days[-1].day)
+    for index in range(1, len(days)):
+        days[index] = days[index]._replace(run=run_record_after(days, index - 1, days[index].day, days[index].long))
+    last_days = [twin.last_entry_day for twin in twins if twin.last_entry_day is not None]
+    return EmotionState(short=short, long=long, last_entry_day=max(last_days) if last_days else None, snapshot=days)

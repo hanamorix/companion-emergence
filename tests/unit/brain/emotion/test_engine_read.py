@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from brain.emotion import engine, engine_files, persona_loader, vocabulary
+from brain.emotion import engine, engine_files, persona_loader, vocabulary, vocabulary_file
 from brain.emotion.engine_utils import Average, EmotionState, EngineState
 from brain.emotion.vocabulary import Emotion
 from tests.unit.brain.emotion._engine_support import (
@@ -205,7 +205,7 @@ def test_a_name_registered_by_another_process_appears_on_the_next_read_and_the_r
 
     monkeypatch.setattr(persona_loader, "refresh_if_changed", refresh, raising=False)
     assert NOVEL in install(persona).read()
-    assert asked == [engine_files.vocabulary_path(persona)]
+    assert asked == [vocabulary_file.vocabulary_path(persona)]
 
 
 def test_with_no_refresh_function_the_call_does_nothing_and_the_read_returns_the_registrys_names(

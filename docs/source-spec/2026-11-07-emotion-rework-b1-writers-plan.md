@@ -171,7 +171,7 @@ def test_live_pass2_lowers_the_feeling_and_writes_no_row(persona_dir, store):
 def test_live_pass2_unregistered_name_folds_nothing(persona_dir, store): ...
 ```
 
-Add the same live test in `test_reconcile.py` through `reconcile_self_read(persona_dir=..., action="revise", channel="joy", delta=-0.2)`, asserting `result["delta_written"] is True` and no `self_model_reconcile` row. Also assert that an off-vocabulary channel gives `delta_written` False.
+Add the same live test in `test_reconcile.py` through `reconcile_self_read(persona_dir=..., action="revise", channel="joy", delta=-0.2)`, asserting `result["delta_written"] is True` (the change reached the queue) and no `self_model_reconcile` row. Also assert that an off-vocabulary channel gives `delta_written` False with no error, and that a failure the engine swallowed (a lock timeout, a failed queue append, a bug) gives the tool's `error` result and no `delta_written`.
 
 In the pins file: remove `@_flipped_by("B1-1")` from both sign pins and rewrite them with `_go_live` and `_settled`. Add `test_unknown_switch_takes_todays_path`, which uses `refuse_the_switch_stat` from `tests/unit/brain/emotion/_engine_support.py` and asserts that a `monologue_emotion` row is written (this type bypasses the pending queue).
 

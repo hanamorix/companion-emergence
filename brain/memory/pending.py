@@ -527,8 +527,11 @@ def route_write(store: MemoryStore, mem: Memory, *, source: str) -> str:
     candidate; a bypass type is written straight to ``memories.db``. Locates the
     persona's queue via ``store.persona_dir`` so callers need only the store +
     the Memory they already hold. Returns ``mem.id`` (matching ``store.create``).
+
+    A queued memory's feelings are checked against her vocabulary when it is queued (spec section 6), so a name a bridge-less
+    command must discard never reaches the queue.
     """
     if mem.memory_type in GATE_BYPASS_TYPES:
         return store.create(mem)
-    PendingQueue(store.persona_dir).enqueue(mem, source=source)
+    PendingQueue(store.persona_dir).enqueue(store.checked(mem), source=source)
     return mem.id

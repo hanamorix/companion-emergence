@@ -176,12 +176,7 @@ def _felt_emotions(value: str) -> dict[str, float] | None:
             continue
         if math.isfinite(number):  # a negative is held to 0 and kept: a 0 counts in the engine's averages, a drop doesn't
             kept[str(name)] = min(max(float(number), 0.0), _FELT_MAX)
-    from brain.chat.extractor import _filter_to_registered
-
-    registered = _filter_to_registered(kept)
-    if dropped := sorted(set(kept) - set(registered)):  # a model inventing names leaves a trace (#709)
-        logger.warning("research: EMOTIONS named emotions that are not registered, dropped: %s", ", ".join(dropped))
-    return registered
+    return kept  # the memory write checks the names against her vocabulary (a name it discards leaves a throttled log line)
 
 
 def _felt_rating(value: str) -> float | None:

@@ -900,30 +900,30 @@ def test_source_modifier_of_an_uncounted_memory_is_a_caller_error() -> None:
 
 
 def test_resolve_emotions_canonicalises_averages_and_holds() -> None:
-    resolved = eu.resolve_emotions({"Joy": 4.0, "joy": 6.0, " Touch-Hunger ": 15, "grief": -1})
+    resolved = eu.resolve_emotions({"Joy": 4.0, "joy": 6.0, " Touch-Hunger ": 15, "grief": -1}, check="tidy")
     assert resolved == {"joy": 5.0, "touch_hunger": 10.0, "grief": 0.0}
 
 
 def test_resolve_emotions_averages_before_it_holds() -> None:
-    assert eu.resolve_emotions({"joy": 20.0, "Joy": 0.0}) == {"joy": 10.0}
+    assert eu.resolve_emotions({"joy": 20.0, "Joy": 0.0}, check="tidy") == {"joy": 10.0}
 
 
 def test_resolve_emotions_drops_a_value_that_is_not_a_finite_number_with_a_log_line(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        resolved = eu.resolve_emotions({"joy": math.nan, "grief": math.inf, "anger": "x", "love": 2.0, "awe": True})
+        resolved = eu.resolve_emotions({"joy": math.nan, "grief": math.inf, "anger": "x", "love": 2.0, "awe": True}, check="tidy")
     assert resolved == {"love": 2.0}
     assert len(caplog.records) == 4
     assert all(r.name == LOGGER for r in caplog.records)
 
 
 def test_a_dropped_spelling_does_not_spoil_the_other() -> None:
-    assert eu.resolve_emotions({"joy": math.nan, "Joy": 4.0}) == {"joy": 4.0}
+    assert eu.resolve_emotions({"joy": math.nan, "Joy": 4.0}, check="tidy") == {"joy": 4.0}
 
 
 def test_resolve_emotions_signed_keeps_the_sign() -> None:
-    assert eu.resolve_emotions({"Joy": -2.0, "grief": 30.0}, signed=True) == {"joy": -2.0, "grief": 30.0}
+    assert eu.resolve_emotions({"Joy": -2.0, "grief": 30.0}, signed=True, check="tidy") == {"joy": -2.0, "grief": 30.0}
 
 
 # --- review-driven additions: the edges the first draft of these tests did not pin ---------------------------------------
@@ -1000,5 +1000,5 @@ def test_a_commit_without_emotions_still_keeps_the_persona_start() -> None:
 
 def test_resolve_emotions_drops_an_integer_too_large_for_a_float(caplog: pytest.LogCaptureFixture) -> None:
     with caplog.at_level(logging.WARNING, logger=LOGGER):
-        assert eu.resolve_emotions({"joy": 10**400, "grief": 3}) == {"grief": 3.0}
+        assert eu.resolve_emotions({"joy": 10**400, "grief": 3}, check="tidy") == {"grief": 3.0}
     assert len(caplog.records) == 1

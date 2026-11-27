@@ -19,12 +19,13 @@ from brain import __version__, prompt_strings
 from brain.bridge import state_file
 from brain.bridge.provider import get_provider
 from brain.emotion import engine as emotion_engine
-from brain.emotion import engine_files
+from brain.emotion import engine_files, vocabulary_access, vocabulary_file
 from brain.emotion.engine_utils import feelings_of
 from brain.emotion.persona_loader import load_persona_vocabulary
+from brain.emotion.vocabulary import VOCABULARY_FILENAME
 from brain.engines._interests import InterestSet
 from brain.engines.dream import DreamEngine
-from brain.engines.heartbeat import HeartbeatEngine
+from brain.engines.heartbeat import HeartbeatConfig, HeartbeatEngine
 from brain.engines.reflex import ReflexEngine
 from brain.engines.research import ResearchEngine
 from brain.health.alarm import compute_pending_alarms
@@ -211,6 +212,17 @@ def _supervisor_rebuild_handler(args: argparse.Namespace) -> int:
         from brain.bridge import runner
 
         runner._setup_runtime_logging(persona_dir)
+        # One of the two noted exceptions to "only the bridge writes her vocabulary" (#801 section 9): this rebuild step, which runs
+        # only with no bridge (the check above), takes any core feeling out of her vocabulary file through the shared writer before
+        # its replay, because the replay must use the framework's definitions of the core feelings (#801 section 8). It writes
+        # nothing else to her vocabulary. A failure is logged and the rebuild goes on: the engine takes a core feeling's half-life
+        # from the framework whether or not the file still holds an entry for it, and the next start retries the removal.
+        try:
+            vocabulary_file.remove_core_entries(vocabulary_file.vocabulary_path(persona_dir))
+        except Exception as exc:  # noqa: BLE001 - a bug in the removal must not stop the rebuild
+            logging.getLogger(__name__).warning(
+                "the removal of core feelings from her vocabulary file stopped on %s: %s; the rebuild goes on", type(exc).__name__, exc, exc_info=True
+            )
         emotion_engine.ensure_engine_ready(persona_dir)
         # Hana's 11-18b point 4: the ready step returned (a completed switch-over, no rebuild needed, or a skip or logged failure
         # that returns), so the notice an earlier attempt left is cleared here, whichever process completed the switch-over. The
@@ -779,7 +791,7 @@ def _memory_backfill_extraction_handler(args: argparse.Namespace) -> int:
     try:
         # No bridge is running here, so nothing has registered the persona's own emotions in this process: without this the
         # extraction would drop every emotion that is not in the baseline vocabulary (524-1).
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        vocabulary_access.load_read_only(persona_dir)
         hebbian = HebbianMatrix(db_path=persona_dir / "hebbian.db")
         try:
             eb.run_foreground(
@@ -1000,7 +1012,7 @@ def _dream_handler(args: argparse.Namespace) -> int:
     try:
         from brain.soul.store import SoulStore
 
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        vocabulary_access.load_read_only(persona_dir)
         refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
         if refused is not None:
             return refused
@@ -1063,11 +1075,13 @@ def _drain_emotion_engine(persona_dir: Path) -> None:
 def _engine_ready_or_refuse(persona_dir: Path, dry_run: bool) -> int | None:
     """Make the emotion engine ready before a command's work (Engine 6, spec 3.1 S6, S107): None to go on, or an exit code to return.
 
-    Called by the six commands that touch the engine, right after their own vocabulary load. A real run no longer rebuilds
-    in-process: it registers the command (`engine_files.register_command_run`, so a start that needs a rebuild can end it) and runs
-    the rebuild step (`daemon.run_rebuild_step`): with no bridge running and a rebuild needed it takes the start lock, ends every
-    other running command and runs the rebuild as its own process (`nell supervisor rebuild`), then goes on. Its code is returned:
-    1 when another command could not be ended, 2 when a start or another rebuild holds the start lock (nothing was run). A dry run writes nothing, so it cannot do the switch-over: on a persona that is
+    Called by the six commands that touch the engine, right after their own vocabulary load. A real run does not rebuild
+    in-process: it registers the command (`engine_files.register_command_run`, so a
+    start that needs a rebuild can end it) and runs the rebuild step (`daemon.run_rebuild_step`): with no bridge running and a
+    rebuild needed it takes the start lock, ends every other running command and runs the rebuild as its own process
+    (`nell supervisor rebuild`, which first takes any core feeling out of her vocabulary file), then goes on. Its code
+    is returned: 1 when another command could not be ended, 2 when a start or another rebuild holds the start lock (nothing was
+    run). A dry run writes nothing, so it cannot do the switch-over: on a persona that is
     not live (not switched yet, or its emotion state file cannot be read: the fail-safe answer is "not switched") it prints a
     plain message on stderr (a different one for each of the two causes, since the advice differs), runs no reader and returns 2;
     on a switched persona it goes on as today.
@@ -1111,7 +1125,7 @@ def _heartbeat_handler(args: argparse.Namespace) -> int:
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        vocabulary_access.load_read_only(persona_dir)
         refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
         if refused is not None:
             return refused
@@ -1237,7 +1251,7 @@ def _reflex_handler(args: argparse.Namespace) -> int:
 
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        vocabulary_access.load_read_only(persona_dir)
         refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
         if refused is not None:
             return refused
@@ -1296,12 +1310,13 @@ def _research_handler(args: argparse.Namespace) -> int:
     provider_name, searcher_name = _resolve_routing(persona_dir, args)
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        vocabulary_access.load_read_only(persona_dir)
         refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
         if refused is not None:
             return refused
         provider = get_provider(provider_name)
         searcher = get_searcher(searcher_name)
+        heartbeat_config = HeartbeatConfig.load(persona_dir / "heartbeat_config.json")
         engine = ResearchEngine(
             store=store,
             provider=provider,
@@ -1314,6 +1329,7 @@ def _research_handler(args: argparse.Namespace) -> int:
             interests_path=persona_dir / "interests.json",
             research_log_path=persona_dir / "research_log.json",
             default_interests_path=_default_interests_path(),
+            research_days_since_human_min=heartbeat_config.research_days_since_human_min,
         )
         result = engine.run_tick(
             trigger=args.trigger,
@@ -1343,9 +1359,9 @@ def _interest_list_handler(args: argparse.Namespace) -> int:
     persona_dir = get_persona_dir(args.persona)
     if not persona_dir.exists():
         raise FileNotFoundError(f"No persona directory at {persona_dir}")
-    # Listing only reads (#708): a corrupt vocabulary is left as it is for a load that has the store and can rebuild it.
+    # Listing only reads (#708): a corrupt vocabulary is left as it is for the bridge's start-up, which has the store and can rebuild it.
     try:
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", read_only=True)
+        load_persona_vocabulary(vocabulary_file.vocabulary_path(persona_dir), read_only=True)
     except JsonFileError as exc:
         print(f"Warning: the emotion vocabulary could not be read and was left as it is ({exc}).", file=sys.stderr)
     interests = InterestSet.load(
@@ -1505,7 +1521,7 @@ def _health_check_handler(args: argparse.Namespace) -> int:
         "heartbeat_state.json",
         "interests.json",
         "reflex_arcs.json",
-        "emotion_vocabulary.json",
+        VOCABULARY_FILENAME,
         "memories.db",
         "hebbian.db",
     ]
@@ -1936,7 +1952,7 @@ def _soul_review_handler(args: argparse.Namespace) -> int:
     provider_name, _ = _resolve_routing(persona_dir, args)
     store = MemoryStore(db_path=persona_dir / "memories.db")
     try:
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        vocabulary_access.load_read_only(persona_dir)
         refused = _engine_ready_or_refuse(persona_dir, args.dry_run)
         if refused is not None:
             return refused
@@ -2281,9 +2297,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
             # integrity-checked the file, so the two never create the file and schema at once
             # (#414).
             _start_floor_bootstrap_for_direct_chat(persona_dir, blocking=False)
-        from brain.emotion.persona_loader import load_persona_vocabulary
-
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+        vocabulary_access.load_read_only(persona_dir)
         refused = _engine_ready_or_refuse(persona_dir, False)  # no dry run here, but the rebuild step can still refuse (1 or 2)
         if refused is not None:
             return refused
@@ -2347,6 +2361,7 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                         break
                     if not user_input:
                         continue
+                    vocabulary_access.start_turn(persona_dir)  # a new turn: ask the bridge again after a timeout (#803 step 9)
                     result = respond(
                         persona_dir,
                         user_input,
@@ -2363,6 +2378,9 @@ def _chat_direct_mode(args: argparse.Namespace) -> int:
                     # ladder (S220) a flagged turn asked for start (its sample never spans a reply, S218).
                     floor_startup.start_requested_ram_figure()
             finally:
+                # Accepted edge (#803 step 9): this exit save does not call `vocabulary_access.start_turn`, so it keeps the last turn's
+                # skip flag. If the bridge timed out in that turn, the new feeling names this save checks are discarded (the
+                # read-only file path). The exit save is the end of that turn, and the flag clears only at the start of a turn.
                 # Flush conversation through ingest pipeline (best-effort)
                 try:
                     flush_session(

@@ -3,7 +3,7 @@
 A pausable gated job that has no cursor/state file of its own (today: only
 the forgetting sub-step of the maintenance job — every other pausable job
 reuses an existing cursor file named in 2-plan.md's S32 table, e.g.
-``emotion_backfill_state.json``, the embedding-backfill cursor, the
+the embedding-backfill cursor, the
 ``calibration_log`` table itself, or a session's own extraction cursor)
 saves how far it got here: ``<persona_dir>/cadence/<job>_progress.json``,
 written atomically (temp file + rename — same pattern as

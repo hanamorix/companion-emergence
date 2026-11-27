@@ -5,7 +5,7 @@ launch (the ~15-min window bug).
 
 Regression: before this fix, the vocabulary was only loaded inside the
 supervisor heartbeat/soul-review ticks, leaving the chat path flatlined
-to 26 baseline emotions until the first tick fired.
+to the baseline emotions until the first tick fired.
 """
 
 from __future__ import annotations
@@ -79,10 +79,10 @@ def test_ensure_persona_vocabulary_loaded_registers_extension_emotion(tmp_path: 
         # After the call the extension emotion must be in the registry.
         assert vocabulary.get(_EXTENSION_EMOTION_NAME) is not None
 
-        # And a reader that filters to registered names keeps it.
-        from brain.chat.extractor import _filter_to_registered
+        # And the check on feeling names (#801 section 6) keeps it.
+        from brain.emotion import vocabulary_access
 
-        assert _filter_to_registered({_EXTENSION_EMOTION_NAME: 0.5}) == {_EXTENSION_EMOTION_NAME: 0.5}
+        assert vocabulary_access.names_used(None, [_EXTENSION_EMOTION_NAME]) == {_EXTENSION_EMOTION_NAME: _EXTENSION_EMOTION_NAME}
     finally:
         store.close()
 
@@ -93,10 +93,10 @@ def test_without_startup_load_extension_emotion_is_dropped(tmp_path: Path):
     # fixture just removed it).
     assert vocabulary.get(_EXTENSION_EMOTION_NAME) is None
 
-    # Unknown to the registry, so a reader that filters to registered names drops it.
-    from brain.chat.extractor import _filter_to_registered
+    # Unknown to the registry, so the check on feeling names discards it.
+    from brain.emotion import vocabulary_access
 
-    assert _filter_to_registered({_EXTENSION_EMOTION_NAME: 0.5}) == {}
+    assert vocabulary_access.names_used(None, [_EXTENSION_EMOTION_NAME]) == {_EXTENSION_EMOTION_NAME: None}
 
 
 def test_ensure_persona_vocabulary_loaded_is_idempotent(tmp_path: Path):

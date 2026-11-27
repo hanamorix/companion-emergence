@@ -444,7 +444,7 @@ def test_live_pass2_lowers_the_feeling_and_writes_no_row(persona_dir: Path):
 
 
 @pytest.mark.no_base_failure(
-    reason="pins that the live fold keeps the vocabulary filter (B1 PR 2); main drops an unregistered name too, on the old path"
+    reason="pins that the live fold drops a name her vocabulary cannot hold (B1 PR 2); main drops an unregistered name too, on the old path"
 )
 def test_live_pass2_unregistered_name_folds_nothing(persona_dir: Path):
     from brain.emotion import engine_files

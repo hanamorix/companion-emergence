@@ -860,6 +860,11 @@ def sandbox(
 
     def _restore_emotion_globals() -> None:
         # Mutate contents in place (clear + update), NOT a rebind — keeps any held reference valid.
+        # The registry's copy follows the sandbox persona's file after a load (#803 step 15): stop following it. getattr: the
+        # harness also runs against product code that has no followed copy.
+        _clear_copy = getattr(_vocab, "clear_file_copy", None)
+        if _clear_copy is not None:
+            _clear_copy()
         _vocab._REGISTRY.clear()
         _vocab._REGISTRY.update(_saved_registry)
 

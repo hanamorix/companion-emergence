@@ -13,6 +13,7 @@ from pathlib import Path
 
 from brain import process_identity
 from brain.emotion import vocabulary as _vocabulary
+from brain.emotion import vocabulary_file
 from brain.health.json_io import write_json
 from brain.memory.hebbian import HebbianMatrix
 from brain.memory.store import MemoryStore
@@ -128,9 +129,15 @@ def run_migrate(args: MigrateArgs) -> MigrationReport:
         lock_target = get_persona_dir(args.install_as)
     lock_path = _migrate_lock_path(lock_target)
     lock_fd = _acquire_migrate_lock(lock_path)
+    # The migrator is the vocabulary owner for its run (#801 section 9, SV8): no bridge serves the new work folder, so the store's
+    # owner-side check (`MemoryStore.checked`) adds the migrated memories' names to that folder's file instead of asking a bridge.
+    # The flag is put back to the value it had (False in the CLI process) on every way out, the error path included.
+    was_owner = _vocabulary.is_bridge_owner()
+    _vocabulary.set_bridge_owner(True)
     try:
         return _run_migrate_locked(args, reader)
     finally:
+        _vocabulary.set_bridge_owner(was_owner)
         _release_migrate_lock(lock_path, lock_fd)
 
 
@@ -160,17 +167,50 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
 
     started = time.monotonic()
 
+    og_memories = reader.read_memories()
+
+    # ---- vocabulary (written BEFORE the memories) ----
+    # One of the two noted exceptions to "only the bridge writes her vocabulary" (#801 section 9; the other is the rebuild step in
+    # brain/cli.py). The migrator acts as the owner of this work folder: a fresh `<name>.new` (the install path refused a persona in
+    # use before any work) or a cleared `--output` folder, which no bridge serves. It writes the new persona's first vocabulary file
+    # through the shared function, so the memories created below are checked against that file and a new name is added, not
+    # discarded. The folder is always empty here (`_ensure_clobber_safe` clears an `--output` folder under `--force`, and `<name>.new`
+    # is removed and re-created), so the file never exists yet. `add` writes no file when no name is accepted (a source with only
+    # core feelings), and refuses core feelings, which the framework holds.
+    # `vocabulary_emotions_migrated` counts the entries written (0 when the file could not be written).
+    # Accepted edge: when the file could not be written, the extracted descriptions, categories and half-lives are lost; the store's
+    # owner-side check keeps each name tidied on its row and later reads add plain entries for them.
+    vocab_target = vocabulary_file.vocabulary_path(work_dir)
+    vocabulary_emotions_migrated = 0
+    vocabulary_skipped_reason: str | None = None
+    try:
+        framework_baseline_names = {e.name for e in _vocabulary._BASELINE}
+        vocab_entries = extract_persona_vocabulary(og_memories, framework_baseline_names=framework_baseline_names)
+        results = vocabulary_file.add(
+            vocab_target,
+            [(entry["name"], {k: v for k, v in entry.items() if k != "name"}) for entry in vocab_entries],
+        )
+        failed = [r.raw for r in results if r.outcome == "cannot_write"]
+        if failed:
+            vocabulary_skipped_reason = f"migrate_error: the vocabulary file could not be written ({len(failed)} names)"
+        else:
+            vocabulary_emotions_migrated = sum(1 for r in results if r.changed)
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        vocabulary_skipped_reason = f"migrate_error: {exc}"
+
     # ---- memories ----
     # try/finally around store.close() so a mid-loop exception on disk-backed
     # DBs doesn't leak a .db-wal file for the next run to recover from.
-    og_memories = reader.read_memories()
     store = MemoryStore(db_path=work_dir / "memories.db")
     migrated_count = 0
     skipped: list[SkippedMemory] = []
     seen_ids: set[str] = set()
     try:
         for og_mem in og_memories:
-            mem, sk = transform_memory(og_mem)
+            # Checked here, once, by the store's owner-side check (this process is the owner for the run, `run_migrate`): the check runs
+            # inside `transform_memory`, before the legacy importance is derived (from the kept feelings) and before the duplicate-id
+            # skip below, which therefore still costs its one check.
+            mem, sk = transform_memory(og_mem, checked=store.checked)
             if sk is not None:
                 skipped.append(sk)
                 continue
@@ -186,7 +226,9 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
                 )
                 continue
             seen_ids.add(mem.id)
-            store.create(mem, fold=False)
+            # The names were checked in `transform_memory` above (the importance is derived from what the check keeps), so the store
+            # does not run the check a second time: one check per memory, on every path.
+            store.create(mem, fold=False, check_names=False)
             migrated_count += 1
     finally:
         store.close()
@@ -200,26 +242,6 @@ def _run_migrate_locked(args: MigrateArgs, reader: OGReader) -> MigrationReport:
             edges_migrated += 1
     finally:
         hebbian.close()
-
-    # ---- vocabulary ----
-    vocab_target = work_dir / "emotion_vocabulary.json"
-    vocabulary_emotions_migrated = 0
-    vocabulary_skipped_reason: str | None = None
-
-    if vocab_target.exists() and not args.force:
-        vocabulary_skipped_reason = "existing_file_not_overwritten"
-    else:
-        try:
-            framework_baseline_names = {e.name for e in _vocabulary._BASELINE}
-            og_memories_for_vocab = reader.read_memories()
-            vocab_entries = extract_persona_vocabulary(
-                og_memories_for_vocab,
-                framework_baseline_names=framework_baseline_names,
-            )
-            write_json(vocab_target, {"version": 1, "emotions": vocab_entries}, fsync=False)
-            vocabulary_emotions_migrated = len(vocab_entries)
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
-            vocabulary_skipped_reason = f"migrate_error: {exc}"
 
     # ---- reflex arcs ----
     # --input points at OG's data/ dir, but reflex_engine.py sits one level

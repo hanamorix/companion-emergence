@@ -32,17 +32,11 @@ READERS = {
         "forgetting_state.json", lambda pd: _imp("brain.forgetting")._load_forgetting_state(pd), "DEFAULT", {}),
     "forgetting._load_migration_grace": (
         "source-manifest.json", lambda pd: _imp("brain.forgetting")._load_migration_grace(pd), "DEFAULT", (None, 0.0)),
-    "crystallizers.reflex._load_emotion_vocabulary": (
-        "emotion_vocabulary.json",
-        lambda pd: _imp("brain.growth.crystallizers.reflex")._load_emotion_vocabulary(pd), "DEFAULT", set()),
     "soul_candidate_repair._load_state": (
         "soul_candidate_repair_state.json",
         lambda pd: _imp("brain.health.soul_candidate_repair")._load_state(pd), "CONTENT", None),
     "vocab_repair._load_state": (
         "vocab_repair_state.json", lambda pd: _imp("brain.health.vocab_repair")._load_state(pd), "CONTENT", None),
-    "emotion_backfill._consume_budget": (
-        "emotion_backfill_budget.json",
-        lambda pd: _imp("brain.ingest.emotion_backfill")._consume_budget(pd, now=NOW, cap=5), "CONTENT", True),
     "kindled_link.cadence.load_tick_cadence": (
         "kindled_link/tick_cadence.json",
         lambda pd: _imp("brain.kindled_link.cadence").load_tick_cadence(pd), "DEFAULT", {"last_run": None}),
@@ -123,22 +117,6 @@ def test_group_d_reader_io_fault_follows_its_mode(tmp_path: Path, name: str) -> 
         with pytest.raises(OSError) as exc:
             call(pd)
         assert isinstance(exc.value, JsonFileError) and exc.value.kind == "io"
-
-
-def test_group_d_consume_budget_corrupt_counter_restarts_but_an_unreadable_one_is_not_reset(tmp_path: Path) -> None:
-    from brain.ingest.emotion_backfill import _consume_budget
-
-    pd = tmp_path
-    path = pd / "emotion_backfill_budget.json"
-    for _ in range(3):
-        assert _consume_budget(pd, now=NOW, cap=3) is True
-    assert _consume_budget(pd, now=NOW, cap=3) is False  # cap reached
-    path.write_bytes(b"{torn")  # corrupt content: as before, starts from an empty counter
-    assert _consume_budget(pd, now=NOW, cap=3) is True
-    path.unlink()
-    path.mkdir()  # unreadable: the daily cap must NOT reset
-    with pytest.raises(OSError):
-        _consume_budget(pd, now=NOW, cap=3)
 
 
 def test_group_d_files_pending_read(tmp_path: Path) -> None:
@@ -254,8 +232,8 @@ def _no_temp_left(directory: Path) -> None:
 def test_group_d_writers_roundtrip_and_leave_no_temp(tmp_path: Path) -> None:
     from brain.attunement import budget
     from brain.chat import pass2_queue, reflection_gate
+    from brain.emotion import vocabulary_file
     from brain.forgetting import _persist_forgetting_state
-    from brain.health.vocab_repair import _atomic_write_vocab
     from brain.memory.embedding_backfill import _load_cursor, _save_cursor
     from brain.self_model import articulate, resolve
     from brain.soul import cadence as soul_cadence
@@ -267,7 +245,7 @@ def test_group_d_writers_roundtrip_and_leave_no_temp(tmp_path: Path) -> None:
     _persist_forgetting_state(pd, {"m1": 3})
     assert json.loads((pd / "forgetting_state.json").read_text()) == {"m1": 3}
     assert json.loads((pd / "forgetting_state.json.bak1").read_text()) == {"m1": 2}
-    _atomic_write_vocab(pd / "emotion_vocabulary.json", {"version": 1, "emotions": [{"name": "café"}]})
+    vocabulary_file.add(pd / "emotion_vocabulary.json", [("café", None)])
     assert (pd / "emotion_vocabulary.json").read_bytes().isascii()
     budget._save(pd, {"date": "d", "count": 1})
     assert json.loads(budget._budget_path(pd).read_text()) == {"date": "d", "count": 1}
@@ -310,25 +288,17 @@ def test_group_d_kit_source_manifest_and_best_effort_writes(tmp_path: Path) -> N
     )
 
 
-def test_group_d_scheduler_appends_to_the_vocabulary_and_raises_on_a_corrupt_one(tmp_path: Path) -> None:
-    from brain.growth.proposal import EmotionProposal
-    from brain.growth.scheduler import _append_to_vocabulary
+def test_group_d_vocabulary_writer_appends_once_and_never_replaces_a_corrupt_file(tmp_path: Path) -> None:
+    from brain.emotion import vocabulary_file
 
     vocab = tmp_path / "emotion_vocabulary.json"
-    prop = EmotionProposal(
-        name="wistful",
-        description="a soft longing",
-        decay_half_life_days=7.0,
-        evidence_memory_ids=(),
-        score=0.5,
-        relational_context=None,
-    )
-    _append_to_vocabulary(vocab, prop)  # missing file: starts a fresh vocabulary
-    _append_to_vocabulary(vocab, prop)
-    assert [e["name"] for e in json.loads(vocab.read_text())["emotions"]] == ["wistful", "wistful"]
+    fields = {"description": "a soft longing", "decay_half_life_days": 7.0}
+    assert vocabulary_file.add(vocab, [("wistful", fields)])[0].changed  # missing file: starts a fresh vocabulary
+    assert not vocabulary_file.add(vocab, [("wistful", fields)])[0].changed  # a name already in the file is not appended again
+    assert [e["name"] for e in json.loads(vocab.read_text())["emotions"]] == ["wistful"]
     vocab.write_bytes(b"\xff{torn")
-    with pytest.raises(ValueError):  # RAISE: a corrupt vocabulary is never silently replaced
-        _append_to_vocabulary(vocab, prop)
+    assert vocabulary_file.add(vocab, [("wistful two", fields)])[0].outcome == "cannot_write"  # a corrupt vocabulary is never silently replaced
+    assert vocab.read_bytes() == b"\xff{torn"
 
 
 def test_group_d_interest_spawn_state_is_read_with_a_fresh_day_fallback_and_written_back(tmp_path: Path) -> None:

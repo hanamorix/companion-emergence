@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
 from brain.memory.store import Memory, MemoryStore
 
@@ -64,7 +66,7 @@ def test_should_run_true_when_stubs_present_no_state(tmp_path: Path) -> None:
     """Vocab with stub entries and no state file → should_run returns True."""
     from brain.health.vocab_repair import should_run_vocab_repair
 
-    _write_vocab(tmp_path, [_stub_entry("body_grief"), _proper_entry("love")])
+    _write_vocab(tmp_path, [_stub_entry("emergence"), _proper_entry("love")])
     assert should_run_vocab_repair(tmp_path) is True
 
 
@@ -75,7 +77,7 @@ def test_should_run_true_when_state_complete_but_placeholder_remains(tmp_path: P
     repair."""
     from brain.health.vocab_repair import should_run_vocab_repair
 
-    _write_vocab(tmp_path, [_stub_entry("body_grief")])
+    _write_vocab(tmp_path, [_stub_entry("emergence")])
     state = {
         "status": "complete",
         "repaired": 1,
@@ -106,7 +108,7 @@ def test_repair_bumps_only_stub_entries(tmp_path: Path) -> None:
     from brain.health.vocab_repair import run_vocab_repair
 
     _write_vocab(tmp_path, [
-        _stub_entry("body_grief"),
+        _stub_entry("emergence"),
         _stub_entry("creative_hunger"),
         _proper_entry("love"),
     ])
@@ -123,7 +125,7 @@ def test_repair_bumps_only_stub_entries(tmp_path: Path) -> None:
     data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
     by_name = {e["name"]: e for e in data["emotions"]}
 
-    assert by_name["body_grief"]["decay_half_life_days"] == 14.0
+    assert by_name["emergence"]["decay_half_life_days"] == 14.0
     assert by_name["creative_hunger"]["decay_half_life_days"] == 14.0
     assert by_name["love"]["decay_half_life_days"] == 45.0
     assert by_name["love"]["description"] == "a real description"
@@ -138,7 +140,7 @@ def test_repair_idempotent(tmp_path: Path) -> None:
     touching the vocab file (Step 1 is done; Step 2 needs a provider)."""
     from brain.health.vocab_repair import run_vocab_repair
 
-    _write_vocab(tmp_path, [_stub_entry("body_grief")])
+    _write_vocab(tmp_path, [_stub_entry("emergence")])
     state = {
         "status": "complete",
         "repaired": 1,
@@ -193,7 +195,7 @@ def test_repair_descriptions_fail_soft(tmp_path: Path) -> None:
     """Provider raises → placeholders kept, half-life still bumped, status complete, described==0."""
     from brain.health.vocab_repair import run_vocab_repair
 
-    _write_vocab(tmp_path, [_stub_entry("body_grief"), _stub_entry("creative_hunger")])
+    _write_vocab(tmp_path, [_stub_entry("emergence"), _stub_entry("creative_hunger")])
     provider = _FakeProvider(raises=True)
 
     store = _make_store(tmp_path)
@@ -208,9 +210,9 @@ def test_repair_descriptions_fail_soft(tmp_path: Path) -> None:
 
     data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
     by_name = {e["name"]: e for e in data["emotions"]}
-    assert by_name["body_grief"]["decay_half_life_days"] == 14.0
+    assert by_name["emergence"]["decay_half_life_days"] == 14.0
     assert by_name["creative_hunger"]["decay_half_life_days"] == 14.0
-    assert by_name["body_grief"]["description"] == PLACEHOLDER_DESCRIPTION
+    assert by_name["emergence"]["description"] == PLACEHOLDER_DESCRIPTION
     assert by_name["creative_hunger"]["description"] == PLACEHOLDER_DESCRIPTION
 
     state = json.loads((tmp_path / "vocab_repair_state.json").read_text(encoding="utf-8"))
@@ -224,15 +226,15 @@ def test_repair_derives_descriptions(tmp_path: Path) -> None:
     """
     from brain.health.vocab_repair import run_vocab_repair
 
-    stub_names = ["body_grief", "creative_hunger"]
+    stub_names = ["emergence", "creative_hunger"]
     _write_vocab(tmp_path, [
-        _stub_entry("body_grief"),
+        _stub_entry("emergence"),
         _stub_entry("creative_hunger"),
         _proper_entry("love"),
     ])
 
     canned_json = json.dumps({
-        "body_grief": "the physical weight of grief",
+        "emergence": "the physical weight of grief",
         "creative_hunger": "deep drive to make something new",
     })
     provider = _FakeProvider(response=canned_json)
@@ -258,9 +260,9 @@ def test_repair_derives_descriptions(tmp_path: Path) -> None:
     data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
     by_name = {e["name"]: e for e in data["emotions"]}
 
-    assert by_name["body_grief"]["description"] == "the physical weight of grief"
+    assert by_name["emergence"]["description"] == "the physical weight of grief"
     assert by_name["creative_hunger"]["description"] == "deep drive to make something new"
-    assert by_name["body_grief"]["decay_half_life_days"] == 14.0
+    assert by_name["emergence"]["decay_half_life_days"] == 14.0
     assert by_name["love"]["description"] == "a real description"
     assert by_name["love"]["decay_half_life_days"] == 45.0
 
@@ -285,10 +287,10 @@ def test_repair_provider_without_persona_dir_kwarg(tmp_path: Path) -> None:
     """A provider whose generate() lacks persona_dir → TypeError retry → descriptions derived."""
     from brain.health.vocab_repair import run_vocab_repair
 
-    canned = json.dumps({"body_grief": "physical weight of loss"})
+    canned = json.dumps({"emergence": "physical weight of loss"})
     provider = _NoPersonaDirProvider(response=canned)
 
-    _write_vocab(tmp_path, [_stub_entry("body_grief")])
+    _write_vocab(tmp_path, [_stub_entry("emergence")])
 
     store = _make_store(tmp_path)
     try:
@@ -302,7 +304,7 @@ def test_repair_provider_without_persona_dir_kwarg(tmp_path: Path) -> None:
 
     data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
     by_name = {e["name"]: e for e in data["emotions"]}
-    assert by_name["body_grief"]["description"] == "physical weight of loss"
+    assert by_name["emergence"]["description"] == "physical weight of loss"
 
 
 def test_repair_no_stubs_noop(tmp_path: Path) -> None:
@@ -398,8 +400,8 @@ def test_repair_describes_new_placeholders_after_state_complete(tmp_path: Path) 
 
 
 def test_repair_merges_variant_entries_keeping_the_described_one(tmp_path: Path) -> None:
-    """#174 reopen: permutation and hyphen/case twins collapse to one canonical entry.
-    The entry with a real description wins; a placeholder twin is dropped."""
+    """#174 reopen, #801 section 3: permutation and hyphen/case twins collapse to one entry under the spelling that comes
+    first in the file. The entry with a real description gives the fields; a placeholder twin is dropped."""
     from brain.health.vocab_repair import run_vocab_repair
 
     _write_vocab(tmp_path, [
@@ -417,17 +419,165 @@ def test_repair_merges_variant_entries_keeping_the_described_one(tmp_path: Path)
 
     data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
     by_name = {e["name"]: e for e in data["emotions"]}
-    assert set(by_name) == {"grief_love_blend", "anticipatory_grief", "love"}
+    assert [e["name"] for e in data["emotions"]] == ["love_grief_blend", "anticipatory-grief", "love"]
+    assert by_name["love_grief_blend"]["description"] == "braided"
+    assert by_name["anticipatory-grief"]["description"] == "dread ahead"
+
+
+def test_repair_merges_a_stray_underscore_blend_key_with_its_twin(tmp_path: Path) -> None:
+    """#800: a vocabulary file already holding `_grief_love_blend` (the old canonical_name output) is
+    merged with `grief_love_blend` on the next repair run; the described entry wins, the stray key goes."""
+    from brain.health.vocab_repair import run_vocab_repair
+
+    _write_vocab(tmp_path, [
+        _stub_entry("grief_love_blend"),
+        _proper_entry("_grief_love_blend", "braided"),
+        _proper_entry("love"),
+    ])
+    store = _make_store(tmp_path)
+    try:
+        run_vocab_repair(tmp_path, store=store, provider=None)
+    finally:
+        store.close()
+
+    data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
+    by_name = {e["name"]: e for e in data["emotions"]}
+    assert set(by_name) == {"grief_love_blend", "love"}
     assert by_name["grief_love_blend"]["description"] == "braided"
-    assert by_name["anticipatory_grief"]["description"] == "dread ahead"
+
+
+def test_repair_keeps_the_spelling_of_a_lone_entry(tmp_path: Path) -> None:
+    """#801 section 3: with no twin, an entry keeps the spelling in her file (it is no longer renamed to its tidied key)."""
+    from brain.health.vocab_repair import run_vocab_repair
+
+    # Parts out of sorted order: the old repair renamed this lone entry to "_grief_love_blend".
+    _write_vocab(tmp_path, [_proper_entry("_love_grief_blend", "braided"), _stub_entry("emergence")])
+    store = _make_store(tmp_path)
+    try:
+        run_vocab_repair(tmp_path, store=store, provider=None)
+    finally:
+        store.close()
+
+    data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
+    by_name = {e["name"]: e for e in data["emotions"]}
+    assert set(by_name) == {"_love_grief_blend", "emergence"}
+    assert by_name["_love_grief_blend"]["description"] == "braided"
+
+
+def test_repair_survives_a_nameless_placeholder_entry_and_keeps_it(tmp_path: Path) -> None:
+    """#801 step 3: a dict that carries the placeholder description but no name used to raise KeyError in Step 1."""
+    from brain.health.vocab_repair import run_vocab_repair
+
+    nameless = {"description": PLACEHOLDER_DESCRIPTION, "category": "persona_extension"}
+    _write_vocab(tmp_path, [nameless, _stub_entry("emergence")])
+    store = _make_store(tmp_path)
+    try:
+        report = run_vocab_repair(tmp_path, store=store, provider=None)
+    finally:
+        store.close()
+    assert report.repaired == 1
+    data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
+    assert data["emotions"][0] == nameless
+    assert data["emotions"][1]["decay_half_life_days"] == 14.0
+
+
+def test_repair_patches_a_stub_spelled_otherwise_when_the_reply_names_it_tidied(tmp_path: Path) -> None:
+    """#801 step 3: the reply is matched by tidied name, so a provider echoing `quiet_dread` describes `Quiet Dread`."""
+    from brain.health.vocab_repair import run_vocab_repair
+
+    _write_vocab(tmp_path, [_stub_entry("Quiet Dread")])
+    provider = _FakeProvider(response='{"quiet_dread": "the held breath before bad news"}')
+    store = _make_store(tmp_path)
+    try:
+        report = run_vocab_repair(tmp_path, store=store, provider=provider)
+    finally:
+        store.close()
+    assert report.described == 1
+    data = json.loads((tmp_path / "emotion_vocabulary.json").read_text(encoding="utf-8"))
+    assert [(e["name"], e["description"]) for e in data["emotions"]] == [("Quiet Dread", "the held breath before bad news")]
+
+
+@pytest.mark.no_base_failure(reason="the old repair read a file with no emotions list as no entries and finished; the new early return keeps that, so this pins it through the refactor")
+def test_repair_finishes_quietly_on_a_file_without_an_emotions_list(tmp_path: Path) -> None:
+    from brain.health.vocab_repair import run_vocab_repair
+
+    path = tmp_path / "emotion_vocabulary.json"
+    path.write_text(json.dumps({"version": 1}), encoding="utf-8")
+    store = _make_store(tmp_path)
+    try:
+        report = run_vocab_repair(tmp_path, store=store, provider=None)
+    finally:
+        store.close()
+    assert report.status == "complete" and report.repaired == 0
+    assert json.loads(path.read_text(encoding="utf-8")) == {"version": 1}
+
+
+@pytest.mark.no_base_failure(reason="the old repair merged in memory and so never prompted for a dropped twin; the merge now writes the file first, and this pins that the prompt still holds one name")
+def test_repair_does_not_describe_a_twin_that_the_merge_dropped(tmp_path: Path) -> None:
+    """The steps after the merge work from the merged file: the dropped twin is not in the provider's prompt."""
+    from brain.health.vocab_repair import run_vocab_repair
+
+    _write_vocab(tmp_path, [_stub_entry("Quiet Dread"), _stub_entry("quiet_dread")])
+    provider = _FakeProvider(response='{"Quiet Dread": "held breath"}')
+    store = _make_store(tmp_path)
+    try:
+        run_vocab_repair(tmp_path, store=store, provider=provider)
+    finally:
+        store.close()
+    assert provider.calls[0]["prompt"].count("- ") == 1
+
+
+def test_repair_raises_and_retires_nothing_when_the_half_life_bump_cannot_be_written(tmp_path: Path, monkeypatch) -> None:
+    """A write the shared writer could not make must not retire Step 1: it raises, and no state file is written."""
+    from brain.emotion import vocabulary_file
+    from brain.health.vocab_repair import run_vocab_repair
+
+    path = _write_vocab(tmp_path, [_stub_entry("emergence")])
+    before = path.read_bytes()
+
+    def disk_full(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(vocabulary_file, "write_json", disk_full)
+    store = _make_store(tmp_path)
+    try:
+        with pytest.raises(OSError, match="half-life bump"):
+            run_vocab_repair(tmp_path, store=store, provider=None)
+    finally:
+        store.close()
+    assert path.read_bytes() == before
+    assert not (tmp_path / "vocab_repair_state.json").exists()
+
+
+def test_repair_never_overwrites_a_description_another_writer_set_since_it_looked(tmp_path: Path, monkeypatch) -> None:
+    from brain.emotion import vocabulary_file
+    from brain.health.vocab_repair import run_vocab_repair
+
+    path = _write_vocab(tmp_path, [_stub_entry("emergence")])
+    real = vocabulary_file.replace_fields
+
+    def another_writer_first(vocab_path, changes, *, only_if=None):
+        if "description" in next(iter(changes.values())):  # the description step: someone described it meanwhile
+            real(vocab_path, {"emergence": {"description": "described by someone else"}})
+        return real(vocab_path, changes, only_if=only_if)
+
+    monkeypatch.setattr(vocabulary_file, "replace_fields", another_writer_first)
+    provider = _FakeProvider(response='{"emergence": "the repair\'s words"}')
+    store = _make_store(tmp_path)
+    try:
+        report = run_vocab_repair(tmp_path, store=store, provider=provider)
+    finally:
+        store.close()
+    assert report.described == 0
+    assert json.loads(path.read_text(encoding="utf-8"))["emotions"][0]["description"] == "described by someone else"
 
 
 def test_repair_accepts_fenced_json_from_provider(tmp_path: Path) -> None:
     """#173: a ```json-fenced reply must still describe the stubs (shared extract_json_object)."""
     from brain.health.vocab_repair import run_vocab_repair
 
-    _write_vocab(tmp_path, [_stub_entry("body_grief")])
-    provider = _FakeProvider(response='```json\n{"body_grief": "the weight of it"}\n```')
+    _write_vocab(tmp_path, [_stub_entry("emergence")])
+    provider = _FakeProvider(response='```json\n{"emergence": "the weight of it"}\n```')
     store = _make_store(tmp_path)
     try:
         report = run_vocab_repair(tmp_path, store=store, provider=provider)
@@ -449,6 +599,12 @@ def test_excerpt_evidence_counts_a_non_finite_valued_emotion_and_logs_no_drop(tm
 
     from brain.health.vocab_repair import _excerpts_for_name
 
+    # The repair describes a name her vocabulary holds (a stub entry). The entry is in her file, not only in the registry: the memory
+    # check of a process that is not the owner reads her file and its copy follows it (#803 step 15), so a registry-only entry is dropped.
+    (tmp_path / "emotion_vocabulary.json").write_text(
+        json.dumps({"version": 1, "emotions": [{"name": "ache_of_nan", "description": "d", "category": "persona_extension", "decay_half_life_days": 5.0}]}),
+        encoding="utf-8",
+    )
     store = _make_store(tmp_path)
     try:
         store.create(
@@ -477,8 +633,8 @@ def test_repair_warns_when_provider_json_matches_no_stub(tmp_path: Path, caplog)
 
     from brain.health.vocab_repair import run_vocab_repair
 
-    _write_vocab(tmp_path, [_stub_entry("body_grief")])
-    provider = _FakeProvider(response=json.dumps({"descriptions": {"body_grief": "x"}}))
+    _write_vocab(tmp_path, [_stub_entry("emergence")])
+    provider = _FakeProvider(response=json.dumps({"descriptions": {"emergence": "x"}}))
     store = _make_store(tmp_path)
     try:
         with caplog.at_level(logging.WARNING, logger="brain.health.vocab_repair"):
@@ -495,7 +651,7 @@ def test_repair_records_an_unparseable_reply(tmp_path: Path) -> None:
     from brain.health.parse_failures import PARSE_FAILURE_LOG
     from brain.health.vocab_repair import run_vocab_repair
 
-    _write_vocab(tmp_path, [_stub_entry("body_grief")])
+    _write_vocab(tmp_path, [_stub_entry("emergence")])
     store = _make_store(tmp_path)
     try:
         run_vocab_repair(tmp_path, store=store, provider=_FakeProvider(response="I can't describe that."))
@@ -510,10 +666,10 @@ def test_repair_records_a_non_object_reply_and_keeps_placeholders(tmp_path: Path
     from brain.health.parse_failures import PARSE_FAILURE_LOG
     from brain.health.vocab_repair import run_vocab_repair
 
-    _write_vocab(tmp_path, [_stub_entry("body_grief")])
+    _write_vocab(tmp_path, [_stub_entry("emergence")])
     store = _make_store(tmp_path)
     try:
-        report = run_vocab_repair(tmp_path, store=store, provider=_FakeProvider(response='["body_grief"]'))
+        report = run_vocab_repair(tmp_path, store=store, provider=_FakeProvider(response='["emergence"]'))
     finally:
         store.close()
     assert report.described == 0

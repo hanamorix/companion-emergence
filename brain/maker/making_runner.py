@@ -53,8 +53,8 @@ def make_and_wire(*, persona_dir: Path, store: Any, provider: Any,
 
     # The three wire-backs of a completed making. For a non-discard making the
     # emotion delta is applied exactly as W8 applies reach_emotions: it is
-    # vocab-filtered by making_emotion_delta() and seeded onto the act-memory
-    # via Memory.create_new(emotions=...), so the engine folds it in. A
+    # built by making_emotion_delta() and seeded onto the act-memory
+    # via Memory.create_new(emotions=...), so the engine folds it in (the store checks the names against her vocabulary). A
     # discarded making moves nothing — empty-emotion act-memory only. The feed
     # wire-back (eventual_share → shared) is driven by flip_ready_shares from
     # run_maker_tick, not here.

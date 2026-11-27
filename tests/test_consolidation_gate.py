@@ -38,6 +38,13 @@ from brain.memory.store import Memory, MemoryStore, _merge_emotions
 from brain.utils.file_lock import file_lock
 
 
+@pytest.fixture(autouse=True)
+def _her_feelings(register_feelings, tmp_path):
+    """The tests here write memories under `trust`, a feeling her vocabulary holds beyond the framework's own (in the persona
+    folder's file too: a process that is not the owner reads it from there)."""
+    register_feelings("trust", persona_dir=tmp_path)
+
+
 @pytest.fixture
 def persona(tmp_path):
     """A persona dir with a MemoryStore + HebbianMatrix + PendingQueue."""
@@ -591,7 +598,7 @@ def _merge_run(persona, target_emotions, cand_emotions, *, merged="Bob likes tea
     # Distinct texts per call: a candidate whose text equals a stored row is dropped by the gate's exact-duplicate pass.
     n = next(_RUN_COUNTER)
     target = _mem(f"Bob likes tea number {n}", "conversation", emotions=target_emotions)
-    target_id = store.create(target, fold=False)
+    target_id = store.create(target, fold=False, check_names=False)  # a stored row keeps the spelling it was written with
     cand = _mem(f"Bob likes tea with honey, take {n}", "conversation", emotions=cand_emotions)
     queue.enqueue(cand, source="x")
     result = run_consolidation(
@@ -844,7 +851,7 @@ def test_e5_live_merge_of_a_target_deleted_before_the_write_defers_the_candidate
     _target_id, res = _merge_run(persona, {"joy": 5.0}, {"joy": 7.0})
     # The live write is the one that failed: it carried the merged emotions and fold=False.
     assert failing_call_fields == [
-        {"content": "Bob likes tea with honey", "emotions": {"joy": 6.0}, "fold": False}
+        {"content": "Bob likes tea with honey", "emotions": {"joy": 6.0}, "fold": False, "check_names": False}
     ]
     assert res.deferred == 1
     assert res.merged == 0
@@ -1317,12 +1324,12 @@ def test_e5_an_emotions_write_during_the_reappraiser_call_is_kept(
     mem = _mem("Bob's address", "conversation", importance=3.0)  # loaded with no emotions
     store.create(mem, fold=False)
 
-    def reappraiser_while_backfill_writes(m):
+    def reappraiser_while_another_writer_lands(m):
         assert m._stored_emotions == {}  # the gate holds the stale row
-        store.update(m.id, emotions={"joy": 6.0}, fold=False)  # the emotion backfill lands meanwhile
+        store.update(m.id, emotions={"joy": 6.0}, fold=False)  # another writer puts emotions on the row meanwhile
         return Reappraisal(7.25)
 
-    res = _reappraise_run(tmp, store, mem, reappraiser=reappraiser_while_backfill_writes)
+    res = _reappraise_run(tmp, store, mem, reappraiser=reappraiser_while_another_writer_lands)
     assert res.reappraised == 1
     got = store.get(mem.id, bump=False)
     assert got._stored_emotions == {"joy": 6.0}  # not erased by a fade of the stale empty dict
@@ -1360,11 +1367,11 @@ def test_e5_the_fade_takes_emotions_from_the_reread_row_and_importance_from_the_
     mem = _mem("Bob's address", "conversation", importance=3.0)  # loaded with no emotions
     store.create(mem, fold=False)
 
-    def reappraiser_while_backfill_writes(m):
+    def reappraiser_while_another_writer_stores_emotions(m):
         store.update(m.id, emotions={"joy": 6.0}, fold=False)  # emotions land during the model call
         return Reappraisal(9.5)
 
-    _reappraise_run(tmp, store, mem, reappraiser=reappraiser_while_backfill_writes)
+    _reappraise_run(tmp, store, mem, reappraiser=reappraiser_while_another_writer_stores_emotions)
     got = store.get(mem.id, bump=False)
     assert got.importance == pytest.approx(9.5)
     assert got._stored_emotions["joy"] == pytest.approx(6.0 * (1 - 3.0 / 20))  # 5.1: fresh emotions, loaded importance

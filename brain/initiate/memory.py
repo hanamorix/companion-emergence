@@ -113,15 +113,14 @@ def write_initiate_memory(
     Failures are swallowed with a warning — the audit row is the durable
     record; a missing memory entry degrades ambient recall but isn't fatal.
 
-    reach_emotions: optional vocab-filtered emotion vector from reach_emotions_for();
+    reach_emotions: optional emotion vector from reach_emotions_for();
         applied to the delivered-reach memory so the engine can count them.
         None (default) → no emotions written (back-compat).
     """
     text = render_memory_for_state(subject=subject, message=message, state=state, user_name=user_name, pronouns=pronouns)
     _emotions: dict[str, float] | None = None
     if reach_emotions:
-        from brain.chat.extractor import _filter_to_registered
-        _emotions = _filter_to_registered(reach_emotions) or None
+        _emotions = dict(reach_emotions)  # the memory write checks the names against her vocabulary
     memory = Memory.create_new(
         content=text,
         memory_type=_INITIATE_MEMORY_TYPE,

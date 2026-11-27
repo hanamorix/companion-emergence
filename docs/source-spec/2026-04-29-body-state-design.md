@@ -62,7 +62,7 @@ The engine looks a half-life up in this order (`EmotionEngine.half_life`):
 **Temperature** is 1-9, from a baseline of 4. The range is asymmetric, with its midpoint at 5, inherited from the original
 companion.
 - +1 for each of `arousal`, `desire`, `belonging`, `love` and `climax` that is high: warmth, presence, release.
-- −1 for each of `body_grief` and `touch_hunger` that is high: distance, lack.
+- −1 when `touch_hunger` is high: distance, lack.
 - −1 when the last contact was over 3 days ago, or −2 when it was over 7 days ago.
 - The result is rounded and held to 1-9.
 
@@ -185,9 +185,6 @@ A caught error is logged as a warning, and `add_memory`'s answer is unchanged. A
 ## 9. Known gaps
 
 These are recorded here, not fixed:
-- **`peace` is not registered** in any vocabulary, so the +1 energy for peace can never fire. #648 registers it, in #656.
-- **`body_grief` is no longer predefined** for new personas, but the temperature rule still reads it. #652 removes it from the
-  rule, in #656. A persona whose own vocabulary file holds `body_grief` still feels it.
 - **Only two readers pass a real session length:** the `get_body_state` tool through the dispatcher, and the state panel. The
   prompt block, the `boot` tool and the three supervisor readers pass 0.0. For them the session drains never apply, and the
   writing window is the last hour. The prompt's comment calls this "not tracked yet".

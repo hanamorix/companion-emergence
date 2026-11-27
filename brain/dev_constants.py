@@ -61,10 +61,10 @@ KNOWN_NAMES_DB_FILENAME: str = "known_names.db"
 
 # --- emotion half-lives (emotion rework, Engine 0, #575) --------------------
 # The built-in half-life, in days, of each named emotion. `brain.emotion.engine`
-# answers `half_life(name)` from the persona's own vocabulary file first, then
+# answers `half_life(name)` from her vocabulary first (the lookup; a framework name has none there), then
 # this table, then EMOTION_DEFAULT_HALF_LIFE_DAYS. Keys are canonical names
 # (`vocabulary.canonical_name`). Emotions the old vocabulary stored as "never
-# fades" and that have no entry here (body_grief, anchor_pull, freedom_ache) take
+# fades" and that have no entry here (anchor_pull, freedom_ache) take
 # the default; love and belonging are given their long half-lives here.
 EMOTION_HALF_LIFE_DAYS: dict[str, float] = {
     "love": 730.0,
@@ -95,8 +95,15 @@ EMOTION_HALF_LIFE_DAYS: dict[str, float] = {
     "rest_need": 0.75,
     "emergence": 60.0,
     "creative_hunger": 5.0,
+    # The four feelings of #648 (contentment and its three flavours). Their half-lives are written only here: the four
+    # `brain.emotion.vocabulary._BASELINE` entries read them from this table. The owner set them: contentment one day,
+    # peace and calm four hours each, groundedness two days.
+    "contentment": 1.0,
+    "peace": 4.0 / 24.0,
+    "calm": 4.0 / 24.0,
+    "groundedness": 2.0,
 }
-# The half-life of an emotion that is in neither the persona's vocabulary file nor the table above.
+# The half-life of an emotion that is in neither her vocabulary nor the table above.
 EMOTION_DEFAULT_HALF_LIFE_DAYS: float = 14.0
 
 # --- the rest of the emotion engine's numbers (emotion rework, Engine 1, #576) -----------------------------------------
@@ -123,6 +130,25 @@ EMOTION_REPEAT_FACTOR: float = 0.5
 # Seconds every acquisition of the engine's lock waits before giving up (`brain.utils.file_lock.locked_within`). Fixed here;
 # a wait that calibrates itself to the machine is #642.
 EMOTION_LOCK_WAIT_S: float = 5.0
+# Seconds a change to her vocabulary file waits for the file's lock (`brain.emotion.vocabulary_file`) before it reports
+# `cannot_write`. The same bound as `EMOTION_LOCK_WAIT_S`: a holder runs one read and one verified write of a small file, so a
+# longer wait means a wedged holder, not a busy one.
+EMOTION_VOCABULARY_LOCK_WAIT_S: float = 5.0
+# Seconds another process waits for the bridge's answer to `POST /vocabulary/add` or `POST /vocabulary/lookup`
+# (`brain.emotion.vocabulary_access`). An add waits for the vocabulary file's lock (up to `EMOTION_VOCABULARY_LOCK_WAIT_S`) and
+# then makes one verified write, so the bound is twice that wait: room for a slow disk, and well under the claude CLI's 60 s
+# tool-silence kill that the search call is sized against. A call that runs out is the same "bridge timeout" as for search, and
+# the process goes on with the read-only file until its next turn (one wait per turn, not per call).
+VOCABULARY_BRIDGE_TIMEOUT_S: float = 10.0
+# Seconds a feeling name whose add could not be written (`cannot_write`: the file's lock wait ran out, or the disk is full) is left
+# alone before the check asks again (`brain.emotion.vocabulary_access.names_used`). One failed add costs up to
+# `EMOTION_VOCABULARY_LOCK_WAIT_S`, so without this a loop over the memories that hold the name would wait that long on every one
+# of them; with it the loop waits at most once in six. The name is kept tidied meanwhile and the next read after the window
+# tries again (spec section 4: "added by the next read of that memory").
+EMOTION_VOCABULARY_ADD_RETRY_S: float = 30.0
+# The longest a feeling name may be, in characters, once tidied (`vocabulary.gate_name`). A longer name is refused and
+# dropped with its values. The owner's reason: "somethings clearly gone wrong if a name's that long".
+EMOTION_NAME_MAX_CHARS: int = 100
 # The engine's files, under `<persona_dir>/<state dir>/`; the change log is a folder of one file a day.
 EMOTION_STATE_DIR: str = "state"
 EMOTION_STATE_FILENAME: str = "emotion_state.json"

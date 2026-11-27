@@ -124,6 +124,9 @@ def test_name_grows_vocab_only_via_crystalliser_not_placeholder_stub(tmp_path: P
     """
     import json
 
+    from brain.emotion import vocabulary
+
+    vocabulary.set_bridge_owner(True)  # as in the bridge, the one process that adds a name (tests/conftest.py restores the flag)
     _seed_open_gap(tmp_path, per_channel={}, magnitude=0.0, unnamed_pressure=0.6)
     _seed_blend_memories(tmp_path, "grief", "loneliness", n=3)
 
@@ -338,13 +341,292 @@ def test_live_revise_lowers_the_feeling_and_writes_no_row(tmp_path: Path) -> Non
     assert _reconcile_rows(tmp_path) == []
 
 
-@pytest.mark.no_base_failure(
-    reason="pins that the live fold keeps the vocabulary filter (B1 PR 2); main answers False for an off-vocabulary channel too"
-)
 def test_live_revise_off_vocab_channel_folds_nothing(tmp_path: Path) -> None:
+    """The engine's fold checks the channel against her vocabulary (#801 section 6): with no bridge a channel she lacks is discarded."""
     eng = _go_live(tmp_path, joy=5.0)
     before = _settled(eng)
     result = reconcile_self_read(persona_dir=tmp_path, action="revise", channel="zorblesque", delta=0.5)
-    assert result["delta_written"] is False
+    assert result["delta_written"] is False  # a channel her vocabulary cannot hold is not folded, and the tool says so
     assert _settled(eng) == before
     assert _reconcile_rows(tmp_path) == []
+
+
+# --- a step after the state change raises (RC18, #803 step 19): fail-soft, state kept, counter not incremented ---------------
+
+
+def _raising_tick(exc: Exception):
+    def tick(*_args, **_kwargs):
+        raise exc
+
+    return tick
+
+
+_NAMING_STEM = "the naming step did not finish this time"
+_CHANGE_STEM = "the step that applies your change to your emotions did not finish this time"
+
+# The reason each error class gets (one table, both paths): (exception, reason).
+def _reason_rows():
+    import sqlite3
+
+    from brain.bridge.cli_throttle import ShutdownDeferred, ThrottleDeferred
+    from brain.bridge.provider_auth import ProviderAuthDeferred
+    from brain.utils.file_lock import LockTimeoutError
+
+    return [
+        (ShutdownDeferred("stop flag set"), "the app is shutting down."),
+        (ProviderAuthDeferred("token rejected"), "background work needs the login renewed."),
+        (ThrottleDeferred("a CLI slot was not free"), "background work was paused, so you can make the same call again later."),
+        (
+            LockTimeoutError("waited for the vocabulary lock"),
+            "something you needed was busy for too long, so you can make the same call again in a moment.",
+        ),
+        (sqlite3.OperationalError("unable to open database file"), "your memory database could not be opened or read."),
+        (PermissionError(13, "Permission denied", "emotion_vocabulary.json"), "something could not be read or saved."),
+        (RuntimeError("a bug"), "an unexpected error happened."),
+    ]
+
+
+def test_name_growth_tick_raising_returns_error_keeps_state_and_skips_counter(tmp_path: Path, monkeypatch, caplog) -> None:
+    import logging
+
+    from brain.self_model.resolve import load_audit
+
+    for exc, reason in _reason_rows():
+        _seed_open_gap(tmp_path, per_channel={}, magnitude=0.0, unnamed_pressure=0.6)
+        before = load_audit(tmp_path)["reconciles_called"]
+        monkeypatch.setattr("brain.growth.scheduler.run_growth_tick", _raising_tick(exc))
+        caplog.clear()
+
+        with caplog.at_level(logging.WARNING):
+            result = reconcile_self_read(persona_dir=tmp_path, action="name", name="that-hollow-ache")
+
+        assert result == {"error": f"{_NAMING_STEM}: {reason}"}
+        assert str(exc) not in result["error"]  # the raw error stays out of the message
+        assert "nothing was changed" not in result["error"]
+        logged = " ".join(r.getMessage() for r in caplog.records)  # and goes to the log: step, class, text, file when named
+        assert "naming step failed" in logged and type(exc).__name__ in logged and str(exc) in logged
+        if isinstance(exc, OSError) and exc.filename:
+            assert "emotion_vocabulary.json" in logged
+        state, _ = load_or_recover(tmp_path)
+        assert state.current_gap is not None
+        assert state.current_gap.status == "acknowledged"  # the state change comes first and stays saved
+        assert load_audit(tmp_path)["reconciles_called"] == before
+
+
+def test_the_reason_table_tests_the_most_specific_class_first() -> None:
+    from brain.bridge.cli_throttle import ShutdownDeferred, ThrottleDeferred
+    from brain.self_model.reconcile import _REASON_UNEXPECTED, _REASONS, _reason_for
+    from brain.utils.file_lock import LockTimeoutError
+
+    assert _reason_for(ShutdownDeferred) == "the app is shutting down."
+    assert _reason_for(ThrottleDeferred).startswith("background work was paused")
+    assert _reason_for(LockTimeoutError).startswith("something you needed was busy")  # not the OSError row
+    assert _reason_for(FileNotFoundError) == "something could not be read or saved."
+    assert _reason_for(Exception) == "an unexpected error happened."
+    for text in [reason for _cls, reason in _REASONS] + [_REASON_UNEXPECTED, _NAMING_STEM, _CHANGE_STEM]:
+        assert not {"she", "her"} & set(text.lower().replace(".", "").split())  # kindled-facing: "you", never "she/her"
+        assert chr(0x2014) not in text
+
+
+def test_name_growth_tick_raising_on_a_pure_channel_gap_leaves_status_alone(tmp_path: Path, monkeypatch) -> None:
+    from brain.self_model.resolve import load_audit
+
+    _seed_open_gap(tmp_path, unnamed_pressure=0.0)
+    monkeypatch.setattr("brain.growth.scheduler.run_growth_tick", _raising_tick(RuntimeError("boom")))
+    result = reconcile_self_read(persona_dir=tmp_path, action="name", name="some-word")
+    assert "error" in result
+    state, _ = load_or_recover(tmp_path)
+    assert state.current_gap is not None and state.current_gap.status == "open"
+    assert load_audit(tmp_path)["reconciles_called"] == 0
+
+
+def test_accept_and_revise_delta_step_raising_returns_error_keeps_state_and_skips_counter(tmp_path: Path, monkeypatch) -> None:
+    from brain.self_model.resolve import load_audit
+
+    for action in ("accept", "revise"):
+        for exc, reason in _reason_rows():
+            _seed_open_gap(tmp_path)
+
+            def boom(*_args, _exc=exc, **_kwargs):
+                raise _exc
+
+            with monkeypatch.context() as m:
+                m.setattr("brain.emotion.vocabulary_access.names_used", boom)
+                result = reconcile_self_read(persona_dir=tmp_path, action=action, channel="grief", delta=0.3)
+            assert result == {"error": f"{_CHANGE_STEM}: {reason}"}  # the reason by the class that reached the catch
+            assert str(exc) not in result["error"]
+            state, _ = load_or_recover(tmp_path)
+            assert state.current_gap is not None
+            assert state.current_gap.status == "acknowledged"
+            assert "grief" in state.current_gap.channel_cooldowns
+            assert load_audit(tmp_path)["reconciles_called"] == 0
+
+
+# --- a change the engine swallowed a failure for is not reported as written (RE19 item 2, #803 step 20) -----------------
+
+
+def _change_log_lines(persona_dir: Path) -> int:
+    from brain.emotion import engine_files
+
+    return sum(len(p.read_text(encoding="utf-8").splitlines()) for p in engine_files.changes_dir(persona_dir).glob("*.jsonl"))
+
+
+def test_a_failed_queue_append_returns_the_error_leaves_the_change_log_empty_and_a_retry_writes_one_copy(tmp_path: Path, monkeypatch) -> None:
+    from brain.emotion import engine_files
+    from brain.self_model.resolve import load_audit
+
+    _go_live(tmp_path, joy=5.0)
+    _seed_open_gap(tmp_path, per_channel={"joy": 4.0})
+    queued_before = len(engine_files.read_queue(tmp_path, from_line=0).events)
+    with monkeypatch.context() as m:
+        m.setattr(engine_files, "append_event", lambda *_a, **_k: False)
+        result = reconcile_self_read(persona_dir=tmp_path, action="revise", channel="joy", delta=-0.2)
+    assert result == {"error": f"{_CHANGE_STEM}: something could not be read or saved."}
+    assert "delta_written" not in result
+    assert _change_log_lines(tmp_path) == 0  # nothing in either file
+    assert len(engine_files.read_queue(tmp_path, from_line=0).events) == queued_before
+    state, _ = load_or_recover(tmp_path)
+    assert state.current_gap is not None and state.current_gap.status == "acknowledged"  # as RC18 left it
+    assert load_audit(tmp_path)["reconciles_called"] == 0
+
+    again = reconcile_self_read(persona_dir=tmp_path, action="revise", channel="joy", delta=-0.2)  # callable straight away
+    assert again["delta_written"] is True
+    assert len(engine_files.read_queue(tmp_path, from_line=0).events) == queued_before + 1
+    assert _change_log_lines(tmp_path) == 1  # one copy of the change, not two
+
+
+def test_a_lock_timeout_or_a_bug_inside_the_engine_is_an_error_not_a_written_change(tmp_path: Path, monkeypatch) -> None:
+    from brain.emotion import engine_files
+    from brain.self_model.resolve import load_audit
+    from brain.utils.file_lock import LockTimeoutError
+
+    _go_live(tmp_path, joy=5.0)
+    for raised, reason in (
+        (LockTimeoutError("engine lock"), "something you needed was busy for too long, so you can make the same call again in a moment."),
+        (PermissionError("denied"), "something could not be read or saved."),
+        (RuntimeError("engine bug"), "an unexpected error happened."),
+    ):
+        _seed_open_gap(tmp_path, per_channel={"joy": 4.0})
+
+        def boom(*_a, _raised=raised, **_k):
+            raise _raised
+
+        with monkeypatch.context() as m:
+            m.setattr(engine_files, "state_lock", boom)
+            result = reconcile_self_read(persona_dir=tmp_path, action="accept", channel="joy", delta=0.3)
+        assert result == {"error": f"{_CHANGE_STEM}: {reason}"}
+        assert load_audit(tmp_path)["reconciles_called"] == 0
+        assert engine_files.read_queue(tmp_path, from_line=0).events == []  # nothing reached the queue
+
+
+@pytest.mark.no_base_failure(reason="pins behaviour that already holds and that RE19 keeps: a change dropped whole for its names is delta_written false with no error")
+def test_a_change_dropped_whole_for_its_names_is_false_with_no_error(tmp_path: Path) -> None:
+    _go_live(tmp_path, joy=5.0)
+    _seed_open_gap(tmp_path, per_channel={"zorblesque": 4.0})
+    result = reconcile_self_read(persona_dir=tmp_path, action="revise", channel="zorblesque", delta=0.5)
+    assert result["delta_written"] is False and "error" not in result
+
+
+# --- the log line for a swallowed engine failure says specifically what went wrong (#803 step 20b) ----------------------
+
+
+def _reconcile_log_records(caplog) -> list:
+    return [r for r in caplog.records if r.getMessage().startswith("reconcile_self_read:")]
+
+
+def test_the_log_line_for_a_swallowed_lock_timeout_names_the_class_and_text(tmp_path: Path, monkeypatch, caplog) -> None:
+    import logging
+
+    from brain.emotion import engine_files
+    from brain.utils.file_lock import LockTimeoutError
+
+    _go_live(tmp_path, joy=5.0)
+    _seed_open_gap(tmp_path, per_channel={"joy": 4.0})
+
+    def boom(*_a, **_k):
+        raise LockTimeoutError("waited 30s for the engine lock")
+
+    with monkeypatch.context() as m, caplog.at_level(logging.WARNING):
+        m.setattr(engine_files, "state_lock", boom)
+        result = reconcile_self_read(persona_dir=tmp_path, action="accept", channel="joy", delta=0.3)
+    assert result == {"error": f"{_CHANGE_STEM}: something you needed was busy for too long, so you can make the same call again in a moment."}
+    records = _reconcile_log_records(caplog)
+    assert len(records) == 1
+    logged = records[0].getMessage()
+    assert "the change step failed" in logged and "LockTimeoutError: waited 30s for the engine lock" in logged
+    assert "file: none named" in logged  # a lock timeout names no file
+    assert records[0].exc_info is not None and records[0].exc_info[0] is LockTimeoutError
+
+
+def test_the_log_line_for_a_swallowed_oserror_names_class_text_file_and_carries_the_traceback(tmp_path: Path, monkeypatch, caplog) -> None:
+    import logging
+
+    from brain.emotion import engine_files
+
+    _go_live(tmp_path, joy=5.0)
+    _seed_open_gap(tmp_path, per_channel={"joy": 4.0})
+    refused = tmp_path / "emotion" / "queue.jsonl"
+
+    def boom(*_a, **_k):
+        raise PermissionError(13, "Permission denied", str(refused))
+
+    with monkeypatch.context() as m, caplog.at_level(logging.WARNING):
+        m.setattr(engine_files, "state_lock", boom)
+        result = reconcile_self_read(persona_dir=tmp_path, action="accept", channel="joy", delta=0.3)
+    assert result == {"error": f"{_CHANGE_STEM}: something could not be read or saved."}
+    records = [r for r in caplog.records if r.getMessage().startswith("reconcile_self_read:")]
+    assert len(records) == 1
+    logged = records[0].getMessage()
+    assert "PermissionError" in logged and "Permission denied" in logged and str(refused) in logged
+    assert records[0].exc_info is not None and records[0].exc_info[0] is PermissionError  # the traceback is kept
+
+
+def test_the_log_line_for_an_append_that_returned_false_says_so_and_names_the_queue_file(tmp_path: Path, monkeypatch, caplog) -> None:
+    import logging
+
+    from brain.emotion import engine_files
+
+    _go_live(tmp_path, joy=5.0)
+    _seed_open_gap(tmp_path, per_channel={"joy": 4.0})
+    with monkeypatch.context() as m, caplog.at_level(logging.WARNING):
+        m.setattr(engine_files, "append_event", lambda *_a, **_k: False)
+        result = reconcile_self_read(persona_dir=tmp_path, action="revise", channel="joy", delta=-0.2)
+    assert result == {"error": f"{_CHANGE_STEM}: something could not be read or saved."}
+    records = [r for r in caplog.records if r.getMessage().startswith("reconcile_self_read:")]
+    assert len(records) == 1
+    logged = records[0].getMessage()
+    assert "returned False" in logged and str(engine_files.queue_path(tmp_path)) in logged
+    assert records[0].exc_info is None  # no exception exists for this kind
+
+
+def test_the_log_line_for_an_unexpected_exception_in_the_engine_names_class_and_text(tmp_path: Path, monkeypatch, caplog) -> None:
+    import logging
+
+    from brain.bridge.cli_throttle import ThrottleDeferred
+    from brain.emotion import engine_files
+
+    _go_live(tmp_path, joy=5.0)
+    _seed_open_gap(tmp_path, per_channel={"joy": 4.0})
+
+    def boom(*_a, **_k):
+        raise RuntimeError("a bug in the hook")
+
+    with monkeypatch.context() as m, caplog.at_level(logging.WARNING):
+        m.setattr(engine_files, "state_lock", boom)
+        result = reconcile_self_read(persona_dir=tmp_path, action="accept", channel="joy", delta=0.3)
+    assert result == {"error": f"{_CHANGE_STEM}: an unexpected error happened."}
+    records = [r for r in caplog.records if r.getMessage().startswith("reconcile_self_read:")]
+    assert len(records) == 1 and "RuntimeError: a bug in the hook" in records[0].getMessage()
+    assert records[0].exc_info is not None and records[0].exc_info[0] is RuntimeError
+
+    # The reason row follows the guard's class, not the swallowed exception's own class: a ThrottleDeferred that the
+    # guard swallowed as a bug still gets the unexpected-error row, as before this step.
+    _seed_open_gap(tmp_path, per_channel={"joy": 4.0})
+
+    def deferred(*_a, **_k):
+        raise ThrottleDeferred("a CLI slot was not free")
+
+    with monkeypatch.context() as m:
+        m.setattr(engine_files, "state_lock", deferred)
+        again = reconcile_self_read(persona_dir=tmp_path, action="accept", channel="joy", delta=0.3)
+    assert again == {"error": f"{_CHANGE_STEM}: an unexpected error happened."}

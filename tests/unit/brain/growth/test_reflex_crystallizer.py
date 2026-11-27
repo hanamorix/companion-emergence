@@ -498,6 +498,65 @@ def test_emergence_gate_4_rejects_unknown_emotion(persona_dir):
     assert "vocabulary" in reason.lower() or "unknown" in reason.lower()
 
 
+def test_emergence_gate_4_matches_trigger_names_by_their_tidied_form(persona_dir):
+    """A trigger written `quiet_dread` is known when her vocabulary holds `Quiet Dread` (#801): both sides are tidied."""
+    for trigger in ({"quiet_dread": 7.0}, {"Quiet-Dread": 7.0}, {"QUIET DREAD": 7.0}):
+        accepted, reason = _validate_emergence_proposal(
+            proposal_dict=_good_proposal(trigger=trigger),
+            current_arc_names=set(),
+            removed_arc_names=set(),
+            emotion_vocabulary={"Quiet Dread"},
+            existing_trigger_keysets=[],
+            active_arc_count=4,
+            total_cap=16,
+        )
+        assert accepted is True, (trigger, reason)
+
+
+def test_load_emotion_vocabulary_is_the_lookup_every_entry_in_the_spelling_her_vocabulary_uses(persona_dir):
+    """The names gate 4 and the corpus use come from `vocabulary_access.lookup` ("all"), not from a read of her file (#801 step 4)."""
+    from brain.emotion import vocabulary
+    from brain.growth.crystallizers.reflex import _load_emotion_vocabulary
+
+    vocabulary.register(vocabulary.Emotion("Quiet Dread", "d", "persona_extension", 5.0))
+    vocabulary.set_bridge_owner(True)  # the owner answers from its registry; tests/conftest.py puts the flag back
+    (persona_dir / "emotion_vocabulary.json").write_text('{"version": 1, "emotions": [{"name": "only_in_the_file"}]}')
+    names = _load_emotion_vocabulary(persona_dir)
+    assert "Quiet Dread" in names and "joy" in names  # her entry in its own spelling, and the framework's names
+    assert "only_in_the_file" not in names  # the file is not read
+
+
+def test_crystallize_reflex_accepts_a_trigger_on_a_framework_name_her_file_does_not_hold(persona_dir, store):
+    """Gate 4 knows the framework's own feelings through the lookup: a file with no `love` entry no longer refuses a `love` trigger."""
+    _seed_vocab(persona_dir, ["creative_hunger"])
+    response = _json.dumps(
+        {
+            "emergences": [
+                {
+                    "name": "love_arc",
+                    "description": "a steady warmth",
+                    "trigger": {"love": 7.0},
+                    "cooldown_hours": 24.0,
+                    "output_memory_type": "reflex_pitch",
+                    "prompt_template": "You are {persona_name}. {emotion_summary}",
+                    "reasoning": "Love held high four times this month.",
+                }
+            ],
+            "prunings": [],
+        }
+    )
+    result = crystallize_reflex(
+        store=store,
+        persona_dir=persona_dir,
+        current_arcs=[_arc("creative_pitch")],
+        removed_arc_names=set(),
+        provider=_FakeProvider(response),
+        persona_name="nell",
+        persona_pronouns="she/her",
+    )
+    assert [e.name for e in result.emergences] == ["love_arc"]
+
+
 def test_emergence_gate_5_rejects_unrenderable_prompt_template(persona_dir):
     """Gate 5 catches malformed format spec in the prompt template."""
     proposal = _good_proposal(prompt_template="invalid {missing_var:0.2f")
@@ -1148,3 +1207,30 @@ def test_corpus_fire_log_excerpt_does_not_count_as_a_recall(persona_dir: Path, s
     assert corpus["fire_log_30d"][0]["output_excerpt"] == "a journal entry the arc wrote"
     row = store.get(mem.id, bump=False)
     assert (row.recall_count, row.last_accessed_at) == (0.0, None)
+
+
+def test_corpus_growth_log_shows_an_added_feeling_in_her_spelling_and_leaves_out_one_her_vocabulary_lacks(persona_dir: Path, store: MemoryStore):
+    """#801 section 6: the names of `emotion_added` events are checked when read; reading the biography adds no name."""
+    from brain.emotion import vocabulary
+    from brain.growth.log import GrowthLogEvent, append_growth_event
+
+    # Her vocabulary holds the entry in her file: a process that is not the owner reads the file and its copy follows it (#803 step 15).
+    (persona_dir / "emotion_vocabulary.json").write_text(
+        _json.dumps({"version": 1, "emotions": [{"name": "Quiet Dread Zz", "description": "dread, still", "category": "persona_extension", "decay_half_life_days": 6.0}]}),
+        encoding="utf-8",
+    )
+    when = datetime(2026, 4, 20, tzinfo=UTC)
+    for kind, name in (("emotion_added", "quiet-dread-zz"), ("emotion_added", "gone_word_zz"), ("arc_added", "some_arc")):
+        append_growth_event(
+            persona_dir / "emotion_growth.log.jsonl",
+            GrowthLogEvent(
+                timestamp=when, type=kind, name=name, description="d", decay_half_life_days=None, reason="r",
+                evidence_memory_ids=(), score=0.5, relational_context=None,
+            ),
+        )
+    corpus = _build_corpus(
+        store=store, persona_dir=persona_dir, persona_name="nell", persona_pronouns="she/her", current_arcs=[_arc("creative_pitch")],
+        removed_arc_names=set(), emotion_vocabulary=["love"], now=datetime(2026, 4, 28, tzinfo=UTC), look_back_days=30,
+    )
+    assert [(e["type"], e["name"]) for e in corpus["growth_log_90d"]] == [("emotion_added", "Quiet Dread Zz"), ("arc_added", "some_arc")]
+    assert vocabulary.get("gone_word_zz") is None and [e["name"] for e in _json.loads((persona_dir / "emotion_vocabulary.json").read_text(encoding="utf-8"))["emotions"]] == ["Quiet Dread Zz"]

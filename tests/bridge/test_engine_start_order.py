@@ -68,9 +68,9 @@ def cli_persona(tmp_path: Path) -> Path:
 
 def _record_vocabulary_and_stop_at_the_first_work(monkeypatch: pytest.MonkeyPatch, order: list[str], at_work=None) -> None:  # noqa: ANN001
     """`order` gets "vocabulary" for the command's vocabulary load and "work" at its first real work, where the command stops."""
-    from brain.emotion import persona_loader
+    from brain.emotion import vocabulary_access
 
-    real_load = persona_loader.load_persona_vocabulary
+    real_load = vocabulary_access.load_read_only
 
     def load(*args: object, **kwargs: object):
         order.append("vocabulary")
@@ -82,8 +82,7 @@ def _record_vocabulary_and_stop_at_the_first_work(monkeypatch: pytest.MonkeyPatc
             at_work()
         raise _StopError
 
-    monkeypatch.setattr(brain_cli, "load_persona_vocabulary", load)  # the five handlers import the name
-    monkeypatch.setattr(persona_loader, "load_persona_vocabulary", load)  # the chat handler imports it inside its body
+    monkeypatch.setattr(vocabulary_access, "load_read_only", load)  # every command loads her vocabulary through this one helper
     monkeypatch.setattr(brain_cli, "get_provider", first_work)
 
 

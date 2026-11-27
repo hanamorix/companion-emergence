@@ -109,12 +109,6 @@ from brain.health.vocab_repair import (
     should_run_vocab_repair as _vocab_repair_should_run,
 )
 from brain.ingest import extraction_backfill
-from brain.ingest.emotion_backfill import (
-    has_emotion_backfill_work as _emotion_backfill_has_work,
-)
-from brain.ingest.emotion_backfill import (
-    run_emotion_backfill as _emotion_backfill_run,
-)
 from brain.ingest.pipeline import (
     finalize_stale_sessions,
     snapshot_stale_sessions,
@@ -445,7 +439,7 @@ def run_folded(
     # Step 1 bumps decay_half_life_days from the bad 1.0 → 14.0 (sync,
     # provider-free, so it always lands). Step 2 re-derives descriptions via
     # Haiku (fail-soft — placeholders kept if provider unavailable/fails).
-    # Runs adjacent to emotion backfill; independent of it (separate try/except).
+    # Independent of the other startup steps (separate try/except).
     try:
         _run_vocab_repair_tick(persona_dir)
     except Exception as exc:  # noqa: BLE001
@@ -994,7 +988,7 @@ def _build_gated_jobs(
 
     One ``GatedJob`` per gated job; a job whose ``*_interval_s`` is None (the
     test/dev disable knob) is left out. The emotion recovery rebuild (#584), pass 2, session snapshot/prune,
-    emotion backfill, research recovery (#591), embedding backfill and the extraction backfill (#523)
+    research recovery (#591), embedding backfill and the extraction backfill (#523)
     have no interval: each runs at every idle pass while it has work (S53/S66;
     the extraction backfill takes one chunk per pass). Deploy recalibration is due
     while the stored floor is stale (S70/S73). The cosine and rerank floor
@@ -1157,39 +1151,7 @@ def _build_gated_jobs(
         GatedJob("session_snapshot_prune", run=_snapshot_prune_run, has_work=_snapshot_prune_has_work)
     )
 
-    # 3. emotion backfill — S53/S66 (was a startup one-shot only).
-    def _emotion_backfill_job_has_work() -> bool:
-        with _tick_store() as store:
-            return _emotion_backfill_has_work(persona_dir, store=store)
-
-    def _emotion_backfill_job() -> JobOutcome:
-        # The per-tick shared store (#132): one memories.db connection per tick.
-        emotion_paused_out: list[bool] = []
-        with _tick_store() as store:
-            _emotion_backfill_run(
-                persona_dir,
-                provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER),
-                store=store,
-                should_pause=_between_items,
-                paused_out=emotion_paused_out,
-            )
-        # INC-10 (C8): PAUSED only when the between-items hook itself stopped
-        # the pass (emotion_paused_out, set at that exact return site) — NOT
-        # merely whenever status=="running", which ALSO covers the unrelated
-        # zero-tagged-guard case (a systematic tagger failure leaves status
-        # "running" too, but that is not a chat-idle pause and must not stop
-        # the S55 sequence for the jobs after this one).
-        return JobOutcome.PAUSED if emotion_paused_out else JobOutcome.COMPLETED
-
-    jobs.append(
-        GatedJob(
-            "emotion_backfill",
-            run=_emotion_backfill_job,
-            has_work=_emotion_backfill_job_has_work,
-        )
-    )
-
-    # 3b. research recovery — #591: the research memories lost to an unread reply layout, recovered once from the stored
+    # 3. research recovery — #591: the research memories lost to an unread reply layout, recovered once from the stored
     # notes, one interest per pass (brain/engines/research_recovery.py). No model call of its own: the consolidation gate
     # classifies what it enqueues, so it waits until the gate has dealt with the previous pass.
     def _research_recovery_job() -> JobOutcome:
@@ -2104,8 +2066,9 @@ def _run_heartbeat_tick(
         # crystallizers see the same emotion universe the user does.
         try:
             from brain.emotion.persona_loader import load_persona_vocabulary
+            from brain.emotion.vocabulary_file import vocabulary_path
 
-            load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+            load_persona_vocabulary(vocabulary_path(persona_dir), store=store)
         except Exception:
             logger.exception("supervisor heartbeat: vocabulary load skipped")
 
@@ -2215,8 +2178,9 @@ def _run_soul_review_tick(
 
         try:
             from brain.emotion.persona_loader import load_persona_vocabulary
+            from brain.emotion.vocabulary_file import vocabulary_path
 
-            load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", store=store)
+            load_persona_vocabulary(vocabulary_path(persona_dir), store=store)
         except Exception:
             logger.exception("supervisor soul-review: vocabulary load skipped")
 

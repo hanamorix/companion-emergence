@@ -85,7 +85,9 @@ def test_merge_into_writes_content_and_merged_feelings_in_one_update(tmp_path: P
         real_update = MemoryStore.update
         monkeypatch.setattr(MemoryStore, "update", lambda self, memory_id, **fields: (calls.append((memory_id, fields)), real_update(self, memory_id, **fields))[1])
         store.merge_into(target, candidate, "a and b", engine_live=True)
-        assert calls == [(target.id, {"content": "a and b", "emotions": {"joy": 6.0, "awe": 2.0}, "fold": False})]
+        assert calls == [
+            (target.id, {"content": "a and b", "emotions": {"joy": 6.0, "awe": 2.0}, "fold": False, "check_names": False})
+        ]
         got = store.get(target.id, bump=False)
         assert got.content == "a and b" and got._stored_emotions == {"joy": 6.0, "awe": 2.0}
     finally:
@@ -97,7 +99,7 @@ def test_merge_into_before_the_switch_writes_the_content_only(tmp_path: Path):
     try:
         target = Memory.create_new(content="a", memory_type="conversation", domain="us", emotions={"Joy": 5.0})
         candidate = Memory.create_new(content="b", memory_type="dream", domain="us", emotions={"joy": 7.0})
-        store.create(target, fold=False)
+        store.create(target, fold=False, check_names=False)  # the row keeps the spelling the test pins
         store.merge_into(target, candidate, "a and b", engine_live=False)
         got = store.get(target.id, bump=False)
         assert got.content == "a and b" and got._stored_emotions == {"Joy": 5.0}
@@ -119,17 +121,17 @@ def test_merge_emotions_lives_in_the_store():
     assert _merge_emotions({"trust": 4, "joy": 7}, {"awe": 6, "Joy": 5}) == {"trust": 4.0, "joy": 6.0, "awe": 6.0}
 
 
-def test_the_backfill_probe_and_emptiness_check_are_store_methods(tmp_path: Path):
+@pytest.mark.no_base_failure(
+    reason="the old test of this predicate lost its other half (the deleted probe) and was renamed; the predicate existed and behaves the same on base"
+)
+def test_the_emptiness_check_is_a_store_method(tmp_path: Path):
     store = MemoryStore(tmp_path / "memories.db")
     try:
-        assert store.has_active_without_emotions() is False  # no rows
         with_feelings = Memory.create_new(content="a", memory_type="conversation", domain="us", emotions={"joy": 4.0})
         store.create(with_feelings, fold=False)
-        assert store.has_active_without_emotions() is False
         assert store.has_stored_emotions(with_feelings) is True
         bare = Memory.create_new(content="b", memory_type="conversation", domain="us")
         store.create(bare, fold=False)
-        assert store.has_active_without_emotions() is True
         assert store.has_stored_emotions(bare) is False
     finally:
         store.close()
@@ -192,7 +194,7 @@ def test_the_write_back_skips_a_row_when_the_read_leaves_a_stored_name_out(tmp_p
     store = MemoryStore(tmp_path / "memories.db")
     try:
         row = _stored(id="w", emotions={"joy": 9.0, "trust": 5.0}, importance=3.0)
-        store.create(row, fold=False)
+        store.create(row, fold=False, check_names=False)  # the row holds a name the check would not keep
         # the read drops "trust" (a value that is not a finite number is dropped by the real read)
         monkeypatch.setattr(emotion_engine_stub, "memory_feelings", lambda m: SimpleNamespace(feelings={"joy": 2.0}))
         before = store.get("w", bump=False)
@@ -214,7 +216,7 @@ def test_the_write_back_writes_a_row_whose_two_spellings_the_read_pools_into_one
     store = MemoryStore(tmp_path / "memories.db")
     try:
         row = _stored(id="w", emotions={"Joy": 4.0, "joy": 6.0}, importance=3.0)
-        store.create(row, fold=False)
+        store.create(row, fold=False, check_names=False)  # an old row: two spellings stored
         assert len(store.get("w", bump=False)._stored_emotions) == 2  # both spellings are stored
         consolidation._write_back_faded_emotions(store, tmp_path, row)
         assert store.get("w", bump=False)._stored_emotions == {"joy": 5.0}  # pooled as their average, written back

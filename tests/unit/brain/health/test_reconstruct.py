@@ -9,19 +9,11 @@ from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION, reconstruct_vocabu
 from brain.memory.store import Memory, MemoryStore
 
 
-def test_empty_store_returns_baseline_only() -> None:
+def test_empty_store_returns_no_entries() -> None:
+    """A core feeling is never written to her file (#801 section 8): an empty store reconstructs nothing."""
     store = MemoryStore(":memory:")
     try:
-        result = reconstruct_vocabulary_from_memories(store)
-        names = {e["name"] for e in result["emotions"]}
-        # 25 framework baseline emotions (11 core + 10 complex + 4 body)
-        assert "love" in names
-        assert "joy" in names
-        assert "belonging" in names
-        assert "climax" in names  # body
-        # No persona extensions
-        for e in result["emotions"]:
-            assert e["category"] in {"core", "complex", "body"}
+        assert reconstruct_vocabulary_from_memories(store) == {"version": 1, "emotions": []}
     finally:
         store.close()
 
@@ -35,8 +27,9 @@ def test_reconstructs_persona_extensions_from_memories() -> None:
                 content="x",
                 memory_type="conversation",
                 domain="us",
-                emotions={"body_grief": 8.0, "love": 9.0},
-            )
+                emotions={"emergence": 8.0, "love": 9.0},
+            ),
+            check_names=False,  # rows an older version stored, with names her vocabulary lacks
         )
         store.create(
             Memory.create_new(
@@ -44,27 +37,28 @@ def test_reconstructs_persona_extensions_from_memories() -> None:
                 memory_type="conversation",
                 domain="us",
                 emotions={"creative_hunger": 7.0},
-            )
+            ),
+            check_names=False,
         )
 
         result = reconstruct_vocabulary_from_memories(store)
         names = {e["name"] for e in result["emotions"]}
-        assert "body_grief" in names
+        assert "emergence" in names
         assert "creative_hunger" in names
-        # love is baseline, should also be present
-        assert "love" in names
+        # love is a core feeling: the framework holds it, so it is not written
+        assert "love" not in names
 
         # Extensions have placeholder description + persona-typical decay (14d)
-        body_grief = next(e for e in result["emotions"] if e["name"] == "body_grief")
-        assert "reconstructed from memory" in body_grief["description"]
-        assert body_grief["category"] == "persona_extension"
-        assert body_grief["decay_half_life_days"] == 14.0
+        emergence = next(e for e in result["emotions"] if e["name"] == "emergence")
+        assert "reconstructed from memory" in emergence["description"]
+        assert emergence["category"] == "persona_extension"
+        assert emergence["decay_half_life_days"] == 14.0
     finally:
         store.close()
 
 
-def test_baseline_names_in_memories_not_duplicated() -> None:
-    """If a baseline emotion name appears in memories, it doesn't get duplicated as extension."""
+def test_baseline_names_in_memories_make_no_entry() -> None:
+    """A core feeling a memory holds makes no entry at all (neither a core entry nor an extension)."""
     store = MemoryStore(":memory:")
     try:
         store.create(
@@ -76,9 +70,7 @@ def test_baseline_names_in_memories_not_duplicated() -> None:
             )
         )
         result = reconstruct_vocabulary_from_memories(store)
-        love_entries = [e for e in result["emotions"] if e["name"] == "love"]
-        assert len(love_entries) == 1
-        assert love_entries[0]["category"] == "core"  # baseline, not extension
+        assert result["emotions"] == []
     finally:
         store.close()
 
@@ -98,12 +90,13 @@ def test_reconstructed_entry_gets_persona_typical_half_life() -> None:
                 content="x",
                 memory_type="conversation",
                 domain="us",
-                emotions={"body_grief": 8.0},
-            )
+                emotions={"emergence": 8.0},
+            ),
+            check_names=False,
         )
         result = reconstruct_vocabulary_from_memories(store)
-        body_grief = next(e for e in result["emotions"] if e["name"] == "body_grief")
-        assert body_grief["decay_half_life_days"] == 14.0
+        emergence = next(e for e in result["emotions"] if e["name"] == "emergence")
+        assert emergence["decay_half_life_days"] == 14.0
     finally:
         store.close()
 
@@ -126,6 +119,7 @@ def test_non_finite_valued_emotion_name_still_gets_a_placeholder(caplog) -> None
                 emotions={"nan_ache": float("nan"), "inf_ache": float("inf"), "love": 9.0},
             ),
             fold=False,
+            check_names=False,
         )
         with caplog.at_level(logging.DEBUG):
             result = reconstruct_vocabulary_from_memories(store)
@@ -134,6 +128,27 @@ def test_non_finite_valued_emotion_name_still_gets_a_placeholder(caplog) -> None
         assert by_name["nan_ache"]["description"] == PLACEHOLDER_DESCRIPTION
         assert by_name["inf_ache"]["category"] == "persona_extension"
         assert not [r for r in caplog.records if "dropping emotion" in r.getMessage()]
+    finally:
+        store.close()
+
+
+def test_a_memory_key_the_gate_refuses_makes_no_entry() -> None:
+    """#801 step 3: a key that tidies to nothing, or is over the length limit, never becomes a vocabulary entry."""
+    store = MemoryStore(":memory:")
+    try:
+        store.create(
+            Memory.create_new(
+                content="x",
+                memory_type="conversation",
+                domain="us",
+                emotions={"---": 2.0, "q" * 101: 1.0, "kept key": 3.0},
+            ),
+            fold=False,
+            check_names=False,
+        )
+        names = [e["name"] for e in reconstruct_vocabulary_from_memories(store)["emotions"]]
+        assert "kept_key" in names
+        assert "" not in names and "q" * 101 not in names
     finally:
         store.close()
 
@@ -148,7 +163,8 @@ def test_returned_shape_matches_persona_loader_expectation() -> None:
                 memory_type="conversation",
                 domain="us",
                 emotions={"x_emotion": 5.0},
-            )
+            ),
+            check_names=False,
         )
         result = reconstruct_vocabulary_from_memories(store)
         assert "version" in result

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
+from brain.emotion import vocabulary, vocabulary_file
 from brain.growth.proposal import EmotionProposal
 from brain.growth.scheduler import (
     GrowthTickResult,
@@ -17,6 +18,13 @@ from brain.growth.scheduler import (
     run_growth_tick,
 )
 from brain.memory.store import MemoryStore
+
+
+@pytest.fixture(autouse=True)
+def _the_tick_runs_in_the_bridge() -> None:
+    """The growth tick runs in the bridge, which owns her vocabulary (the conftest fixture puts the flag back); the cases of
+    another process are the tests named `..._another_process_...` below, which clear it."""
+    vocabulary.set_bridge_owner(True)
 
 
 def _seed_vocab(persona_dir: Path, names: list[str] | None = None) -> None:
@@ -101,6 +109,76 @@ def test_run_growth_tick_applies_proposal_atomically(persona_dir: Path, store: M
     assert parsed["relational_context"] == "recurred during Hana's tender messages"
 
 
+def _proposal(name: str = "lingering") -> EmotionProposal:
+    return EmotionProposal(
+        name=name, description="the slow trail of warmth", decay_half_life_days=7.0,
+        evidence_memory_ids=("mem_a", "mem_b"), score=0.78, relational_context=None,
+    )
+
+
+def test_run_growth_tick_counts_a_proposal_the_add_refuses_as_rejected_and_adds_the_rest(persona_dir: Path, store: MemoryStore) -> None:
+    """A half-life of 0 days is not a number the engine can use: the add refuses that proposal, the tick counts it and goes on."""
+    bad = EmotionProposal(
+        name="no_time", description="d", decay_half_life_days=0.0, evidence_memory_ids=(), score=0.5, relational_context=None
+    )
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[bad, _proposal("lingering")]):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert (result.emotions_added, result.proposals_rejected) == (1, 1)
+    assert [e["name"] for e in json.loads((persona_dir / "emotion_vocabulary.json").read_text(encoding="utf-8"))["emotions"]] == ["lingering"]
+
+
+def test_run_growth_tick_in_another_process_with_no_bridge_adds_nothing_and_leaves_her_file(
+    persona_dir: Path, store: MemoryStore
+) -> None:
+    """Only the bridge writes her vocabulary: a tick in a `nell` command with no bridge adds no name, logs none, and leaves the file."""
+    _seed_vocab(persona_dir, names=["love", "joy"])
+    path = persona_dir / "emotion_vocabulary.json"
+    before = path.read_bytes()
+    vocabulary.set_bridge_owner(False)
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[_proposal("lingering"), _proposal("another_one")]):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 0
+    assert path.read_bytes() == before
+    assert not (persona_dir / "emotion_growth.log.jsonl").exists()
+    assert vocabulary.get("lingering") is None
+
+
+def test_run_growth_tick_in_another_process_does_not_heal_a_damaged_file(persona_dir: Path, store: MemoryStore) -> None:
+    """The health read of the names heals (quarantines and resets) a damaged file, which only the bridge may do."""
+    path = persona_dir / "emotion_vocabulary.json"
+    path.write_text("{corrupt{{", encoding="utf-8")
+    vocabulary.set_bridge_owner(False)
+    anomalies: list = []
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[]):
+        run_growth_tick(persona_dir, store, datetime.now(UTC), anomalies_collector=anomalies)
+    assert path.read_text(encoding="utf-8") == "{corrupt{{"
+    assert anomalies == []
+    assert list(persona_dir.glob("emotion_vocabulary.json.corrupt-*")) == []
+
+
+def test_run_growth_tick_in_another_process_adds_through_the_bridge(
+    persona_dir: Path, store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from brain.emotion import vocabulary_access
+
+    asked: list[tuple[str, dict]] = []
+
+    def bridge(persona_dir_: Path, route: str, body: dict, *, timeout: float) -> dict:
+        asked.append((route, body))
+        return {"results": [{"name": "lingering", "spelling": "lingering", "outcome": "used", "changed": True}]}
+
+    monkeypatch.setattr(vocabulary_access, "post_to_bridge", bridge)
+    vocabulary.set_bridge_owner(False)
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[_proposal("lingering")]):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 1
+    assert [route for route, _body in asked if route == "/vocabulary/add"] == ["/vocabulary/add"]
+    add_body = next(body for route, body in asked if route == "/vocabulary/add")
+    assert add_body["items"][0]["name"] == "lingering" and add_body["items"][0]["fields"]["decay_half_life_days"] == 7.0
+    assert not (persona_dir / "emotion_vocabulary.json").exists()  # this process wrote nothing
+    assert (persona_dir / "emotion_growth.log.jsonl").exists()
+
+
 def test_run_growth_tick_skips_proposal_with_existing_name(
     persona_dir: Path, store: MemoryStore
 ) -> None:
@@ -123,25 +201,198 @@ def test_run_growth_tick_skips_proposal_with_existing_name(
     assert not (persona_dir / "emotion_growth.log.jsonl").exists()
 
 
-def test_run_growth_tick_rejects_proposal_with_invalid_chars(
+def test_run_growth_tick_skips_a_proposal_whose_tidied_name_matches_an_entry_spelled_otherwise(
     persona_dir: Path, store: MemoryStore
 ) -> None:
-    """Names containing path-traversal chars or curly braces are rejected as schema-invalid."""
+    """#801 section 3: the dedupe compares tidied forms, so her file's spelling `Quiet Dread` matches the proposal `quiet_dread`."""
+    _seed_vocab(persona_dir, names=["Quiet Dread"])
+    before = (persona_dir / "emotion_vocabulary.json").read_bytes()
+    proposal = EmotionProposal(
+        name="quiet_dread",
+        description="dup",
+        decay_half_life_days=None,
+        evidence_memory_ids=(),
+        score=0.5,
+        relational_context=None,
+    )
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[proposal]):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 0
+    assert (persona_dir / "emotion_vocabulary.json").read_bytes() == before
+    assert not (persona_dir / "emotion_growth.log.jsonl").exists()
+
+
+def test_read_current_vocabulary_names_come_from_the_lookup_in_the_tidied_form(persona_dir: Path) -> None:
+    """The names are her registered vocabulary, tidied (an entry keeps its file spelling): the framework's own and her entries."""
+    entry = {"description": "d", "category": "persona_extension", "decay_half_life_days": 5.0}
+    (persona_dir / "emotion_vocabulary.json").write_text(
+        json.dumps({"version": 1, "emotions": [{"name": "Quiet Dread", **entry}, {"name": 5}, "x"]}),
+        encoding="utf-8",
+    )
+    vocabulary_file.load(persona_dir / "emotion_vocabulary.json")
+    names, anomaly = _read_current_vocabulary_names(persona_dir)
+    assert anomaly is None
+    assert {"quiet_dread", "joy"} <= names
+    assert "Quiet Dread" not in names
+
+
+def test_read_current_vocabulary_names_read_the_file_for_nothing_but_its_health(persona_dir: Path) -> None:
+    """In the bridge (the owner) the names are the registry's: a file entry that was never registered is not a name."""
+    entry = {"description": "d", "category": "persona_extension", "decay_half_life_days": 5.0}
+    (persona_dir / "emotion_vocabulary.json").write_text(
+        json.dumps({"version": 1, "emotions": [{"name": "unregistered_word", **entry}]}), encoding="utf-8"
+    )
+    vocabulary.set_bridge_owner(True)  # the fixture in tests/conftest.py puts the flag back
+    names, anomaly = _read_current_vocabulary_names(persona_dir)
+    assert anomaly is None
+    assert "unregistered_word" not in names
+
+
+_OLD_GATE_ALSO_REFUSED = "the scheduler's old name check already refused this name (empty, or holding a slash), so the row passes on the old code by design"
+_OLD_GATE_ALSO_ACCEPTED = "the scheduler's old name check already accepted this name, so the row passes on the old code by design"
+
+
+@pytest.mark.parametrize(
+    "bad_name",
+    [
+        pytest.param("", marks=pytest.mark.no_base_failure(reason=_OLD_GATE_ALSO_REFUSED)),
+        "---",
+        pytest.param(" / ", marks=pytest.mark.no_base_failure(reason=_OLD_GATE_ALSO_REFUSED)),
+        "x" * 101,
+    ],
+)
+def test_run_growth_tick_rejects_a_name_the_gate_refuses(persona_dir: Path, store: MemoryStore, bad_name: str) -> None:
+    """A name that is empty once tidied or longer than the cap is rejected, counted, and never written."""
     _seed_vocab(persona_dir)
-    bad_names = ["bad/name", "bad\\name", "bad{name}", ""]
-    for bn in bad_names:
-        proposal = EmotionProposal(
-            name=bn,
-            description="x",
-            decay_half_life_days=None,
-            evidence_memory_ids=(),
-            score=0.5,
-            relational_context=None,
-        )
-        with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[proposal]):
-            result = run_growth_tick(persona_dir, store, datetime.now(UTC))
-        assert result.emotions_added == 0
-        assert result.proposals_rejected == 1
+    before = (persona_dir / "emotion_vocabulary.json").read_text(encoding="utf-8")
+    proposal = EmotionProposal(
+        name=bad_name,
+        description="x",
+        decay_half_life_days=None,
+        evidence_memory_ids=(),
+        score=0.5,
+        relational_context=None,
+    )
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[proposal]):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 0
+    assert result.proposals_rejected == 1
+    assert (persona_dir / "emotion_vocabulary.json").read_text(encoding="utf-8") == before
+    assert not (persona_dir / "emotion_growth.log.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    "raw_name, written",
+    [
+        ("bad/name", "bad_name"),
+        ("Bad Name", "bad_name"),
+        pytest.param("x" * 100, "x" * 100, marks=pytest.mark.no_base_failure(reason=_OLD_GATE_ALSO_ACCEPTED)),
+    ],
+)
+def test_run_growth_tick_writes_an_accepted_name_in_its_tidied_form(
+    persona_dir: Path, store: MemoryStore, raw_name: str, written: str
+) -> None:
+    _seed_vocab(persona_dir)
+    proposal = EmotionProposal(
+        name=raw_name,
+        description="x",
+        decay_half_life_days=None,
+        evidence_memory_ids=(),
+        score=0.5,
+        relational_context=None,
+    )
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[proposal]):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 1
+    assert result.proposals_rejected == 0
+    names = [e["name"] for e in json.loads((persona_dir / "emotion_vocabulary.json").read_text(encoding="utf-8"))["emotions"]]
+    assert names == ["love", "joy", written]
+    log_lines = (persona_dir / "emotion_growth.log.jsonl").read_text(encoding="utf-8").splitlines()
+    assert json.loads(log_lines[-1])["name"] == written
+
+
+def _wistful() -> EmotionProposal:
+    return EmotionProposal(
+        name="wistful scheduler",
+        description="a soft longing",
+        decay_half_life_days=7.0,
+        evidence_memory_ids=(),
+        score=0.5,
+        relational_context=None,
+    )
+
+
+def test_run_growth_tick_adds_through_the_shared_writer_with_the_proposals_fields(persona_dir: Path, store: MemoryStore) -> None:
+    _seed_vocab(persona_dir)
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[_wistful()]):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 1
+    entry = json.loads((persona_dir / "emotion_vocabulary.json").read_text(encoding="utf-8"))["emotions"][-1]
+    assert entry == {
+        "name": "wistful_scheduler",
+        "description": "a soft longing",
+        "category": "persona_extension",
+        "decay_half_life_days": 7.0,
+        "intensity_clamp": 10.0,
+    }
+    from brain.emotion import vocabulary
+
+    assert vocabulary.get("wistful_scheduler") is not None  # the writer registers it too
+
+
+def test_run_growth_tick_counts_and_logs_nothing_when_the_file_cannot_be_written(
+    persona_dir: Path, store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from brain import dev_constants
+    from brain.utils import file_lock
+
+    _seed_vocab(persona_dir)
+    path = persona_dir / "emotion_vocabulary.json"
+    before = path.read_bytes()
+    monkeypatch.setattr(dev_constants, "EMOTION_VOCABULARY_LOCK_WAIT_S", 0.2)
+    with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[_wistful()]), file_lock.file_lock(path):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 0 and result.proposals_rejected == 0
+    assert path.read_bytes() == before
+    assert not (persona_dir / "emotion_growth.log.jsonl").exists()
+
+
+def test_run_growth_tick_stops_adding_after_the_first_name_the_file_cannot_take(persona_dir: Path, store: MemoryStore) -> None:
+    from brain.emotion.vocabulary_file import NameResult
+
+    _seed_vocab(persona_dir)
+    second = EmotionProposal(
+        name="another one",
+        description="x",
+        decay_half_life_days=None,
+        evidence_memory_ids=(),
+        score=0.4,
+        relational_context=None,
+    )
+    refused = NameResult("wistful_scheduler", None, "cannot_write")
+    with (
+        patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[_wistful(), second]),
+        patch("brain.growth.scheduler.vocabulary_file.add", return_value=[refused]) as add,
+    ):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert add.call_count == 1  # no second wait on a lock that just timed out
+    assert result.emotions_added == 0
+
+
+def test_run_growth_tick_records_nothing_when_another_writer_added_the_name_since_the_read(
+    persona_dir: Path, store: MemoryStore
+) -> None:
+    from brain.emotion.vocabulary_file import NameResult
+
+    _seed_vocab(persona_dir)
+    taken = NameResult("wistful_scheduler", "wistful_scheduler", "used", False)
+    with (
+        patch("brain.growth.scheduler.crystallize_vocabulary", return_value=[_wistful()]),
+        patch("brain.growth.scheduler.vocabulary_file.add", return_value=[taken]),
+    ):
+        result = run_growth_tick(persona_dir, store, datetime.now(UTC))
+    assert result.emotions_added == 0
+    assert not (persona_dir / "emotion_growth.log.jsonl").exists()
 
 
 def test_run_growth_tick_dry_run_does_not_write(persona_dir: Path, store: MemoryStore) -> None:
@@ -170,12 +421,12 @@ def test_run_growth_tick_handles_multiple_proposals(persona_dir: Path, store: Me
         EmotionProposal(
             name=f"p{i}",
             description=f"desc {i}",
-            decay_half_life_days=float(i),
+            decay_half_life_days=float(i),  # from 1: a half-life of 0 is not a number of days the engine can use (the add refuses it)
             evidence_memory_ids=(),
             score=0.5,
             relational_context=None,
         )
-        for i in range(3)
+        for i in range(1, 4)
     ]
     with patch("brain.growth.scheduler.crystallize_vocabulary", return_value=proposals):
         result = run_growth_tick(persona_dir, store, datetime.now(UTC))
@@ -261,9 +512,9 @@ def test_read_current_vocabulary_names_corrupt_quarantines_restores_bak(
     vocab_path.write_text("{corrupt{{", encoding="utf-8")
 
     with caplog.at_level(logging.WARNING):
-        names, anomaly = _read_current_vocabulary_names(vocab_path)
+        names, anomaly = _read_current_vocabulary_names(persona_dir)
 
-    # Names restored from .bak1
+    # The names are the lookup's (the framework's own are there with no file at all)
     assert "joy" in names
     assert "love" in names
     # Anomaly captures the heal action so caller can surface to audit log
@@ -277,16 +528,16 @@ def test_read_current_vocabulary_names_corrupt_quarantines_restores_bak(
 def test_read_current_vocabulary_names_corrupt_no_bak_resets_to_default(
     persona_dir: Path, caplog
 ) -> None:
-    """Corrupt vocab + no .bak → empty set returned + warning logged."""
+    """Corrupt vocab + no .bak → the anomaly is returned + warning logged; the names are still the lookup's."""
     import logging
 
     vocab_path = persona_dir / "emotion_vocabulary.json"
     vocab_path.write_text("{corrupt{{", encoding="utf-8")
 
     with caplog.at_level(logging.WARNING):
-        names, anomaly = _read_current_vocabulary_names(vocab_path)
+        names, anomaly = _read_current_vocabulary_names(persona_dir)
 
-    assert names == set()
+    assert "joy" in names
     assert anomaly is not None
     assert anomaly.action == "reset_to_default"
     # Some warning surfaced (either from json_io or the existing path)
@@ -419,7 +670,7 @@ def test_vocabulary_crystallization_emits_initiate_candidate(
     """After vocabulary crystallization commits, emit a candidate.
 
     Phase 4.2 — the emit fires inside scheduler.run_growth_tick immediately
-    after _append_to_vocabulary + append_growth_event, so it lives at the
+    after vocabulary_file.add + append_growth_event, so it lives at the
     actual SoulStore-commit point for vocabulary changes.
     """
     from brain.initiate.emit import read_candidates

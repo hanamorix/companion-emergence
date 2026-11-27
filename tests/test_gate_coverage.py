@@ -12,6 +12,7 @@ isolation tests missed (change: changes/gate-leak-coverage/):
 - G6: a direct-write coverage guard — enumerates every ``.create(`` under brain/ and asserts
   it is a subset of a pinned allowlist, so a NEW automatic writer that bypasses the gate (any
   receiver name) or a regression of a routed locus fails CI.
+- G6b: the same pin for ``.update(..., check_names=False)`` (a write that skips the check on a memory's feeling names).
 - G7: the owner-BYPASS writers (grief_event / kindled_peer) stay direct — guards the owner
   ruling against an over-eager "route everything" edit.
 - A2 (advisory): documents the file_write exact-dup cross-tick drop (designed gate behavior).
@@ -22,7 +23,10 @@ default CI selection (that is the whole point: the missed coverage runs in CI).
 
 from __future__ import annotations
 
+import ast
 import sqlite3
+from collections import Counter
+from collections.abc import Mapping
 from pathlib import Path
 
 import pytest
@@ -203,14 +207,14 @@ _ALLOWED_DIRECT = {
     ("grief/breadcrumb.py", "return store.create(memory)"),
     ("kindled_link/relationship.py", "mem_store.create(mem)"),
     ("memory/pending.py", "return store.create(mem)"),
-    ("migrator/cli.py", "store.create(mem, fold=False)"),
+    ("migrator/cli.py", "store.create(mem, fold=False, check_names=False)"),
     ("migrator/cli.py", "soul_store.create(crystal)"),
     ("migrator/emergence_kit.py", "soul_store.create(crystal)"),
-    ("migrator/emergence_kit.py", "store.create(mem, fold=False)"),
-    ("recovery/engine.py", "store.create(mem, fold=False)"),
+    ("migrator/emergence_kit.py", "store.create(mem, fold=False, check_names=False)"),
+    ("recovery/engine.py", "store.create(mem, fold=False, check_names=False)"),
     ("soul/review.py", "soul_store.create(c)"),
     ("tools/impls/add_journal.py", "store.create(memory)"),
-    ("tools/impls/add_memory.py", "store.create(memory)"),
+    ("tools/impls/add_memory.py", "store.create(memory, check_names=False)"),
     ("tools/impls/crystallize_soul.py", "soul_store.create(c)"),
 }
 _PINNED = _KNOWN_NON_MEMORY | _ALLOWED_DIRECT
@@ -269,6 +273,100 @@ def test_g6_guard_can_fail(tmp_path):
     assert not any("create_new" in txt for _rel, txt in found)
     # and such a novel writer is NOT in the pinned allowlist → test_g6 would FAIL on it
     assert (found - _PINNED)
+
+
+# ── G6b: the same for `.update(..., check_names=False)` (#803 step 17) ──────────────────────
+# `MemoryStore.update` checks a memory's feeling names unless `check_names=False`. A write that turns the check off is pinned, like
+# the `.create(` writers above, by (relpath, exact stripped line) and a count, with a reason. The shapes looked at: an `.update(`
+# call, a `dict(...)` call, a dict literal and a subscript assignment that set `check_names` to anything but the constant True.
+# Any other callee (an alias of `update`, `functools.partial(s.update, ...)`, a reader such as `_resolved_faded`) is caught when it is
+# given the constant False; the readers that do are pinned as reads. Not caught: a `**kwargs` dict built somewhere this scan does not
+# look (a name, a function's return), a value held in a variable (`check_names=flag` into an `update`-named call is caught, into any
+# other callee it is not), a `check_names` set with `setattr`.
+_CHECK_NAMES_OFF_PINNED: dict[tuple[str, str], tuple[int, str]] = {
+    ("memory/store.py", "fields.update(emotions=_merge_emotions(target._stored_emotions, candidate._stored_emotions), fold=False, check_names=False)"): (
+        1,
+        "the consolidation merge builds the kwargs dict that `self.update(target.id, **fields)` takes on the next line (this line is the "
+        "dict, not the store call): the merged map comes from two stored rows whose names the store already wrote tidied",
+    ),
+    ("emotion/engine.py", "emotions = self._resolved_faded(memory, check_names=False)  # the store checked the emotions before writing them"): (
+        1,
+        "a READ of a row's feelings by the engine's hook after the store checked and wrote the row (`_resolved_faded`'s docstring); writes nothing",
+    ),
+    ("emotion/engine.py", "emotions = self._resolved_faded(memory, check_names=False)  # the store checked the row before writing it"): (
+        1,
+        "a READ of a row's feelings by the engine's hook after the store checked and wrote the row (`_resolved_faded`'s docstring); writes nothing",
+    ),
+    ("emotion/engine.py", "return self._resolved_faded(memory, check_names=False) if counted_kind(memory) is not None else {}"): (
+        1,
+        "a READ of a stored row's feelings replayed under the engine lock (spec section 7, `_resolved_faded`'s docstring); writes nothing",
+    ),
+}
+
+
+def _is_true(node: ast.expr) -> bool:
+    return isinstance(node, ast.Constant) and node.value is True
+
+
+def _enumerate_check_names_off(files: Mapping[str, str]) -> Counter[tuple[str, str]]:
+    """Every place that sets `check_names` to something other than True, as (path relative to brain/, stripped line)."""
+    found: Counter[tuple[str, str]] = Counter()
+    for rel, text in files.items():
+        lines = text.splitlines()
+        for node in ast.walk(ast.parse(text)):
+            hit = False
+            if isinstance(node, ast.Call):
+                name = node.func.attr if isinstance(node.func, ast.Attribute) else node.func.id if isinstance(node.func, ast.Name) else ""
+                # `update` and `dict` (the kwargs of an update) with any value but True; any other callee (an alias `u = s.update`,
+                # `functools.partial(s.update, ...)`, `getattr(s, "update")(...)`) with the constant False. `create` is G6's.
+                # A variable forwarded to a callee (`check_names=check_names`) is not turning the check off by itself.
+                hit = name != "create" and any(
+                    k.arg == "check_names" and (not _is_true(k.value) if name in ("update", "dict") else isinstance(k.value, ast.Constant) and not _is_true(k.value))
+                    for k in node.keywords
+                )
+            elif isinstance(node, ast.Dict):
+                hit = any(isinstance(k, ast.Constant) and k.value == "check_names" and not _is_true(v) for k, v in zip(node.keys, node.values, strict=True))
+            elif isinstance(node, ast.Assign):
+                hit = not _is_true(node.value) and any(
+                    isinstance(t, ast.Subscript) and isinstance(t.slice, ast.Constant) and t.slice.value == "check_names" for t in node.targets
+                )
+            if hit:
+                found[(rel.removeprefix("brain/"), lines[node.lineno - 1].strip())] += 1
+    return found
+
+
+def test_g6b_no_unpinned_update_that_skips_the_name_check():
+    found = _enumerate_check_names_off({rel: text for rel, text in brain_sources().items() if "check_names" in text})
+    unpinned = {k: n for k, n in found.items() if k not in _CHECK_NAMES_OFF_PINNED or n > _CHECK_NAMES_OFF_PINNED[k][0]}
+    assert not unpinned, (
+        "A write that turns off the check on a memory's feeling names is new. Let the store check them, or pin it in "
+        "_CHECK_NAMES_OFF_PINNED with the reason:\n" + "\n".join(f"  {rel}: {txt}" for (rel, txt) in sorted(unpinned))
+    )
+    stale = sorted(k for k, (count, _reason) in _CHECK_NAMES_OFF_PINNED.items() if found.get(k, 0) < count)
+    assert not stale, f"pins with no hit left, remove them: {stale}"
+    assert all(reason.strip() for _count, reason in _CHECK_NAMES_OFF_PINNED.values())
+
+
+@pytest.mark.no_base_failure(reason="self-test of the guard on synthetic source; passes on any base by design")
+def test_g6b_guard_can_fail():
+    """The REAL enumerator on synthetic bypasses: each shape is found, a checked write and a constant True are not."""
+    bypasses = {
+        "a.py": "def f(s, i):\n    s.update(i, emotions={}, check_names=False)\n",
+        "b.py": "def f(s, i, flag):\n    s.update(i, check_names=flag)\n",
+        "c.py": "def f(s, i):\n    kw = dict(check_names=False)\n    s.update(i, **kw)\n",
+        "d.py": "def f(s, i):\n    s.update(i, **{'check_names': False})\n",
+        "e.py": "def f(s, i, fields):\n    fields['check_names'] = False\n    s.update(i, **fields)\n",
+        "f.py": "def f(s, i):\n    u = s.update\n    u(i, check_names=False)\n",
+        "g2.py": "import functools\ndef f(s):\n    return functools.partial(s.update, check_names=False)\n",
+        "g3.py": "def f(s, i):\n    getattr(s, 'update')(i, check_names=False)\n",
+    }
+    clean = {
+        "g.py": "def f(s, i):\n    s.update(i, emotions={})\n    s.update(i, check_names=True)\n",
+        "h.py": "def f(s, i):\n    x = {'check_names': True}\n    return s.create(i, check_names=False)\n",
+    }
+    found = _enumerate_check_names_off(bypasses | clean)
+    assert {rel for rel, _txt in found} == set(bypasses)
+    assert not (set(found) & set(_CHECK_NAMES_OFF_PINNED))
 
 
 # ── G7: owner-BYPASS writers stay direct (guards the owner ruling) ──────────────

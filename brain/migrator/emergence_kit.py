@@ -278,7 +278,8 @@ def _migrate_emergence_kit_locked(args: EmergenceKitMigrateArgs) -> MigrationRep
                 )
                 continue
             seen_ids.add(mem.id)
-            store.create(mem, fold=False)
+            # an import keeps the names it brings: it must not lose a feeling
+            store.create(mem, fold=False, check_names=False)
             migrated_count += 1
     finally:
         store.close()

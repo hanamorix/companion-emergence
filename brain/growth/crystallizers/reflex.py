@@ -26,7 +26,8 @@ from typing import Any
 
 from brain.bridge.cli_throttle import ThrottleDeferred
 from brain.bridge.provider import LLMProvider, ProviderError
-from brain.emotion.vocabulary import pool_by_canonical_name
+from brain.emotion import vocabulary_access
+from brain.emotion.vocabulary import canonical_name, pool_by_canonical_name
 from brain.engines.reflex import ArcFire, ReflexArc
 from brain.growth.arc_storage import read_removed_arcs
 from brain.growth.log import read_growth_log
@@ -191,16 +192,25 @@ def _build_corpus(
     growth_path = persona_dir / "emotion_growth.log.jsonl"
     growth_in_window = []
     try:
-        for ev in read_growth_log(growth_path):
-            if ev.timestamp >= growth_cutoff:
-                growth_in_window.append(
-                    {
-                        "timestamp": ev.timestamp.isoformat(),
-                        "type": ev.type,
-                        "name": ev.name,
-                        "reasoning": ev.reason,
-                    }
-                )
+        window = [ev for ev in read_growth_log(growth_path) if ev.timestamp >= growth_cutoff]
+        # An `emotion_added` event names a feeling: it is checked when read (spec section 6), shown in the spelling her vocabulary
+        # uses, and left out when her vocabulary no longer holds it. Other event types name arcs, not feelings. Reading the
+        # biography adds no name.
+        feelings = vocabulary_access.names_known(persona_dir, [ev.name for ev in window if ev.type == "emotion_added"])
+        for ev in window:
+            name = ev.name
+            if ev.type == "emotion_added":
+                name = feelings.get(ev.name)
+                if name is None:
+                    continue
+            growth_in_window.append(
+                {
+                    "timestamp": ev.timestamp.isoformat(),
+                    "type": ev.type,
+                    "name": name,
+                    "reasoning": ev.reason,
+                }
+            )
     except Exception as exc:
         logger.warning("growth log load failed (non-fatal): %s", exc)
 
@@ -613,7 +623,8 @@ def _validate_emergence_proposal(
         return False, "gate 5: trigger values must be numeric"
 
     # Gate 4: all trigger emotions in vocabulary
-    unknown = set(trigger_typed.keys()) - emotion_vocabulary
+    # Both sides are matched by tidied name: a trigger written `quiet_dread` is known when her vocabulary holds `Quiet Dread`.
+    unknown = set(pool_by_canonical_name(trigger_typed)) - {canonical_name(n) for n in emotion_vocabulary}
     if unknown:
         return False, (
             f"gate 4: trigger references unknown emotions {sorted(unknown)} not in vocabulary"
@@ -761,10 +772,9 @@ def _prompt_template_renderable(template: str) -> bool:
 
 
 def _load_emotion_vocabulary(persona_dir: Path) -> set[str]:
-    """Read emotion_vocabulary.json and return the set of emotion names.
+    """Her vocabulary's feeling names, each in the spelling her vocabulary uses, from the lookup (`vocabulary_access.lookup`, "all").
 
-    Missing file or corruption → empty set (gate 4 will reject any trigger).
+    Every entry of her vocabulary is a name, the framework's own included. With no bridge and a file that cannot be read, only
+    the framework's names are known. Gate 4 matches a trigger name against these by its tidied form.
     """
-    data = read_json(persona_dir / "emotion_vocabulary.json", default=dict, expect=dict)
-    emotions = data.get("emotions", [])
-    return {e["name"] for e in emotions if isinstance(e, dict) and isinstance(e.get("name"), str)}
+    return {found.spelling for found in vocabulary_access.lookup(persona_dir, vocabulary_access.ALL).values() if found is not None}

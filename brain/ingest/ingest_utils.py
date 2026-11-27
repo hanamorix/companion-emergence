@@ -248,24 +248,22 @@ def load_user_pronouns(persona_dir: Path) -> dict | None:
         return None
 
 
-def load_emotion_vocab() -> tuple[set[str], str]:
-    """Return (names_set, comma_separated_sorted_string) for all registered emotions.
+def load_emotion_vocab() -> str:
+    """Return the comma-separated, sorted names of all registered emotions, for the extraction prompt.
 
     Reads the in-process vocabulary registry (baseline + any persona extensions
     registered at engine startup). Falls back to empty on any error — an
-    extraction must never fail because of a vocabulary load issue.
-
-    Returns a tuple so callers get both forms cheaply (set for normalize(),
-    string for the prompt).
+    extraction must never fail because of a vocabulary load issue. The names the
+    model returns are not filtered against this list: the memory write checks them
+    against her vocabulary (spec section 6).
     """
     try:
         from brain.emotion.vocabulary import list_all
 
-        names = {e.name for e in list_all()}
-        return names, ",".join(sorted(names))
+        return ",".join(sorted({e.name for e in list_all()}))
     except Exception:  # noqa: BLE001
-        logger.warning("load_emotion_vocab: failed to load vocabulary; emotions will be empty")
-        return set(), ""
+        logger.warning("load_emotion_vocab: failed to load vocabulary; the prompt lists no names")
+        return ""
 
 
 # Where chunked extraction began, PER SESSION: for each session, the ts of the

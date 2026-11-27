@@ -1,8 +1,8 @@
 """One-time startup migration repairing already-stubbed emotion_vocabulary.json.
 
 Step 1 (sync, provider-free): entries with the OLD bad decay_half_life_days==1.0
-AND the placeholder description → bumped to 14.0. Atomic write. Stops ongoing
-damage immediately.
+AND the placeholder description → bumped to 14.0. Written through `brain/emotion/vocabulary_file.py`
+(every change to the file in this module is). Stops ongoing damage immediately.
 
 Step 2 (Haiku, budget-capped, fail-soft): for repaired stub names, derive
 one-line descriptions and replace the placeholder. Batch into ONE prompt per
@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from brain import prompt_strings
+from brain.emotion import vocabulary_access, vocabulary_file
 from brain.emotion.vocabulary import canonical_name
 from brain.health.json_io import Recovery, read_json, write_json
 from brain.health.parse_failures import record_parse_failure
@@ -85,13 +86,13 @@ def should_run_vocab_repair(persona_dir: Path) -> bool:
 
     #173: the completed-state file only retires Step 1 (the one-time 1.0 → 14.0
     half-life bump). Placeholders keep being minted afterwards by
-    reconstruct.py / persona_loader.py (already at 14.0), so Step 2 (describe)
+    the memory heal and the rebuild (`vocabulary_file.add`, already at 14.0), so Step 2 (describe)
     must be allowed to run again whenever any placeholder exists. The
     supervisor only asks at startup, so the retry cadence is once per bridge
     start, bounded by _DESCRIBE_BATCH per run.
     """
     data = read_json(
-        persona_dir / "emotion_vocabulary.json",
+        vocabulary_file.vocabulary_path(persona_dir),
         default=lambda: None,
         recover=Recovery.CONTENT,
         expect=dict,
@@ -129,20 +130,31 @@ def run_vocab_repair(
     prior_repaired = int(existing.get("repaired", 0)) if prior_complete else 0
     prior_described = int(existing.get("described", 0)) if prior_complete else 0
 
-    vocab_path = persona_dir / "emotion_vocabulary.json"
+    vocab_path = vocabulary_file.vocabulary_path(persona_dir)
     data = read_json(vocab_path, default=lambda: None, recover=Recovery.CONTENT, expect=dict)
-    if data is None:  # missing, or corrupt (the module logged it): skip, as before
+    if data is None or not isinstance(data.get("emotions"), list):
+        # missing, corrupt (the module logged it), or a file with no emotions list: skip, as before
         return _write_and_return(persona_dir, repaired=0, described=0)
 
     # ------------------------------------------------------------------
     # Step 0 (#174, provider-free, every run): collapse spelling-variant twins
     # (love_grief_blend / grief_love_blend, anticipatory-grief / Anticipatory_Grief)
-    # into one canonical entry. A twin with a real description beats a placeholder.
+    # into one entry under the spelling that comes first in the file. A twin with a real
+    # description gives the fields (it beats a placeholder). A core feeling's twins are never merged (they stay for the
+    # start-up removal). Every change to the file below
+    # goes through `vocabulary_file`. A merge or half-life bump it could not write raises, so the state
+    # file is not rewritten and the repair runs again at the next start; a description batch it could not
+    # write raises into Step 2's fail-soft handler (placeholders kept, retried at the next start).
     # ------------------------------------------------------------------
-    merged = _merge_variant_entries(data)
-    if merged:
-        _atomic_write_vocab(vocab_path, data)
-        logger.info("vocab_repair: merged %d variant twin(s): %s", len(merged), merged)
+    merge_result = vocabulary_file.merge(vocab_path)
+    if merge_result.cannot_write:
+        raise OSError(f"vocab_repair: the twin merge could not be written to {vocab_path.name}")
+    if merge_result.pairs:
+        logger.info("vocab_repair: merged %d variant twin(s): %s", len(merge_result.pairs), merge_result.pairs)
+        # The file changed under us: the steps below work from what it holds now.
+        data = read_json(vocab_path, default=lambda: None, recover=Recovery.CONTENT, expect=dict)
+        if data is None:
+            return _write_and_return(persona_dir, repaired=0, described=0)
 
     if prior_complete and provider is None:
         # Step 1 already done and Step 2 needs a provider: nothing more to do.
@@ -159,20 +171,28 @@ def run_vocab_repair(
     # Step 1: bump half-life for stub entries (sync, provider-free)
     # ------------------------------------------------------------------
     stub_names: list[str] = []
-    repaired = 0
+    bumps: dict[str, dict] = {}
     for entry in emotions:
         if not isinstance(entry, dict):
             continue
         if entry.get("description") != PLACEHOLDER_DESCRIPTION:
             continue
+        name = entry.get("name")
+        if not isinstance(name, str):
+            continue  # a nameless entry has nothing to describe or bump
         # Step 2 target: every placeholder, whatever its half-life (#173).
-        stub_names.append(entry["name"])
+        stub_names.append(name)
         if not prior_complete and entry.get("decay_half_life_days") == _OLD_STUB_DECAY_DAYS:
-            entry["decay_half_life_days"] = _REPAIRED_DECAY_DAYS
-            repaired += 1
+            bumps[name] = {"decay_half_life_days": _REPAIRED_DECAY_DAYS}
+
+    repaired = 0
+    if bumps:
+        results = vocabulary_file.replace_fields(vocab_path, bumps, only_if=_is_old_stub)
+        if any(r.outcome == "cannot_write" for r in results):
+            raise OSError(f"vocab_repair: the half-life bump could not be written to {vocab_path.name}")
+        repaired = sum(1 for r in results if r.changed)
 
     if repaired > 0:
-        _atomic_write_vocab(vocab_path, data)
         logger.info(
             "vocab_repair: bumped half-life to %.1f for %d stub entries: %s",
             _REPAIRED_DECAY_DAYS,
@@ -191,7 +211,6 @@ def run_vocab_repair(
             described = _describe_stubs(
                 persona_dir=persona_dir,
                 vocab_path=vocab_path,
-                data=data,
                 stub_names=stub_names,
                 store=store,
                 provider=provider,
@@ -233,61 +252,38 @@ def _write_and_return(persona_dir: Path, *, repaired: int, described: int) -> Re
     )
 
 
-def _merge_variant_entries(data: dict) -> list[tuple[str, str]]:
-    """Collapse entries whose names canonicalise to the same key (#174).
-
-    Mutates ``data["emotions"]`` in place. Returns ``(dropped_name, kept_name)``
-    pairs; empty when nothing changed. Survivor: the first entry with a real
-    description, else the first seen. The survivor is renamed to the canonical key.
-    """
-    from brain.emotion.vocabulary import canonical_name
+def _is_old_stub(entry: dict) -> bool:
+    """The entry is still a placeholder with the old bad half-life (so the bump has not been made by anyone since)."""
     from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
 
-    emotions = data.get("emotions", [])
-    survivors: dict[str, dict] = {}
-    order: list[str] = []
-    dropped: list[tuple[str, str]] = []
-    for entry in emotions:
-        if not isinstance(entry, dict) or not isinstance(entry.get("name"), str):
-            continue
-        key = canonical_name(entry["name"])
-        current = survivors.get(key)
-        if current is None:
-            survivors[key] = entry
-            order.append(key)
-            continue
-        current_is_stub = current.get("description") == PLACEHOLDER_DESCRIPTION
-        entry_is_stub = entry.get("description") == PLACEHOLDER_DESCRIPTION
-        if current_is_stub and not entry_is_stub:
-            dropped.append((current["name"], entry["name"]))
-            survivors[key] = entry
-        else:
-            dropped.append((entry["name"], current["name"]))
-
-    renamed = [(survivors[k]["name"], k) for k in order if survivors[k]["name"] != k]
-    if not dropped and not renamed:
-        return []
-    for key in order:
-        survivors[key]["name"] = key
-    data["emotions"] = [survivors[k] for k in order]
-    return dropped + renamed
+    return (
+        entry.get("description") == PLACEHOLDER_DESCRIPTION and entry.get("decay_half_life_days") == _OLD_STUB_DECAY_DAYS
+    )
 
 
-def _atomic_write_vocab(vocab_path: Path, data: dict) -> None:
-    """Atomic JSON write with .bak rotation via json_io.write_json."""
-    write_json(vocab_path, data, backups=3)
+def _is_placeholder(entry: dict) -> bool:
+    """The entry still carries the placeholder description (so no one has described it since)."""
+    from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
+
+    return entry.get("description") == PLACEHOLDER_DESCRIPTION
 
 
 def _excerpts_for_name(name: str, store: MemoryStore) -> list[str]:
     """Return up to _MAX_EXCERPTS_PER_NAME memory excerpts mentioning name."""
     try:
+        try:
+            persona_dir: Path | None = store.persona_dir
+        except ValueError:
+            persona_dir = None
         # F3: cap the search so a high-frequency name doesn't pull all rows.
         candidates = store.search_text(name, limit=10)
         excerpts = []
         wanted = canonical_name(name)
         for mem in candidates:
-            # Names only: a stored emotion whose value is not finite still counts as evidence for its name.
-            if wanted in {canonical_name(n) for n in MemoryStore.stored_emotion_names(mem)}:
+            # Names only: a stored emotion whose value is not finite still counts as evidence for its name. The repair runs in the
+            # owner, so the check is answered from the registry (a name it cannot hold does not count, spec section 6).
+            used = vocabulary_access.names_used(persona_dir, MemoryStore.stored_emotion_names(mem))
+            if wanted in {canonical_name(s) for s in used.values() if s is not None}:
                 text = mem.content[:_EXCERPT_CHAR_LIMIT]
                 excerpts.append(text)
                 if len(excerpts) >= _MAX_EXCERPTS_PER_NAME:
@@ -302,19 +298,17 @@ def _describe_stubs(
     *,
     persona_dir: Path,
     vocab_path: Path,
-    data: dict,
     stub_names: list[str],
     store: MemoryStore,
     provider: LLMProvider,
 ) -> int:
-    """Call provider in batches to derive descriptions; patch data in-place.
+    """Call provider in batches to derive descriptions; write them through `vocabulary_file.replace_fields`.
 
-    Returns the number of descriptions successfully replaced.
+    Returns the number of descriptions successfully replaced. A batch's descriptions that could not be written raise OSError
+    (the caller keeps the placeholders and the next start retries).
     """
-    from brain.health.reconstruct import PLACEHOLDER_DESCRIPTION
-
     described = 0
-    # F2: mirror emotion_backfill's throttle pattern — wrap each batch in a
+    # F2: wrap each batch in a
     # background slot so interactive chat is never displaced.
     from brain.bridge import cli_throttle as _cli_throttle  # noqa: PLC0415
 
@@ -377,21 +371,20 @@ def _describe_stubs(
                 )
                 continue
 
-            # Patch entries in data
-            batch_set = set(batch)
+            # Match the reply to the stubs by tidied name (a provider may echo a name as tidied, not as spelled in the file) and
+            # write the descriptions through the shared writer, only into an entry that is still a placeholder.
+            reply_by_key = {canonical_name(k): v for k, v in mapping.items() if isinstance(k, str)}
+            changes: dict[str, dict] = {}
+            for name in batch:
+                desc = reply_by_key.get(canonical_name(name))
+                if isinstance(desc, str) and desc.strip():
+                    changes[name] = {"description": desc.strip()}
             patched = 0
-            for entry in data.get("emotions", []):
-                if not isinstance(entry, dict):
-                    continue
-                n = entry.get("name")
-                if n not in batch_set:
-                    continue
-                desc = mapping.get(n)
-                if not desc or not isinstance(desc, str):
-                    continue
-                if entry.get("description") == PLACEHOLDER_DESCRIPTION:
-                    entry["description"] = desc.strip()
-                    patched += 1
+            if changes:
+                results = vocabulary_file.replace_fields(vocab_path, changes, only_if=_is_placeholder)
+                if any(r.outcome == "cannot_write" for r in results):
+                    raise OSError(f"vocab_repair: the descriptions could not be written to {vocab_path.name}")
+                patched = sum(1 for r in results if r.changed)
 
             if patched == 0:
                 logger.warning(
@@ -401,7 +394,6 @@ def _describe_stubs(
                     batch,
                 )
             if patched > 0:
-                _atomic_write_vocab(vocab_path, data)
                 described += patched
                 logger.info(
                     "vocab_repair: described %d stubs in batch starting at index %d",

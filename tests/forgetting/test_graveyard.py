@@ -156,8 +156,9 @@ def test_append_without_neighbors_defaults_empty(tmp_path):
     assert graveyard.read_all(tmp_path)[0]["hebbian_neighbors"] == []
 
 
-def test_append_writes_the_faded_emotion_at_ingest_and_the_inputs_as_given(tmp_path, emotion_engine_stub):
+def test_append_writes_the_faded_emotion_at_ingest_and_the_inputs_as_given(tmp_path, emotion_engine_stub, register_feelings):
     """B2 phase B: the entry's emotions are faded once, at the write; the salience inputs are not faded again."""
+    register_feelings("sorrow")  # a feeling her vocabulary holds beyond the framework's own
     m = _make_memory(id="mem_faded", emotions={"sorrow": 7.2, "love": 3.0})
     emotion_engine_stub.faded = {("mem_faded", "sorrow"): 4.0, ("mem_faded", "love"): 2.5}
     append(

@@ -18,8 +18,9 @@
   "EMOTION_CLIMAX_THRESHOLD": "7.0",
   "EMOTION_DEFAULT_HALF_LIFE_DAYS": "14.0",
   "EMOTION_FADE_FLOOR_FRACTION": "{'belonging': 0.3333333333333333, 'love': 0.3333333333333333}",
-  "EMOTION_HALF_LIFE_DAYS": "{'anger': 1.0, 'arousal': 0.5, 'awe': 3.0, 'belonging': 365.0, 'climax': 0.125, 'comfort_seeking': 1.0, 'creative_hunger': 5.0, 'curiosity': 2.0, 'defiance': 5.0, 'desire': 2.0, 'emergence': 60.0, 'fear': 5.0, 'gratitude': 14.0, 'grief': 60.0, 'guilt': 14.0, 'jealousy': 7.0, 'joy': 3.0, 'loneliness': 10.0, 'love': 730.0, 'memory_grief': 30.0, 'nostalgia': 21.0, 'pride': 7.0, 'relief': 2.0, 'rest_need': 0.75, 'shame': 14.0, 'tenderness': 7.0, 'touch_hunger': 1.5, 'vulnerability': 5.0}",
+  "EMOTION_HALF_LIFE_DAYS": "{'anger': 1.0, 'arousal': 0.5, 'awe': 3.0, 'belonging': 365.0, 'calm': 0.16666666666666666, 'climax': 0.125, 'comfort_seeking': 1.0, 'contentment': 1.0, 'creative_hunger': 5.0, 'curiosity': 2.0, 'defiance': 5.0, 'desire': 2.0, 'emergence': 60.0, 'fear': 5.0, 'gratitude': 14.0, 'grief': 60.0, 'groundedness': 2.0, 'guilt': 14.0, 'jealousy': 7.0, 'joy': 3.0, 'loneliness': 10.0, 'love': 730.0, 'memory_grief': 30.0, 'nostalgia': 21.0, 'peace': 0.16666666666666666, 'pride': 7.0, 'relief': 2.0, 'rest_need': 0.75, 'shame': 14.0, 'tenderness': 7.0, 'touch_hunger': 1.5, 'vulnerability': 5.0}",
   "EMOTION_LOCK_WAIT_S": "5.0",
+  "EMOTION_NAME_MAX_CHARS": "100",
   "EMOTION_LONG_HALF_LIFE_D": "30.0",
   "EMOTION_PENDING_FILENAME": "'emotion_pending.jsonl'",
   "EMOTION_REPEAT_FACTOR": "0.5",
@@ -30,6 +31,8 @@
   "EMOTION_SUMMARY_COUNT": "3",
   "EMOTION_SUMMARY_MODE": "'long'",
   "EMOTION_VALUE_CAP": "10.0",
+  "EMOTION_VOCABULARY_ADD_RETRY_S": "30.0",
+  "EMOTION_VOCABULARY_LOCK_WAIT_S": "5.0",
   "ENGINE_PROGRESS_FILENAME": "'engine_progress.json'",
   "FADE_IMPORTANCE_GAIN": "2.0",
   "FADE_THRESHOLD": "0.25",
@@ -90,5 +93,6 @@
   "SETTINGS_FILE_LOCK_WAIT_S": "3.0",
   "SQLITE_INTEGRITY_CHECK_RETRY_ATTEMPTS": "3",
   "SQLITE_INTEGRITY_CHECK_RETRY_DELAY_S": "0.1",
-  "SQLITE_STORE_BUSY_TIMEOUT_S": "5.0"
+  "SQLITE_STORE_BUSY_TIMEOUT_S": "5.0",
+  "VOCABULARY_BRIDGE_TIMEOUT_S": "10.0"
 }

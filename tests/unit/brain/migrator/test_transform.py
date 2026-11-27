@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
+import pytest
+
+from brain.memory.store import Memory
 from brain.migrator.transform import (
     SkippedMemory,
     transform_memory,
@@ -187,7 +191,8 @@ def test_skipped_memory_dataclass_shape() -> None:
     assert s.raw_snippet == "..."
 
 
-def test_transform_non_numeric_importance_degrades_to_emotion_backfill() -> None:
+@pytest.mark.no_base_failure(reason="a rename of an existing test (it ended _degrades_to_emotion_backfill); the behaviour is unchanged and already holds on main")
+def test_transform_non_numeric_importance_falls_back_to_the_emotion_bucket() -> None:
     """Non-numeric importance (e.g. 'high') must not crash float() — it is
     treated as malformed/missing and backfilled from emotions (P3 retention
     rework, Change 1: `_og()`'s default emotions={"love": 9.0} -> emotion_score
@@ -198,7 +203,8 @@ def test_transform_non_numeric_importance_degrades_to_emotion_backfill() -> None
     assert mem.importance == 3.0
 
 
-def test_transform_list_importance_degrades_to_emotion_backfill() -> None:
+@pytest.mark.no_base_failure(reason="a rename of an existing test (it ended _degrades_to_emotion_backfill); the behaviour is unchanged and already holds on main")
+def test_transform_list_importance_falls_back_to_the_emotion_bucket() -> None:
     """A list-valued importance field degrades gracefully (no crash) and is
     backfilled from emotions the same way a missing importance is, not a
     hard 0.0."""
@@ -233,3 +239,71 @@ def test_transform_bool_emotion_score_falls_back_to_sum() -> None:
     mem, _ = transform_memory(_og(emotions={"love": 5.0}, emotion_score=True))
     assert mem is not None
     assert mem._stored_score == 5.0  # sum of emotions, not float(True)=1.0
+
+
+# --- the store's check, handed in (#803 step 13, MG12) -----------------------------------------------------------------
+
+
+def _keeping(*names: str):
+    """A stand-in for `MemoryStore.checked` that keeps only `names` (and records each memory it was handed)."""
+    seen: list[Memory] = []
+
+    def check(memory: Memory) -> Memory:
+        seen.append(memory)
+        kept = {n: v for n, v in memory._stored_emotions.items() if n in names}
+        numbers = list(kept.values())
+        return replace(memory, _stored_emotions=kept, _stored_score=float(sum(numbers)), _stored_peak=max(numbers, default=0.0))
+
+    check.seen = seen  # type: ignore[attr-defined]
+    return check
+
+
+def _legacy(**overrides: Any) -> dict[str, Any]:
+    """A legacy row with no importance at all."""
+    og = _og(**overrides)
+    og.pop("importance", None)
+    return og
+
+
+def test_the_check_runs_once_on_the_built_memory() -> None:
+    check = _keeping("love")
+    mem, skipped = transform_memory(_legacy(emotions={"love": 9.0}), checked=check)
+    assert skipped is None and mem is not None
+    assert [m.id for m in check.seen] == ["m1"]
+    assert check.seen[0]._stored_emotions == {"love": 9.0}
+
+
+def test_a_row_with_no_importance_gets_the_importance_of_its_kept_feelings() -> None:
+    """Raw sum 24 would band to 7; the kept `love` alone (4.0) bands to 3."""
+    mem, _ = transform_memory(_legacy(emotions={"love": 4.0, "gone": 20.0}, emotion_score=24.0), checked=_keeping("love"))
+    assert mem is not None
+    assert mem._stored_emotions == {"love": 4.0}
+    assert mem.importance == 3.0
+
+
+def test_a_row_whose_feelings_are_all_dropped_gets_four() -> None:
+    mem, _ = transform_memory(_legacy(emotions={"gone": 25.0}, emotion_score=25.0), checked=_keeping())
+    assert mem is not None
+    assert mem._stored_emotions == {}
+    assert mem.importance == 4.0
+
+
+def test_a_numeric_importance_is_kept_as_given_when_a_feeling_is_dropped() -> None:
+    mem, _ = transform_memory(_og(importance=8.0, emotions={"love": 4.0, "gone": 20.0}, emotion_score=24.0), checked=_keeping("love"))
+    assert mem is not None
+    assert mem.importance == 8.0
+    assert mem._stored_emotions == {"love": 4.0}
+
+
+@pytest.mark.no_base_failure(reason="control: with no check handed in the importance still comes from the raw feelings, as it did")
+def test_with_no_check_the_importance_still_comes_from_the_raw_feelings() -> None:
+    mem, _ = transform_memory(_legacy(emotions={"love": 4.0, "gone": 20.0}, emotion_score=24.0))
+    assert mem is not None
+    assert mem.importance == 7.0
+
+
+def test_a_skipped_row_never_reaches_the_check() -> None:
+    check = _keeping("love")
+    mem, skipped = transform_memory(_og(content=""), checked=check)
+    assert mem is None and skipped is not None
+    assert check.seen == []

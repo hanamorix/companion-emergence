@@ -10,6 +10,6 @@ Sub-modules, each with a single responsibility:
 See spec Section 5 for design rationale.
 """
 
-from brain.emotion.vocabulary import Emotion, by_category, get, list_all, register
+from brain.emotion.vocabulary import Emotion, by_category, get, list_all
 
-__all__ = ["Emotion", "get", "list_all", "by_category", "register"]
+__all__ = ["Emotion", "get", "list_all", "by_category"]

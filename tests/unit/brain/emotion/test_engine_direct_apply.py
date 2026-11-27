@@ -194,26 +194,26 @@ def test_an_assigned_event_on_a_row_created_before_saved_at_and_not_opened_since
     persona, _ = _backup_world(tmp_path, [row(D[1], emotions={}, mid="old")])
     store = MemoryStore(persona / "memories.db")
     try:
-        store.update("old", emotions={"sadness": 2.0})
+        store.update("old", emotions={"shame": 2.0})
     finally:
         store.close()
-    sadness = state_of(persona).emotions["sadness"]
+    shame = state_of(persona).emotions["shame"]
     # The window does not return the row, so the event applies, once: dated day 1, two days before the state's last update,
     # it is pre-aged to 0.5^(48/24) = 0.25. The day close at `now` then adds a quiet-day zero (weight 1, no entry on day 3)
     # dated half a day later, which ages the 0.25 by 0.5^(12/24): 1 + 0.25 x 0.7071. Applied twice it would be 1 + 0.5 x 0.7071.
-    assert sadness.short.weight == pytest.approx(1.0 + 0.25 * 0.5**0.5)
+    assert shame.short.weight == pytest.approx(1.0 + 0.25 * 0.5**0.5)
 
 
 def test_an_assigned_event_on_an_older_row_that_was_also_opened_since_is_skipped(tmp_path: Path) -> None:
     persona, _ = _backup_world(tmp_path, [row(D[1], accessed=D[5], emotions={}, mid="old")])
     store = MemoryStore(persona / "memories.db")
     try:
-        store.update("old", emotions={"sadness": 2.0})
+        store.update("old", emotions={"shame": 2.0})
     finally:
         store.close()
     # The replay folds the row once at its access (day 5, a new emotion: weight 1); the event is skipped, not added again.
-    # The day close at `now` closes day 5 with a quiet-day zero for joy dated half a day later, which ages sadness: 0.5^(12/24).
-    assert state_of(persona).emotions["sadness"].short.weight == pytest.approx(0.5**0.5)
+    # The day close at `now` closes day 5 with a quiet-day zero for joy dated half a day later, which ages shame: 0.5^(12/24).
+    assert state_of(persona).emotions["shame"].short.weight == pytest.approx(0.5**0.5)
 
 
 def test_an_assigned_event_on_an_older_row_opened_at_or_after_the_oldest_queued_line_is_applied_once(tmp_path: Path) -> None:
@@ -222,11 +222,11 @@ def test_an_assigned_event_on_an_older_row_opened_at_or_after_the_oldest_queued_
     queue(persona, showing("elsewhere", D[6], {"joy": 1.0}))
     store = MemoryStore(persona / "memories.db")
     try:
-        store.update("old", emotions={"sadness": 2.0})
+        store.update("old", emotions={"shame": 2.0})
     finally:
         store.close()
     # applied once, pre-aged by 2 days (0.25), then the day close at `now` adds a zero and ages it (as in the first case above)
-    assert state_of(persona).emotions["sadness"].short.weight == pytest.approx(1.0 + 0.25 * 0.5**0.5)
+    assert state_of(persona).emotions["shame"].short.weight == pytest.approx(1.0 + 0.25 * 0.5**0.5)
     assert len(queue_text_lines(persona)) == 1  # a direct apply leaves the queue to the drain
 
 
@@ -261,28 +261,28 @@ def test_a_batch_on_a_backup_state_recovers_first_and_applies_once_each_the_even
     try:
         with eng.batch():
             store.create(row(D[5], emotions={"grief": 3.0}, mid="new"))  # in the window: counted by the replay, event skipped
-            store.update("old", emotions={"sadness": 2.0})  # not in the window: applied once
+            store.update("old", emotions={"shame": 2.0})  # not in the window: applied once
             assert saves == []  # nothing applied inside the block
     finally:
         store.close()
     state = state_of(persona)
     # grief: folded by the replay at day 5 (weight 1), once; aged half a day by the close of day 5 (a zero for joy): 0.5^(12/24)
     assert state.emotions["grief"].short.weight == pytest.approx(0.5**0.5)
-    # sadness: applied once, dated day 1 against a last update at day 5 (the replay moved it): 0.5^(96/24) = 0.0625; the close
+    # shame: applied once, dated day 1 against a last update at day 5 (the replay moved it): 0.5^(96/24) = 0.0625; the close
     # of day 5 adds a zero (weight 1) dated half a day later: 1 + 0.0625 x 0.7071
-    assert state.emotions["sadness"].short.weight == pytest.approx(1.0 + 0.0625 * 0.5**0.5)
+    assert state.emotions["shame"].short.weight == pytest.approx(1.0 + 0.0625 * 0.5**0.5)
     assert saves == [0] and len(spy.within) == 1
 
 
 def test_the_drains_own_recovery_runs_the_catch_up_first_then_folds_every_queue_line_once(tmp_path: Path) -> None:
     persona, eng = _backup_world(
         tmp_path,
-        [row(D[5], emotions={"grief": 3.0}, mid="r1"), row(D[1], accessed=D[7], emotions={"sadness": 2.0}, mid="r2")],
+        [row(D[5], emotions={"grief": 3.0}, mid="r1"), row(D[1], accessed=D[7], emotions={"shame": 2.0}, mid="r2")],
     )
     queue(persona, showing("s", D[6], {"joy": 1.0}))
     eng.note_active(D[8])
     state = state_of(persona)
-    assert "sadness" not in state.emotions  # opened at day 7, after the oldest queued line (day 6): its queued showing folds it
+    assert "shame" not in state.emotions  # opened at day 7, after the oldest queued line (day 6): its queued showing folds it
     # grief: folded at its creation (day 5) with weight 1; the showing at day 6 noon is 24 h later, so the weight is 0.5 by then
     # (the close of day 5 in between is a zero for joy only); the close of day 6 at `now` adds a zero for grief (no entry on
     # day 6), dated half a day later: 1 + 0.5 x 0.7071

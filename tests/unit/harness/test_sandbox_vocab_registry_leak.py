@@ -51,6 +51,7 @@ def _registry_self_clean():
     try:
         yield
     finally:
+        vocabulary.clear_file_copy()  # the registry follows a sandbox persona's file after a load (#803 step 15)
         vocabulary._REGISTRY.clear()
         vocabulary._REGISTRY.update(saved_registry)
 

@@ -72,7 +72,8 @@ def _load_vocabulary(persona_dir: Path) -> None:
     """
     try:
         from brain.emotion.persona_loader import load_persona_vocabulary
+        from brain.emotion.vocabulary_file import vocabulary_path
 
-        load_persona_vocabulary(persona_dir / "emotion_vocabulary.json", read_only=True)
+        load_persona_vocabulary(vocabulary_path(persona_dir), read_only=True)
     except Exception:  # noqa: BLE001
         logger.warning("mcp server: could not load the persona vocabulary; tools see only the baseline names", exc_info=True)

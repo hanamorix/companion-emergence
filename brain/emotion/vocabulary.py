@@ -1,24 +1,40 @@
 """Emotion vocabulary — the typed taxonomy + persona extension registry.
 
-Baseline: 26 emotions (11 core + 11 complex + 4 body) shipped with the framework.
+Baseline: 30 emotions (12 core + 14 complex + 4 body) shipped with the framework.
 Personas extend via register() — typically via the persona-loader at
 engine startup, which reads `{persona_dir}/emotion_vocabulary.json`.
-The 5 emotions previously in `nell_specific` (body_grief, emergence,
-anchor_pull, creative_hunger, freedom_ache) are now per-persona and
-ship via the migrator. See spec 2026-04-25-vocabulary-split-design.md.
+The 4 emotions previously in `nell_specific` that the migrator still ships
+(emergence, anchor_pull, creative_hunger, freedom_ache) are now per-persona. See spec 2026-04-25-vocabulary-split-design.md.
 
 Decay half-lives per spec Section 10.1:
 - grief: 60-day half-life
 - joy: 3-day half-life
 - belonging / love: None (identity-level)
 - others: seed values — tunable as we gather lived-experience data
+- contentment, peace, calm, groundedness: the half-lives are not written here; they come from
+  `dev_constants.EMOTION_HALF_LIFE_DAYS` (one source for these four, #648)
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import logging
+import re
+import threading
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Literal
+
+from brain.dev_constants import EMOTION_HALF_LIFE_DAYS, EMOTION_NAME_MAX_CHARS
+from brain.utils import file_ops
+from brain.utils.log_throttle import warn_throttled
+
+logger = logging.getLogger(__name__)
+
+# The name of her vocabulary file: the one place the name is spelled as a file name in brain/ (tests/unit/test_vocabulary_bypass_guards.py
+# fails on the literal as a path token anywhere else). `vocabulary_file.vocabulary_path` joins it to a persona folder; a list of persona file names uses it.
+VOCABULARY_FILENAME = "emotion_vocabulary.json"
 
 # `nell_specific` retained for backwards-compat — pre-vocabulary-split persona
 # files in the wild may still contain entries with this category. New baseline
@@ -33,12 +49,13 @@ class Emotion:
     """A typed emotion in the framework's vocabulary.
 
     Attributes:
-        name: Canonical identifier (lowercase, underscore-separated).
+        name: The entry's own spelling: the framework's names are tidied (lowercase, underscore-separated); a persona entry
+            keeps the spelling in her vocabulary file. `canonical_name(name)` is the tidied form every lookup matches by.
         description: Human-readable meaning — the "intended use" per Section 5.2.
         category: One of "core", "complex", "nell_specific", "persona_extension"
             (enforced at edit time via the EmotionCategory Literal annotation).
         decay_half_life_days: Time for intensity to halve. None = identity-level
-            (no temporal decay — for anchor_pull, love, belonging, body_grief,
+            (no temporal decay — for anchor_pull, love, belonging,
             and freedom_ache).
         intensity_clamp: Maximum intensity value (typically 10.0). Float so
             comparisons against state.py's float intensities don't silently
@@ -53,7 +70,7 @@ class Emotion:
 
 
 _BASELINE: tuple[Emotion, ...] = (
-    # ── core (11) ──
+    # ── core (12) ──
     Emotion("love", "deep caring, attachment, devotion", "core", None),
     Emotion("joy", "happiness, delight, warmth", "core", 3.0),
     Emotion("grief", "loss, mourning, absence", "core", 60.0),
@@ -65,7 +82,13 @@ _BASELINE: tuple[Emotion, ...] = (
     Emotion("shame", "the weight of being wrong or insufficient", "core", 14.0),
     Emotion("tenderness", "soft protective caring, gentleness toward the fragile", "core", 7.0),
     Emotion("awe", "overwhelm at something greater than yourself", "core", 3.0),
-    # ── complex (11) ──
+    Emotion(
+        "contentment",
+        "the quiet pleasure of what is, safe, wanting nothing more",
+        "core",
+        EMOTION_HALF_LIFE_DAYS["contentment"],
+    ),
+    # ── complex (14) ──
     Emotion("nostalgia", "bittersweet memory of what was", "complex", 21.0),
     Emotion("jealousy", "the fear of being replaced or insufficient", "complex", 7.0),
     Emotion("guilt", "responsibility for harm, intended or not", "complex", 14.0),
@@ -81,6 +104,26 @@ _BASELINE: tuple[Emotion, ...] = (
         "the ache of having lost something I once knew",
         "complex",
         30.0,
+    ),
+    # peace, calm and groundedness are flavours of contentment (core). The vocabulary has no parent field, so the
+    # relation is recorded here only (#648).
+    Emotion(
+        "peace",
+        "settled and unhurried, nothing pressing",
+        "complex",
+        EMOTION_HALF_LIFE_DAYS["peace"],
+    ),
+    Emotion(
+        "calm",
+        "steady and unruffled, nothing stirred up",
+        "complex",
+        EMOTION_HALF_LIFE_DAYS["calm"],
+    ),
+    Emotion(
+        "groundedness",
+        "rooted and steady, sure of where you stand",
+        "complex",
+        EMOTION_HALF_LIFE_DAYS["groundedness"],
     ),
     # ── body (4) ──
     # Spec docs/source-spec/2026-04-29-body-state-design.md §2.1.
@@ -119,28 +162,59 @@ _BASELINE: tuple[Emotion, ...] = (
 )
 
 
-# NOT thread-safe. All extension register() calls must happen at startup
-# before any concurrent reader (e.g. the async bridge) is running. The
-# framework enforces this by loading extensions in main() before the
-# bridge starts its event loop.
+# Keyed by the tidied form (`canonical_name`); each value is the entry with its own spelling in `.name`, so the key is the
+# index from a tidied form to the entry and its spelling (#801 section 3).
+# Changed while readers run (#803 step 15: a copy follows its file, so a read can reload it). Every change is made under
+# `vocabulary_file._REGISTRY_LOCK`, one dict operation at a time; the readers below take no lock: `get` is one dict lookup and
+# `list_all` / `by_category` iterate a list copy, so a reader sees the registry before or after any single change, never a torn
+# one. A reader that needs a consistent picture across several changes does not exist.
 _REGISTRY: dict[str, Emotion] = {e.name: e for e in _BASELINE}
 
+
+_BASELINE_KEYS: frozenset[str] = frozenset(e.name for e in _BASELINE)
 
 _BLEND_SUFFIX = "_blend"
 
 
-def canonical_name(name: str) -> str:
-    """Collapse spelling variants of one emotion channel to a single key (#174).
+_SEPARATOR_RUN = re.compile(r"[\W_]+")  # a run of characters that are not letters or digits (`str.isalnum`)
 
-    Lowercase, hyphens to underscores, surrounding whitespace dropped. A
-    two-part ``<a>_<b>_blend`` name has its parts sorted so ``love_grief_blend``
-    and ``grief_love_blend`` are the same channel.
+
+def canonical_name(name: str) -> str:
+    """The one tidier of a feeling name (#174, #800, #801): collapse spelling variants of one feeling to a single key.
+
+    Lowercase; every run of characters that are not letters or digits becomes one underscore (so ``name____name`` and
+    ``name_name`` are the same); underscores are trimmed from both ends. A ``<a>_<b>_blend`` name (any number of parts) has its
+    parts sorted, so ``love_grief_blend``, ``Grief Love Blend`` and ``love_grief__blend`` all give ``grief_love_blend``
+    (a doubled, leading or trailing separator makes no empty part, because a run of separators is one underscore and the ends are
+    trimmed: #800). Lowercasing comes first so that tidying a tidied name changes nothing.
     """
-    key = name.strip().lower().replace("-", "_")
+    key = _SEPARATOR_RUN.sub("_", name.lower()).strip("_")
     if key.endswith(_BLEND_SUFFIX):
-        parts = key[: -len(_BLEND_SUFFIX)].split("_")
-        key = "_".join(sorted(parts)) + _BLEND_SUFFIX
+        key = "_".join(sorted(key[: -len(_BLEND_SUFFIX)].split("_"))) + _BLEND_SUFFIX
     return key
+
+
+def gate_name(raw: str) -> str | None:
+    """The one gate of a feeling name (#801): the tidied name, or None when it must be refused.
+
+    A name that is empty once tidied, or longer than `dev_constants.EMOTION_NAME_MAX_CHARS`, is refused with a throttled warning
+    that says why (the length only, never the name).
+    """
+    name = canonical_name(raw)
+    if not name:
+        warn_throttled(logger, "vocabulary.gate_name.empty", "vocabulary: a feeling name is empty once tidied; refused", exc_info=False)
+        return None
+    if len(name) > EMOTION_NAME_MAX_CHARS:
+        warn_throttled(
+            logger,
+            "vocabulary.gate_name.too_long",
+            "vocabulary: a feeling name is %d characters once tidied, over the limit of %d; refused",
+            len(name),
+            EMOTION_NAME_MAX_CHARS,
+            exc_info=False,
+        )
+        return None
+    return name
 
 
 def pool_by_canonical_name(values: Mapping[str, float]) -> dict[str, float]:
@@ -157,37 +231,180 @@ def pool_by_canonical_name(values: Mapping[str, float]) -> dict[str, float]:
     return pooled
 
 
+# Which process owns her vocabulary (#801 section 5): True only in the bridge, set at its start-up and cleared when it stops. The
+# owner answers a lookup from the registry and runs a change itself; any other process asks the bridge
+# (`brain.emotion.vocabulary_access`).
+_BRIDGE_OWNER: bool = False
+
+
+def set_bridge_owner(owner: bool) -> None:
+    """Mark this process as the one that owns her vocabulary (the bridge, at start-up) or not (the bridge, when it stops)."""
+    global _BRIDGE_OWNER
+    _BRIDGE_OWNER = owner
+
+
+def is_bridge_owner() -> bool:
+    """True in the process that owns her vocabulary (the bridge)."""
+    return _BRIDGE_OWNER
+
+
+# The copy of her vocabulary file this process keeps follows the file (#803 step 15, S26, P19). The loader of the copy hands the
+# file's path and a function that reloads the copy as a plain module setting (`set_file_copy`, the same kind of setting as the owner
+# flag): this module imports neither the file module nor the access module. The copy remembers the stat key of the file it came from;
+# every read below, and every write of the file module (`follow_file`), stats the file first and reloads the copy when the key differs.
+#
+# Valid states of a `_FileCopy`: `stale` True (the key is unknown and unused: the next check reloads), or `stale` False with `key`
+# the stat key of the file the copy matches, or None when the copy matches an ABSENT file. `stale` False with any other key is
+# not a state: only `note_copy_key` clears `stale`, with the key a load or write observed. `key` None with `stale` True does not mean
+# "absent", only "unknown".
+@dataclass(frozen=True)
+class _FileCopy:
+    path: Path
+    reload: Callable[[], object]
+    key: tuple[int, int, int] | None
+    stale: bool
+
+
+_FILE_COPY: _FileCopy | None = None
+
+# Per thread: the depth of "the check is switched off" (a reload, and the writes it makes, must not check again: they read the
+# registry while the registry lock is held, and the lock is not re-entrant).
+_CHECK_OFF = threading.local()
+
+
+def set_file_copy(path: Path, reload: Callable[[], object], key: tuple[int, int, int] | None = None, *, stale: bool = True) -> None:
+    """Follow `path`: this process's copy came from that file and `reload()` makes it match the file again.
+
+    Called by the loader of the copy. `stale` (the default) says the copy is not known to match, so the next check reloads;
+    pass `stale=False` with the stat key (None for an absent file) of the file the copy was just made to match.
+    """
+    global _FILE_COPY
+    _FILE_COPY = _FileCopy(Path(path), reload, None if stale else key, stale)
+
+
+def clear_file_copy() -> None:
+    """Stop following any file (the registry test restore; a process that ends needs no clearing)."""
+    global _FILE_COPY
+    _FILE_COPY = None
+
+
+def followed_path() -> Path | None:
+    """The file this process's copy follows, or None."""
+    copy = _FILE_COPY
+    return None if copy is None else copy.path
+
+
+def note_copy_key(path: Path, key: tuple[int, int, int] | None) -> None:
+    """The copy now matches the file whose stat key is `key` (None: no such file). Ignored when `path` is not the followed file.
+
+    No lock: the copy is replaced as a whole object (one name binding), and a racing `set_file_copy` or `note_copy_key` can only
+    leave an older key or a stale flag, which makes the next check reload once more, never a key newer than the data.
+    """
+    global _FILE_COPY
+    copy = _FILE_COPY
+    if copy is not None and copy.path == Path(path):
+        _FILE_COPY = replace(copy, key=key, stale=False)
+
+
+def copy_matches(path: Path, key: tuple[int, int, int] | None) -> bool:
+    """True when no copy of `path` is followed, or the followed copy is known to match the file whose stat key is `key`."""
+    copy = _FILE_COPY
+    if copy is None or copy.path != Path(path):
+        return True
+    return not copy.stale and copy.key == key
+
+
+@contextmanager
+def suspended() -> Iterator[None]:
+    """Switch the check off in this thread: a reload and the writes it makes read the registry without checking the file again."""
+    _CHECK_OFF.depth = getattr(_CHECK_OFF, "depth", 0) + 1
+    try:
+        yield
+    finally:
+        _CHECK_OFF.depth -= 1
+
+
+def follow_file() -> None:
+    """Make the copy match its file: stat the file, and reload the copy when the key differs from the one it came from.
+
+    Nothing happens when no file is followed or the check is off in this thread. A stat that fails for a reason other than a missing
+    file cannot say whether the file changed, so no reload is made. A reload that raises is logged once and the saved key becomes the
+    key observed (the file as found), so it is not run and logged again until the file changes; the copy stays as it was and the
+    read goes on.
+
+    Accepted edge (a file system with coarse modified times, e.g. FAT32, 1 to 2 seconds): a same-size edit inside that window can be
+    missed until the next change. Where the inode reads as 0 the key still holds the modified time and the size. One stat per read,
+    no further constant.
+    """
+    copy = _FILE_COPY
+    if copy is None or getattr(_CHECK_OFF, "depth", 0) > 0:
+        return
+    try:
+        seen = file_ops.stat_path(copy.path)
+    except OSError:
+        return
+    key = None if seen is None else seen.key
+    if not copy.stale and key == copy.key:
+        return
+    try:
+        with suspended():
+            copy.reload()
+    except Exception:  # noqa: BLE001  a bug in the reload must not stop the read; logged once, then the key is noted
+        logger.warning("vocabulary: reloading the copy of %s failed; the copy stays as it was", copy.path.name, exc_info=True)
+        note_copy_key(copy.path, key)
+
+
 def get(name: str) -> Emotion | None:
     """Return the Emotion with the given name (any spelling variant), or None."""
+    follow_file()
     return _REGISTRY.get(canonical_name(name))
 
 
 def list_all() -> list[Emotion]:
     """Return every registered Emotion (baseline + extensions)."""
+    follow_file()
     return list(_REGISTRY.values())
 
 
 def by_category(category: str) -> list[Emotion]:
     """Return every Emotion with the given category."""
-    return [e for e in _REGISTRY.values() if e.category == category]
+    follow_file()
+    return [e for e in list(_REGISTRY.values()) if e.category == category]
 
 
 def register(emotion: Emotion) -> None:
-    """Register a persona-specific emotion extension.
+    """Register a persona-specific emotion extension, under the spelling it carries.
 
-    Raises ValueError if an emotion with the same name is already registered.
+    The entry keeps its own spelling (`Emotion.name`, the spelling in her vocabulary file); it is stored under the tidied form
+    of that name, so `get` finds it by any spelling that tidies the same (#801 section 3).
+
+    Raises ValueError if an emotion whose name tidies the same is already registered.
     """
     key = canonical_name(emotion.name)
     if key in _REGISTRY:
         raise ValueError(f"Emotion {emotion.name!r} already registered")
-    if key != emotion.name:
-        emotion = replace(emotion, name=key)
     _REGISTRY[key] = emotion
 
 
-def _unregister(name: str) -> None:
-    """Remove an emotion from the registry. Private: test-cleanup only.
+def is_baseline(name: str) -> bool:
+    """True when the name (any spelling) is one of the framework's own 30 entries."""
+    return canonical_name(name) in _BASELINE_KEYS
 
-    The framework does not support runtime removal of vocabulary entries.
+
+def replace_entry(emotion: Emotion) -> None:
+    """Put `emotion` in the registry in place of the entry whose name tidies the same (the vocabulary file's own change path).
+
+    Raises ValueError for a framework (baseline) name: those entries are never replaced from a file. Registers the entry
+    when none carries that name yet.
+    """
+    if is_baseline(emotion.name):
+        raise ValueError(f"Emotion {emotion.name!r} is a framework entry and is never replaced")
+    _REGISTRY[canonical_name(emotion.name)] = emotion
+
+
+def _unregister(name: str) -> None:
+    """Remove an emotion from the registry, by any spelling. Private: the vocabulary file module's `remove` and test cleanup.
+
+    The caller keeps framework (baseline) names registered (`is_baseline`).
     """
     _REGISTRY.pop(canonical_name(name), None)

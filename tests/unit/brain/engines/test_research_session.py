@@ -16,10 +16,10 @@ _FELT_BODY = "NOTES:\nn\n\nMEMORY:\nm\n\nVERDICT:\nclose"
         ('EMOTIONS: {"joy": 7}\nENGAGEMENT: 7', {"joy": 7.0}, 7.0),
         ('ENGAGEMENT: 7/10\n\nEMOTIONS: {"joy": 7}\n', {"joy": 7.0}, 7.0),
         ('**EMOTIONS:** {"joy": 7}\n__ENGAGEMENT__: 7', {"joy": 7.0}, 7.0),
-        # A negative is held to 0 and kept, like a given 0 (B1 writers design); unregistered and non-finite are dropped.
+        # A negative is held to 0 and kept, like a given 0 (B1 writers design); non-finite is dropped; names are not filtered here.
         (
             '**EMOTIONS**: {"joy": 12, "awe": -1, "fear": 0, "zorble": 3, "love": NaN}',
-            {"joy": 10.0, "awe": 0.0, "fear": 0.0},
+            {"joy": 10.0, "awe": 0.0, "fear": 0.0, "zorble": 3.0},
             None,
         ),
         ("ENGAGEMENT: -2", None, None),
