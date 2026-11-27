@@ -550,7 +550,7 @@ def run_folded(
             # almost always have a reply in flight near the 15-min mark
             # could defer the heartbeat far past its own interval,
             # indefinitely. Only advance when the heartbeat RAN (any
-            # non-None return) — a skipped tick leaves `last_heartbeat_at`
+            # non-None return): a skipped tick leaves `last_heartbeat_at`
             # untouched, so the very next supervisor loop pass (seconds
             # away, not 15 minutes) re-checks immediately instead of
             # waiting out a full fresh interval. A pass whose felt-time
