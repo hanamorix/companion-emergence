@@ -78,20 +78,38 @@ def test_felt_time_replay_rebuilds_state_from_logs(tmp_path):
     assert state.lived_age_hours == 0.0
 
 
-def test_load_or_recover_replays_when_logs_newer_than_state(tmp_path):
+def test_load_or_recover_keeps_saved_state_when_logs_newer_than_state(tmp_path):
     from brain.felt_time.state import persist
 
-    # Persist an old state.
-    persist(FeltTimeState(last_tick_ts="2026-05-17T18:00:00+00:00"), tmp_path)
-    # Now write a newer dream.
+    # Persist a valid saved state with real lived age.
+    persist(
+        FeltTimeState(lived_age_hours=1.25, last_tick_ts="2026-05-17T18:00:00+00:00"),
+        tmp_path,
+    )
+    # A dream is logged after the last tick (the normal case between ticks).
     _write_jsonl(
         tmp_path / "dreams.log.jsonl",
         [{"ts": "2026-05-17T20:00:00+00:00", "summary": "later"}],
     )
 
     loaded, recovered = load_or_recover(tmp_path)
-    assert recovered is True
-    assert loaded.anchors["dream"].label == "later"
+    assert recovered is False  # saved state is authoritative; no replay
+    assert loaded.lived_age_hours == 1.25
+    # The new anchor is folded in by the next tick, not at load time (OQ1).
+    assert "dream" not in loaded.anchors
+
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(
+        TickContext(
+            now_iso="2026-05-17T21:00:00+00:00",
+            heartbeats_in_tick=1,
+            chat_turns_in_tick=0,
+            reflex_firings_in_tick=0,
+            wall_clock_s_in_tick=3600.0,
+            drivers=IntensityDrivers(),
+        )
+    )
+    assert ft.get_state().anchors["dream"].label == "later"
 
 
 def test_replay_marks_state_as_replayed(tmp_path):
@@ -230,3 +248,404 @@ def test_replay_seeds_arc_anchors_from_logs(tmp_path):
     assert len(state.arc_anchors) == 2
     assert state.arc_anchors[0].event_type == "arc_opened"
     assert state.arc_anchors[1].event_type == "arc_closed"
+
+
+# ---------------------------------------------------------------------------
+# Lived age survives anchor events logged between ticks (#384)
+# ---------------------------------------------------------------------------
+import pytest  # noqa: E402
+
+from brain.felt_time.state import (  # noqa: E402
+    Anchor,
+    HorizonBucket,
+    PressureCounters,
+    persist,
+)
+
+# source name -> (log file, label key)
+_EVENT_SOURCES = {
+    "dream": ("dreams.log.jsonl", "summary"),
+    "growth": ("growth.log.jsonl", "title"),
+    "soul": ("soul.log.jsonl", "moment_label"),
+}
+_T0 = "2026-10-01T10:00:00+00:00"  # last tick of the saved state
+
+_REAL_ROW_ON_BASE = (
+    "pins the dream row the real writer puts on disk today (timestamp, no ts), which main ignores; it goes red if main's staleness check returns with a reader that sees timestamp (the #676-before-#385 order)"
+)
+_HOLDS_ON_BASE = (
+    "pins behaviour main already has (its timestamp fold or replay path gives the same result); guards that this PR's position-based arc fold and kept saved state do not break it"
+)
+
+
+def _append_event(persona_dir: Path, kind: str, label: str, ts: str) -> None:
+    filename, label_key = _EVENT_SOURCES[kind]
+    with (persona_dir / filename).open("a") as f:
+        f.write(json.dumps({"ts": ts, label_key: label}) + "\n")
+
+
+def _rich_saved_state(persona_dir: Path, *, saved_only: str) -> FeltTimeState:
+    """A valid persisted state holding values the log replay cannot reproduce."""
+    state = FeltTimeState(
+        lived_age_hours=3.5,
+        anchors={
+            saved_only: Anchor(
+                type=saved_only,
+                ts="2026-09-30T08:00:00+00:00",
+                label="saved only",
+                source_ref=f"{saved_only}.log.jsonl:99",
+            )
+        },
+        pressure=PressureCounters(heartbeats=5, chat_turns=2, reflex_firings=1, wall_clock_s=4500.0),
+        last_tick_ts=_T0,
+        first_tick_ts="2026-09-25T10:00:00+00:00",
+        weather_baselines={"joy": {"mean": 0.4}},
+        replayed=False,
+        horizon_pressure={
+            "week": HorizonBucket(
+                counters=PressureCounters(heartbeats=7),
+                period_start_ts="2026-09-28T00:00:00+00:00",
+            )
+        },
+    )
+    persist(state, persona_dir)
+    return state
+
+
+def _saved_only_for(kind: str) -> str:
+    return "growth" if kind == "soul" else "soul"
+
+
+def test_lived_age_survives_dream_logged_between_ticks(tmp_path):
+    """The #384 repro: 5 ticks -> 1.25 h; a dream is logged; the next FeltTime()
+    must still read 1.25 h (was 0.0 with recovered_from_logs=True)."""
+    from datetime import datetime, timedelta
+
+    start = datetime.fromisoformat("2026-10-01T10:00:00+00:00")
+    for i in range(1, 6):  # five 15-minute ticks, a fresh FeltTime each time (as the supervisor does)
+        ft = FeltTime(persona_dir=tmp_path)
+        ft.tick(_neutral_ctx((start + timedelta(minutes=15 * i)).isoformat()))
+    assert ft.get_state().lived_age_hours == pytest.approx(1.25)
+    last_tick = ft.get_state().last_tick_ts
+
+    assert last_tick == "2026-10-01T11:15:00+00:00"
+    _append_event(tmp_path, "dream", "x", "2026-10-01T11:20:00+00:00")
+
+    ft2 = FeltTime(persona_dir=tmp_path)
+    assert ft2.get_state().lived_age_hours == pytest.approx(1.25)
+    assert ft2.recovered_from_logs is False
+
+    ft2.tick(_neutral_ctx("2026-10-01T11:30:00+00:00"))
+    assert ft2.get_state().lived_age_hours > 1.25
+
+
+@pytest.mark.parametrize("kind", ["dream", "growth", "soul"])
+def test_saved_state_preserved_across_anchor_event(tmp_path, kind):
+    saved = _rich_saved_state(tmp_path, saved_only=_saved_only_for(kind))
+    _append_event(tmp_path, kind, "new event", "2026-10-01T10:05:00+00:00")
+
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is False
+    assert loaded.replayed is False
+    assert loaded.lived_age_hours == saved.lived_age_hours
+    assert loaded.first_tick_ts == saved.first_tick_ts
+    assert loaded.last_tick_ts == saved.last_tick_ts
+    assert loaded.pressure == saved.pressure
+    assert loaded.weather_baselines == saved.weather_baselines
+    assert loaded.horizon_pressure == saved.horizon_pressure
+    assert loaded.anchors == saved.anchors
+    assert loaded.arc_anchors == saved.arc_anchors
+
+
+@pytest.mark.no_base_failure(reason=_HOLDS_ON_BASE)
+def test_saved_state_preserved_across_arc_event_control(tmp_path):
+    """arcs.log.jsonl is not in LOG_SOURCES, so this never reset; control for C2."""
+    saved = _rich_saved_state(tmp_path, saved_only="soul")
+    _write_arc_event(tmp_path, "arc_opened", "Thread A", "2026-10-01T10:05:00+00:00")
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is False
+    assert loaded.lived_age_hours == saved.lived_age_hours
+    assert loaded.pressure == saved.pressure
+    assert loaded.anchors == saved.anchors
+
+
+@pytest.mark.parametrize("kind", ["dream", "growth", "soul"])
+def test_tick_folds_newer_anchor_into_preserved_state(tmp_path, kind):
+    saved_only = _saved_only_for(kind)
+    saved = _rich_saved_state(tmp_path, saved_only=saved_only)
+    _append_event(tmp_path, kind, "new event", "2026-10-01T10:05:00+00:00")
+
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T11:00:00+00:00"))  # dt = 1 h, quiet drivers
+    state = ft.get_state()
+
+    assert state.lived_age_hours == pytest.approx(saved.lived_age_hours + 1.0)
+    assert state.anchors[kind].label == "new event"
+    assert state.anchors[kind].ts == "2026-10-01T10:05:00+00:00"
+    assert state.anchors[saved_only] == saved.anchors[saved_only]  # not discarded
+    assert state.pressure == PressureCounters()  # new anchor zeroes pressure
+    assert state.weather_baselines == saved.weather_baselines
+    assert state.first_tick_ts == saved.first_tick_ts
+    assert state.last_tick_ts == "2026-10-01T11:00:00+00:00"
+    assert state.replayed is False
+
+    persisted = json.loads((tmp_path / "felt_time_state.json").read_text())
+    assert persisted["lived_age_hours"] == pytest.approx(saved.lived_age_hours + 1.0)
+    assert persisted["anchors"][kind]["label"] == "new event"
+
+
+@pytest.mark.no_base_failure(reason=_HOLDS_ON_BASE)
+def test_tick_folds_newer_arc_event_exactly_once(tmp_path):
+    _rich_saved_state(tmp_path, saved_only="soul")
+    _write_arc_event(tmp_path, "arc_opened", "Thread A", "2026-10-01T10:30:00+00:00")
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T11:00:00+00:00"))
+    state = ft.get_state()
+    assert [a.label for a in state.arc_anchors] == ["Thread A"]
+    assert state.anchors["arc"] == state.arc_anchors[-1]
+    ft.tick(_neutral_ctx("2026-10-01T11:15:00+00:00"))
+    assert len(ft.get_state().arc_anchors) == 1
+
+
+def test_repeated_loads_between_ticks_are_stable_control(tmp_path):
+    """C8 control: constructing FeltTime twice before the tick does not double-fold."""
+
+    def run(root: Path, loads: int):
+        root.mkdir()
+        _rich_saved_state(root, saved_only="soul")
+        _append_event(root, "dream", "new event", "2026-10-01T10:05:00+00:00")
+        _write_arc_event(root, "arc_opened", "Thread A", "2026-10-01T10:30:00+00:00")
+        for _ in range(loads):
+            ft = FeltTime(persona_dir=root)
+        ft.tick(_neutral_ctx("2026-10-01T11:00:00+00:00"))
+        ft.tick(_neutral_ctx("2026-10-01T11:15:00+00:00"))
+        return ft.get_state()
+
+    one = run(tmp_path / "one", 1)
+    two = run(tmp_path / "two", 2)
+    assert two.lived_age_hours == one.lived_age_hours
+    assert two.anchors == one.anchors
+    assert two.arc_anchors == one.arc_anchors
+    assert len(two.arc_anchors) == 1
+
+
+def test_arc_opened_with_seed_time_stamp_is_folded_once(tmp_path):
+    """C11: arc_opened is stamped with the SEED anchor's time (<= last tick), so a
+    timestamp scan never sees it. It must still reach arc_anchors, exactly once,
+    without resetting pressure."""
+    _append_event(tmp_path, "dream", "the seed", "2026-10-01T10:00:00+00:00")
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:05:00+00:00"))
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:15:00+00:00"))
+    assert ft.get_state().pressure.heartbeats == 1  # accumulating, no anchor this tick
+
+    # Narrative pass opens the arc later, stamped with the seed's own time, and a
+    # later close is logged too (both appended after the last tick).
+    _write_arc_event(tmp_path, "arc_opened", "Thread A", "2026-10-01T10:00:00+00:00")
+    _write_arc_event(tmp_path, "arc_closed", "Thread A", "2026-10-01T10:12:00+00:00")
+
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:20:00+00:00"))
+    state = ft.get_state()
+    assert [(a.label, a.event_type) for a in state.arc_anchors] == [
+        ("Thread A", "arc_opened"),
+        ("Thread A", "arc_closed"),
+    ]
+    assert state.anchors["arc"] == state.arc_anchors[-1]
+    # Both rows are stamped before the last tick (10:15), so neither resets pressure.
+    assert state.pressure.heartbeats == 2
+
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:35:00+00:00"))
+    assert len(ft.get_state().arc_anchors) == 2
+    assert ft.get_state().pressure.heartbeats == 3
+
+
+def test_arc_fold_in_from_previously_persisted_state_adds_only_unfolded(tmp_path):
+    """C11b: state saved by earlier code already holds arc anchors 1 and 2; a third
+    stale-stamped arc_opened is added, the first two are not re-added."""
+    _write_arc_event(tmp_path, "arc_opened", "Thread A", "2026-09-20T10:00:00+00:00")
+    _write_arc_event(tmp_path, "arc_closed", "Thread A", "2026-09-21T10:00:00+00:00")
+    folded = [
+        Anchor("arc", "2026-09-20T10:00:00+00:00", "Thread A", "arcs.log.jsonl:1", "arc_opened"),
+        Anchor("arc", "2026-09-21T10:00:00+00:00", "Thread A", "arcs.log.jsonl:2", "arc_closed"),
+    ]
+    persist(
+        FeltTimeState(
+            lived_age_hours=2.0, last_tick_ts=_T0, arc_anchors=folded, anchors={"arc": folded[-1]}
+        ),
+        tmp_path,
+    )
+    _write_arc_event(tmp_path, "arc_opened", "Thread B", "2026-09-20T09:00:00+00:00")
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:15:00+00:00"))
+    labels = [(a.label, a.event_type) for a in ft.get_state().arc_anchors]
+    assert labels == [
+        ("Thread A", "arc_opened"),
+        ("Thread A", "arc_closed"),
+        ("Thread B", "arc_opened"),
+    ]
+
+
+@pytest.mark.no_base_failure(reason=_HOLDS_ON_BASE)
+def test_arc_cap_is_stable_and_idempotent_across_ticks(tmp_path):
+    """C12: 25 arc events; first tick keeps the 20 most recent; later ticks do not
+    re-add the 5 evicted ones."""
+    for i in range(25):
+        _write_arc_event(
+            tmp_path, "arc_opened", f"Thread {i:02d}", f"2026-09-{i + 1:02d}T10:00:00+00:00"
+        )
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:00:00+00:00"))
+    first = [a.label for a in ft.get_state().arc_anchors]
+    assert first == [f"Thread {i:02d}" for i in range(5, 25)]
+    for minute in ("10:15", "10:30"):
+        ft = FeltTime(persona_dir=tmp_path)
+        ft.tick(_neutral_ctx(f"2026-10-01T{minute}:00+00:00"))
+        assert [a.label for a in ft.get_state().arc_anchors] == first
+
+
+@pytest.mark.no_base_failure(reason=_HOLDS_ON_BASE)
+def test_event_stamped_exactly_at_last_tick_is_not_folded_again(tmp_path):
+    """The anchor scan is strictly newer than the last tick: a row stamped at the
+    last tick was already seen by that tick and must not reset pressure again."""
+    _append_event(tmp_path, "dream", "x", "2026-10-01T10:05:00+00:00")
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:05:00+00:00"))  # folds the dream, zeroes pressure
+    assert ft.get_state().pressure.heartbeats == 0
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:20:00+00:00"))
+    assert ft.get_state().pressure.heartbeats == 1
+
+
+@pytest.mark.no_base_failure(reason=_HOLDS_ON_BASE)
+def test_arc_event_newer_than_last_tick_resets_pressure(tmp_path):
+    """Unchanged rule, pinned: an arc event stamped after the last tick is a new anchor
+    and zeroes pressure like any other anchor."""
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:00:00+00:00"))
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:15:00+00:00"))
+    assert ft.get_state().pressure.heartbeats == 2
+    _write_arc_event(tmp_path, "arc_closed", "Thread A", "2026-10-01T10:20:00+00:00")
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:30:00+00:00"))
+    assert ft.get_state().pressure == PressureCounters()
+    assert len(ft.get_state().arc_anchors) == 1
+
+
+def test_arc_cap_evicts_by_log_order_even_when_timestamps_disagree(tmp_path):
+    """Selection and eviction follow log position: the last-appended event (stamped
+    oldest) is kept by the cap and not re-folded on the next tick."""
+    for i in range(24):
+        _write_arc_event(
+            tmp_path, "arc_opened", f"Thread {i:02d}", f"2026-09-{i + 1:02d}T10:00:00+00:00"
+        )
+    _write_arc_event(tmp_path, "arc_opened", "LATE", "2026-08-01T10:00:00+00:00")  # 25th, oldest stamp
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:00:00+00:00"))
+    first = [a.label for a in ft.get_state().arc_anchors]
+    assert len(first) == 20
+    assert first[-1] == "LATE"  # newest by log position, last in the list
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:15:00+00:00"))
+    assert [a.label for a in ft.get_state().arc_anchors] == first
+
+
+@pytest.mark.no_base_failure(reason=_REAL_ROW_ON_BASE)
+def test_lived_age_survives_a_dream_logged_by_the_real_dream_writer(tmp_path):
+    """#385 review step 4: the other #384 tests hand-write `ts` rows in the shape the reader
+    expects; this one lets `DreamEngine` write the row exactly as it does on disk today, then
+    ticks. The saved lived age must be kept, never replayed from zero."""
+    from datetime import UTC, datetime, timedelta
+
+    from brain.bridge.provider import FakeProvider
+    from brain.engines.dream import DreamEngine
+    from brain.memory.hebbian import HebbianMatrix
+    from brain.memory.store import Memory, MemoryStore
+
+    now = datetime.now(UTC)
+    saved = FeltTimeState(
+        lived_age_hours=1.25,
+        last_tick_ts=(now - timedelta(minutes=30)).isoformat(),
+        first_tick_ts=(now - timedelta(hours=2)).isoformat(),
+    )
+    persist(saved, tmp_path)
+
+    store = MemoryStore(db_path=tmp_path / "memories.db")
+    seed = Memory.create_new(content="a walk by the river", memory_type="conversation", domain="us")
+    seed.importance = 8.0
+    store.create(seed)
+    DreamEngine(
+        store=store,
+        hebbian=HebbianMatrix(db_path=":memory:"),
+        provider=FakeProvider(),
+        log_path=tmp_path / "dreams.log.jsonl",
+        persona_name="Nell",
+        persona_system_prompt="You are Nell. Reflect on the dream in first person, starting with 'DREAM: '.",
+    ).run_cycle()
+
+    rows = [json.loads(line) for line in (tmp_path / "dreams.log.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["timestamp"] > saved.last_tick_ts  # the dream is newer than the last tick
+
+    ft = FeltTime(persona_dir=tmp_path)
+    assert ft.recovered_from_logs is False
+    assert ft.get_state().lived_age_hours == pytest.approx(1.25)
+
+    ft.tick(_neutral_ctx((now + timedelta(minutes=1)).isoformat()))
+    assert ft.get_state().lived_age_hours > 1.25
+
+    reloaded, recovered = load_or_recover(tmp_path)
+    assert recovered is False
+    assert reloaded.lived_age_hours == pytest.approx(ft.get_state().lived_age_hours)
+
+
+def test_a_log_row_with_a_non_string_ts_never_resets_lived_age(tmp_path):
+    """A row whose `ts` is a number must not become a saved anchor: the loader rejects a
+    non-string anchor ts as corrupt, so saving one would replay lived age from zero on
+    every load after it (cold review of #385)."""
+    saved = FeltTimeState(lived_age_hours=2.0, last_tick_ts=_T0, first_tick_ts="2026-09-30T10:00:00+00:00")
+    persist(saved, tmp_path)
+    (tmp_path / "growth.log.jsonl").write_text(json.dumps({"ts": 1767225600, "title": "t"}) + "\n", encoding="utf-8")
+
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:15:00+00:00"))
+    ticked = ft.get_state().lived_age_hours
+    assert ticked > 2.0
+
+    reloaded, recovered = load_or_recover(tmp_path)
+    assert recovered is False
+    assert reloaded.lived_age_hours == pytest.approx(ticked)
+
+
+@pytest.mark.no_base_failure(reason=_HOLDS_ON_BASE)
+def test_nul_repair_of_the_arc_log_does_not_fold_an_arc_twice(tmp_path):
+    """#618's one-time repair restores a record a NUL run swallowed, which shifts the log
+    positions of the rows after it. An arc already folded must not be folded again at its
+    new position (cold review of #385)."""
+    from brain.health.jsonl_nul_repair import run_jsonl_nul_repair
+
+    def row(title: str, ts: str) -> bytes:
+        return json.dumps({"event": "arc_opened", "ts_iso": ts, "title": title}).encode() + b"\n"
+
+    log = tmp_path / "arcs.log.jsonl"
+    swallowed = row("B", "2026-09-30T09:00:00+00:00")
+    log.write_bytes(
+        row("A", "2026-09-30T08:00:00+00:00")
+        + b'{"event": "arc_op' + b"\0" * 20 + swallowed  # a cut-short append, then B swallowed by the NUL run
+        + row("C", "2026-09-30T10:00:00+00:00")
+    )
+
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx(_T0))
+    assert [a.label for a in ft.get_state().arc_anchors] == ["A", "C"]
+
+    run_jsonl_nul_repair(tmp_path)
+    assert swallowed in log.read_bytes()  # B is whole again, so C moved down one position
+
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-10-01T10:15:00+00:00"))
+    labels = [a.label for a in ft.get_state().arc_anchors]
+    assert labels.count("C") == 1
