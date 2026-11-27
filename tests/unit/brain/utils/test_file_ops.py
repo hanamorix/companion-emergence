@@ -391,6 +391,48 @@ def test_delete_tree_raises_when_the_failure_persists(tmp_path: Path, sleeps: li
     assert flaky.calls == 8 and (folder / "x").exists()
 
 
+def _patch_rmtree_vanishing_child(monkeypatch: pytest.MonkeyPatch, times: int) -> list[int]:
+    """The first ``times`` calls remove one file and raise ``FileNotFoundError``, as 3.12's ``rmtree`` stops when a child
+    vanishes mid-delete (#657); later calls are the real ``rmtree``. Returns the call counter."""
+    real = shutil.rmtree
+    calls = [0]
+
+    def rmtree(path, *args, **kwargs):
+        calls[0] += 1
+        if calls[0] <= times:
+            child = next(p for p in Path(path).rglob("*") if p.is_file())
+            child.unlink()
+            raise FileNotFoundError(2, "No such file or directory", str(child))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(file_ops.shutil, "rmtree", rmtree)
+    return calls
+
+
+def test_delete_tree_carries_on_when_a_child_vanishes_mid_delete(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    folder = tmp_path / "d"
+    (folder / "sub").mkdir(parents=True)
+    for name in ("a", "b", "sub/c"):
+        (folder / name).write_bytes(b"1")
+    calls = _patch_rmtree_vanishing_child(monkeypatch, 1)
+    file_ops.delete_tree(folder)
+    assert not folder.exists() and calls[0] == 2
+
+
+def test_delete_tree_raises_when_children_keep_vanishing_and_the_folder_stays(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The docstring's "a failure that persists is raised": never a silent return with the folder still there (#657)."""
+    folder = tmp_path / "d"
+    folder.mkdir()
+    for i in range(20):
+        (folder / f"f{i}").write_bytes(b"1")
+    calls = _patch_rmtree_vanishing_child(monkeypatch, 10_000)
+    with pytest.raises(FileNotFoundError):
+        file_ops.delete_tree(folder)
+    assert folder.exists() and calls[0] == dev_constants.FILE_RETRY_ATTEMPTS
+
+
 def test_delete_tree_never_removes_a_file(tmp_path: Path, sleeps: list[float]) -> None:
     path = tmp_path / "a"
     path.write_bytes(b"x")
