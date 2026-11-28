@@ -66,6 +66,8 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
       - background_jobs: list[{"name": str, "running_for_seconds": float}] —
         currently-running gated job/heartbeat names (ram-spike-fix INC-11),
         ordered LONGEST-RUNNING FIRST; [] when none are running
+      - embedding_download_notice: {"state": "downloading" | "failed", "size_gb": float | None} | None, the memory-search
+        model being downloaded by the bridge's background thread, or its download failed (#833)
       - rebuild_notice: {"reason", "log_path"} | None, why the persona's
         switch-over did not complete and the bridge started on the state
         saved before, while the persona is not switched over (Hana's point 5
@@ -120,6 +122,9 @@ def build_persona_state(persona_dir: Path, *, now: datetime | None = None) -> di
             {"name": name, "running_for_seconds": round(elapsed, 3)}
             for name, elapsed in background_jobs.snapshot_with_elapsed()
         ],
+        # #833: the memory-search model is downloading, or its download failed and it is not on this computer:
+        # {"state": "downloading" | "failed", "size_gb": <float | None>}, else None. Read from the floor start-up's own state, stored nowhere.
+        "embedding_download_notice": _build_embedding_download_notice(),
         # Hana's point 5 on #633: a switch-over that did not complete, persisted in the persona folder (`rebuild_notice.json`) by
         # whichever process found it, so the window shows it until the persona is switched over: {"reason": <one line>,
         # "log_path": <the runtime log holding the error>}, else None. A pure read; the notice is cleared by its writer, never here.
@@ -259,6 +264,21 @@ def _narrative_memory_replayed(persona_dir: Path) -> bool:
         return bool(load_or_recover(persona_dir).replayed)
     except Exception:  # noqa: BLE001
         return _flag_failed("narrative_memory_replayed")
+
+
+def _build_embedding_download_notice() -> dict[str, Any] | None:
+    """#833: `{"state": "downloading" | "failed", "size_gb": float | None}` while the bridge's background thread is fetching the
+    memory-search model (or its last fetch failed and it is not on this computer), else None. A pure read
+    (`floor_startup.embedding_download_notice`). Never raises: a failed read is None, with a throttled warning."""
+    try:
+        from brain.memory import floor_startup
+
+        return floor_startup.embedding_download_notice()
+    except Exception:  # noqa: BLE001
+        warn_throttled(
+            logger, "persona_state:embedding_download_notice", "embedding download notice failed; reporting None", exc_info=True
+        )
+        return None
 
 
 def _felt_time_recovered(persona_dir: Path) -> bool:

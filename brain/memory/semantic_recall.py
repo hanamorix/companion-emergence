@@ -1340,9 +1340,13 @@ def search_paragraphs(
     before_provider = _clock()
     try:
         # Looked up via the MODULE so a test's monkeypatch on
-        # `embeddings.build_embedding_provider` is honored.
-        embedder = embeddings_mod.build_embedding_provider()
+        # `embeddings.build_embedding_provider` is honored. In the bridge this never waits for the model's download:
+        # not built yet raises at once and the background thread builds it (#833).
+        embedder = embeddings_mod.get_ready_embedding_provider()
         embedder_model_id = embedder.model_id()
+    except embeddings_mod.EmbeddingNotReadyError:
+        log.debug("semantic recall: the embedding model is not built yet, falling back to lexical")
+        return None
     except Exception:  # noqa: BLE001 — fail-soft
         log.exception("semantic recall: embedding provider unavailable — falling back to lexical")
         return None

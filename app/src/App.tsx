@@ -40,6 +40,7 @@ import { PersonaPicker } from "./wizard/PersonaPicker";
 import { errString } from "./lib/errString";
 import { tunablesNoticeMessage } from "./lib/tunablesNotice";
 import { rebuildNoticeMessage } from "./lib/rebuildNotice";
+import { embeddingDownloadNoticeMessage } from "./lib/embeddingDownloadNotice";
 
 const STATE_POLL_MS = 5000;
 
@@ -629,6 +630,12 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
         {state?.rebuild_notice && (
           <NoticeBox testId="rebuild-notice">{rebuildNoticeMessage(state.rebuild_notice, capitalize(persona))}</NoticeBox>
         )}
+        {/* The memory search model downloading (or its download failed), read from the brain's state on each poll: it goes by itself. */}
+        {state?.embedding_download_notice && (
+          <NoticeBox testId="embedding-download-notice">
+            {embeddingDownloadNoticeMessage(state.embedding_download_notice)}
+          </NoticeBox>
+        )}
         <ChatPanel
           persona={persona}
           onSpeakingChange={setIsSpeaking}
@@ -641,7 +648,7 @@ function Ready({ config, setConfig, persona }: ReadyProps) {
   );
 }
 
-/** One small status box above the chat, for a notice the brain keeps for the window (the tunables notice, the rebuild notice).
+/** One small status box above the chat, for a notice the brain keeps for the window (the tunables notice, the rebuild notice, the memory-model download notice).
  *  It has no state and no button: a notice shown here cannot be closed, it goes when the brain stops sending it. */
 function NoticeBox({ testId, children }: { testId: string; children: ReactNode }) {
   return (

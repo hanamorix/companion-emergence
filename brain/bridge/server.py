@@ -1490,7 +1490,11 @@ def build_app(
         # Floor bootstraps (name-recall fix S85, revised; spec §2): the cosine
         # (S91: only the COSINE one) bootstrap floor is computed ONCE per
         # process, here at process start, on a daemon thread off every reply
-        # path (recall only peeks the caches). Until it finishes, the no-rerank
+        # path (recall only peeks the caches). That thread also builds the
+        # embedding model (its 2.2 GB download) whenever it is not built, floor
+        # or no floor (#833): `enable_background_embedding_build` below makes
+        # every other caller in this process take its keyword fallback until it
+        # is built instead of waiting. Until the floor exists, the no-rerank
         # path renders keyword results only. The RERANK floor bootstraps on
         # first need in the background; a failed bootstrap is retried in the
         # background on each incoming message (`respond()`, S92) and at the
@@ -1504,6 +1508,7 @@ def build_app(
                 from brain.bridge import cli_throttle as _cli_throttle
                 from brain.memory import floor_startup as _floor_startup
 
+                _floor_startup.enable_background_embedding_build(persona_dir)
                 app.state.bridge.floor_bootstrap_thread = _floor_startup.start_background(
                     persona_dir,
                     activity_marker=_cli_throttle.chat_activity_marker,

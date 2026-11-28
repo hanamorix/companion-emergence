@@ -891,20 +891,24 @@ def _note_model_downloaded(model_id: str) -> None:
 
 def _registry_entry(model_id: str) -> dict | None:
     """S249, S253: fastembed's own description of `model_id` (`model`, `sources.hf`, `model_file`,
-    `size_in_GB`), or `None` when the model is not in its registry. May raise: the callers wrap it."""
+    `additional_files`, `size_in_GB`), or `None` when the model is in neither of its registries (the cross-encoders it
+    lists for the reranker, and its text embedders, so the embedding model's download can be seen too, #833).
+    May raise: the callers wrap it."""
+    from fastembed import TextEmbedding
     from fastembed.rerank.cross_encoder.text_cross_encoder import TextCrossEncoder
 
-    for description in TextCrossEncoder.list_supported_models():
+    for description in (*TextCrossEncoder.list_supported_models(), *TextEmbedding.list_supported_models()):
         if description.get("model") == model_id:
             return description
     return None
 
 
 def _model_file_cached(model_id: str, cache_dir: str | Path) -> bool | None:
-    """S249: whether fastembed's construction will find the model file in the cache (True) or has to
-    download it (False); `None` when that cannot be decided (the model is not in fastembed's registry, or
-    any error: the caller then counts the model as NOT downloaded and warns once). The repository and the file
-    come from fastembed's own description of the model (`sources.hf`, `model_file`), never from the model id
+    """S249: whether fastembed's construction will find every file of the model in the cache (True) or has to
+    download one (False); `None` when that cannot be decided (the model is not in fastembed's registry, or
+    any error: the caller then counts the model as NOT downloaded and warns once). The repository and the files
+    come from fastembed's own description of the model (`sources.hf`, `model_file` and every `additional_files`
+    entry, such as the embedding model's 2.2 GB `model.onnx_data`), never from the model id
     (the registered fp16 export is another file of the fp32 repository). `try_to_load_from_cache` reads the
     same hub layout fastembed writes (`models--org--name/snapshots/<rev>/<file>`, `refs/main`) and neither
     downloads nor raises for an uncached file."""
@@ -918,9 +922,10 @@ def _model_file_cached(model_id: str, cache_dir: str | Path) -> bool | None:
         filename = description.get("model_file")
         if not repo or not filename:
             return None
-        return isinstance(try_to_load_from_cache(repo, filename, cache_dir=str(cache_dir)), str)
+        names = [filename, *(description.get("additional_files") or [])]
+        return all(isinstance(try_to_load_from_cache(repo, name, cache_dir=str(cache_dir)), str) for name in names)
     except Exception:  # noqa: BLE001 - detection must never break building the provider
-        _warn_ram_figure_once("could not tell whether the reranker model was already cached (S249)", exc_info=True)
+        _warn_ram_figure_once("could not tell whether the model was already cached (S249)", exc_info=True)
         return None
 
 

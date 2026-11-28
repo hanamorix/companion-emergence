@@ -253,10 +253,14 @@ class FastEmbedProvider(EmbeddingProvider):
     itself to the first `embed()` call, not the file download (confirmed
     against the installed fastembed's `OnnxTextEmbedding.__init__`, which
     calls `download_model()` unconditionally before its own `lazy_load`
-    check). Every current call site constructs this provider off the message
-    hot path already, so paying the download cost at construction time (when
-    the file isn't yet cached) is acceptable; only the ONNX session build is
-    deferred, keeping steady-state (already-cached) construction cheap.
+    check). So whoever constructs this provider waits for the whole download
+    when the file isn't yet cached. In the bridge process only one background
+    thread constructs it (`floor_startup`, #833) and every other caller asks
+    `get_ready_embedding_provider()`, which never waits; only the ONNX session
+    build is deferred to the first `embed()`, keeping steady-state
+    (already-cached) construction cheap. Processes with no background builder
+    (`nell embed backfill`, `nell chat --no-bridge`, the one-shot commands)
+    construct it on their own thread and wait.
 
     ONNXRUNTIME EXTERNAL-DATA SYMLINK WORKAROUND (#259 F1 model-swap): a
     model that ships sharded "external data" weights (a `model.onnx` that
@@ -325,9 +329,8 @@ class FastEmbedProvider(EmbeddingProvider):
         # first embed() call rather than construction time (the model FILE
         # download itself still happens eagerly, right here, inside
         # TextEmbedding's own __init__ — see the class docstring's "The model
-        # file is downloaded once" paragraph). Every current call site
-        # constructs this off the message hot path already, so paying the
-        # download cost at construction (when not yet cached) is acceptable;
+        # file is downloaded once" paragraph). The caller waits for that
+        # download (the bridge hands it to one background thread, #833);
         # deferring the session build keeps steady-state construction cheap.
         self._model = TextEmbedding(model_name=model_id, cache_dir=str(cache_dir), lazy_load=True)
         # Fallback for a cache directory populated by a PRIOR run (before
@@ -525,12 +528,57 @@ _provider_cache: dict[str, EmbeddingProvider] = {}
 _provider_cache_lock = threading.Lock()
 
 
+class EmbeddingNotReadyError(RuntimeError):
+    """The embedding model is not built yet and the bridge is building it on its
+    background thread (#833); the caller takes the fallback it already has."""
+
+
+def embedding_provider_ready() -> bool:
+    """True when this process has built the embedding provider. An unlocked peek
+    at the process cache: never waits for a download in progress."""
+    return _provider_cache.get(resolve_embedding_model_id()) is not None
+
+
+def embedding_provider_not_ready() -> bool:
+    """True when the bridge builds the model on its background thread (the
+    bridge enabled that, `floor_startup.enable_background_embedding_build`) and
+    the model is not built yet. False in every process that builds it on its
+    own thread, so those keep waiting as before."""
+    from brain.memory import floor_startup
+
+    return floor_startup.background_embedding_build_enabled() and not embedding_provider_ready()
+
+
+def get_ready_embedding_provider() -> EmbeddingProvider:
+    """The embedding provider for a caller that must not wait for a download.
+
+    In the bridge, while the model is not built: asks the background thread to
+    build it (one at a time, `floor_startup.request_embedding_build`) and raises
+    `EmbeddingNotReadyError` at once; the caller uses the fallback it already has
+    (keyword search, no vector, not a duplicate). Everywhere else, and once the
+    model is built, this is `build_embedding_provider()`: looked up through the
+    module, so a test's patch of that function is honoured."""
+    if embedding_provider_not_ready():
+        from brain.memory import floor_startup
+
+        floor_startup.request_embedding_build()
+        raise EmbeddingNotReadyError("the embedding model is not built yet")
+    return build_embedding_provider()
+
+
 def build_embedding_provider() -> EmbeddingProvider:
     """The production embedding provider: FastEmbedProvider pinned to
     `model_tier.TIER_EMBEDDING`'s model id, caching the model file in the
     shared `get_cache_dir()` (one download across every persona on the box,
     per the build-plan recommendation — the model isn't persona-specific
     data, just a local asset).
+
+    WAITS for the download when the model is not cached. A caller that must
+    not wait (anything on the bridge's reply or supervisor thread) calls
+    `get_ready_embedding_provider()` instead; in the bridge this function is
+    called only by the one background thread that builds the model
+    (`floor_startup.ensure_embedder_built`), and by processes with no such
+    thread (`nell embed backfill`, `nell chat --no-bridge`, one-shot commands).
 
     The model id comes from `model_tier.py`, never hardcoded here — same
     convention as every Claude tier in that module. `MODEL_EMBEDDING_DIM` is
