@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import random
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -136,6 +137,25 @@ def _large(shape: str, n_names: int, n_words: int) -> tuple[list[str], str]:
 
 
 _ROUNDS = 9
+# How often a failing ratio is measured before the test fails (#780). A real regression is slow on every measure; a burst of
+# host trouble (memory pressure, the worker descheduled) that inflates one pair in a full parallel run is not repeated.
+_MEASURES = 3
+
+
+def _cpu() -> float:
+    """This process's CPU time. Waiting (descheduled, a page fault served from disk) is not counted, wall time is (#780)."""
+    return time.process_time()
+
+
+def _holds(
+    measure: Callable[[], tuple[float, float]], ok: Callable[[float, float], bool], what: str
+) -> tuple[float, float]:
+    """Measure a pair until ``ok`` holds, at most ``_MEASURES`` times; fail with ``what`` and the last pair otherwise."""
+    for _ in range(_MEASURES):
+        pair = measure()
+        if ok(*pair):
+            return pair
+    raise AssertionError(f"{what}: {pair[1]:.4f} s against {pair[0]:.4f} s on each of {_MEASURES} measures")
 
 
 def _warm_pair(a: tuple[kn.KnownNames, str], b: tuple[kn.KnownNames, str]) -> tuple[float, float]:
@@ -147,12 +167,12 @@ def _warm_pair(a: tuple[kn.KnownNames, str], b: tuple[kn.KnownNames, str]) -> tu
     kn.match_known_names(b[1], b[0])
     best_a = best_b = float("inf")
     for _ in range(_ROUNDS):
-        t0 = time.perf_counter()
+        t0 = _cpu()
         kn.match_known_names(a[1], a[0])
-        best_a = min(best_a, time.perf_counter() - t0)
-        t0 = time.perf_counter()
+        best_a = min(best_a, _cpu() - t0)
+        t0 = _cpu()
         kn.match_known_names(b[1], b[0])
-        best_b = min(best_b, time.perf_counter() - t0)
+        best_b = min(best_b, _cpu() - t0)
     return best_a, best_b
 
 
@@ -162,10 +182,25 @@ def _cold_pair(names_a: list[str], names_b: list[str], text: str) -> tuple[float
     for _ in range(_ROUNDS):
         for i, names in enumerate((names_a, names_b)):
             known = kn.KnownNames.from_names(names)
-            t0 = time.perf_counter()
+            t0 = _cpu()
             kn.match_known_names(text, known)
-            best[i] = min(best[i], time.perf_counter() - t0)
+            best[i] = min(best[i], _cpu() - t0)
     return best[0], best[1]
+
+
+@pytest.mark.no_base_failure(reason="#780 test infrastructure: checks this file's own re-measure helper, not brain code")
+def test_a_ratio_is_re_measured_before_it_fails() -> None:
+    pairs = iter([(1.0, 20.0), (1.0, 2.0)])  # a burst on the first pair only
+    assert _holds(lambda: next(pairs), lambda a, b: b < 10 * a, "a burst") == (1.0, 2.0)
+    calls: list[int] = []
+
+    def always_slow() -> tuple[float, float]:
+        calls.append(1)
+        return 1.0, 20.0
+
+    with pytest.raises(AssertionError, match="a regression"):
+        _holds(always_slow, lambda a, b: b < 10 * a, "a regression")
+    assert len(calls) == _MEASURES  # a real regression is slow on every measure
 
 
 @pytest.mark.slow(reason='9.1 s of CPU in its call phase on a 4-core dev VM, 9.2 s wall (serial run for #540, J12)')
@@ -181,21 +216,22 @@ def test_matcher_scales_with_the_message_not_the_list(shape: str) -> None:
     names2, _ = _large(shape, 798, 6000)
     # Building the automaton is linear in the name text, and doubling the list quadruples that text (a name has k words
     # for k up to n): 4x-6x measured, 16x for a quadratic build. Compared with a 10x bound plus a small floor.
-    cold, cold2 = _cold_pair(names, names2, text)
-    assert cold2 < 10 * cold + 0.02, "building the doubled list"
+    _holds(lambda: _cold_pair(names, names2, text), lambda cold, cold2: cold2 < 10 * cold + 0.02, "building the doubled list")
     known2 = kn.KnownNames.from_names(names2)
     # The additive floor (a warm match takes a few ms) dominates at this size: only a regression costing well above
     # about 10 ms is caught, which the base matcher (seconds) is.
-    base, doubled_list = _warm_pair((known, text), (known2, text))
-    assert doubled_list < 1.5 * base + 0.005, "doubling the list"
+    _holds(
+        lambda: _warm_pair((known, text), (known2, text)),
+        lambda base, doubled_list: doubled_list < 1.5 * base + 0.005,
+        "doubling the list",
+    )
     # The message grows 8x: linear is 8x, a quadratic matcher 64x. Load slows the larger run more than the smaller one, so
     # the gap has to be wide: at 4x growth a busy macOS runner measured 14.5x for the linear matcher (#780), past a 10x
     # bound, while a quadratic one under load can come in near 10x. Measured 2026-11-20 on an 11-core Mac: linear
     # 7.9x-8.5x idle and up to 24x with every core busy; a quadratic matcher at least 60x idle and 113x under load. The
     # bound sits at 40x, between the two.
     _, text8 = _large(shape, 399, 48000)
-    base, grown = _warm_pair((known, text), (known, text8))
-    assert grown < 40 * base, "growing the paste 8x"
+    _holds(lambda: _warm_pair((known, text), (known, text8)), lambda base, grown: grown < 40 * base, "growing the paste 8x")
 
 
 # --------------------------------------------------------------------------
