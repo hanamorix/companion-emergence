@@ -243,7 +243,7 @@ def ensure_embedder_built(marker: object) -> bool:
         return True
     # The refusal at thread registration (`_register_task`) covers a thread that would START after the stop began; this
     # covers one that was already running (counted) and has not reached the download yet. A stop that begins in the few
-    # instructions after this check finds a download that has started, and waits for it like any running task.
+    # instructions after this check still finds this thread's counted task, so the stop waits for it and its download.
     if cli_throttle.shutdown_requested():
         logger.info("floor_startup: the embedding model download is not started, the bridge is stopping")
         return False
@@ -333,7 +333,7 @@ def start_background(
     flight. The thread is a counted bridge task (`_register_task`): a stop waits for it
     while it runs, download included (the hard-exit offer is the way out), and a stop
     that has begun starts none. Daemon only so a hard exit or a crash never leaves it
-    behind; whatever it did not finish it computes again next start. Registers the
+    behind at a normal exit; whatever it did not finish it computes again next start. Registers the
     process's activity-marker source for the background starters, also when inhibited."""
     set_activity_marker_provider(activity_marker)
     if _background_inhibited:

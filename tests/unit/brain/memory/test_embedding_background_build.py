@@ -497,6 +497,15 @@ def test_no_download_thread_starts_once_the_stop_has_begun(stopping: dict, tmp_p
     assert floor_startup.inflight("cosine") is False
 
 
+@pytest.mark.no_base_failure(reason="control for the test above: without a stop the same trigger starts the download, as it does today")
+@pytest.mark.parametrize("trigger", list(_TRIGGERS))
+def test_the_same_trigger_without_a_stop_does_start_the_download(stopping: dict, tmp_path: Path, trigger: str) -> None:
+    thread = _TRIGGERS[trigger](tmp_path)
+    assert thread is not None
+    thread.join(timeout=10)
+    assert stopping["builds"] == 1
+
+
 @pytest.mark.no_base_failure(
     reason="pins the refusal that already exists at thread registration (floor_startup._register_task, spawner=True)"
 )
