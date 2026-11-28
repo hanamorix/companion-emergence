@@ -920,6 +920,14 @@ REMOVED: tuple[Removed, ...] = (
         kind="code",
         scope=("brain",),
     ),
+    # --- recall queues a re-check only for a memory opened in full (#650 bug round step 6, S72 (b)) ---------------------------
+    Removed(
+        names=("snippet_enqueue_ids", "snippet_ids"),
+        why="recall no longer queues a re-check for a snippet-surfaced memory (a snippet is bumped fractionally, not opened in full; invariant I5): the snippet id list, its parameter on `_bump_active_entries` and its flush went; only `open_memory`'s full-open ids are queued (`SemanticSurfacing.snippet_ids` in semantic_recall.py is another thing)",
+        ref="#650 bug round step 6, S72 (b) (draft PR #655)",
+        kind="code",
+        scope=("brain/chat/prompt.py",),
+    ),
 )
 
 

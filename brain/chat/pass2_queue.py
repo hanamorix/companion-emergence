@@ -354,6 +354,10 @@ def drain_in_own_thread(persona_dir: Path) -> None:
             else:
                 refused_with_free_slot = True  # the slot was released just after the refusal: try once more
     except cli_throttle.ThrottleDeferred as exc:
+        # Accepted edge (principles P4; owner "reads right", via Planning 2026-11-27; commit note: bug round step 6): after a
+        # refusal such as an expired login, this thread ends and the refused item waits at the head of the saved queue for
+        # the next reply's thread or the next start. Nothing retries it in between, by design: a retry trigger would be a
+        # new mechanism. Rare (a login that expired while work was queued) and nothing is lost, the item stays saved.
         log.info("pass-2 thread ended: %s; the queue stays saved", exc)
     except Exception:  # noqa: BLE001 - the thread must not die loudly; the queue stays saved
         log.exception("pass-2 thread failed; the queue stays saved")

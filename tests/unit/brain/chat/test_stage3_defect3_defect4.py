@@ -261,13 +261,11 @@ def test_semantic_full_render_bumps_and_enqueues_when_snippet_mode_disabled(tmp_
     assert ids.count(snippet_mem.id) == 1
 
 
-def test_semantic_snippet_bump_and_enqueue_apply_when_snippet_mode_enabled(tmp_path: Path) -> None:
+def test_semantic_snippet_bumps_but_is_not_queued_when_snippet_mode_enabled(tmp_path: Path) -> None:
     """Contrast case (prod path, flag ON): the snippet tier still gets the
-    rank-weighted fractional bump and the full tier still gets +1.0, and every
-    surfaced id is enqueued exactly once. This is a byte-identical parity guard
-    for the consolidation — outcomes here are unchanged from pre-fix; only the
-    enqueue call GROUPING changed (full ids now enqueue per-id through the door,
-    snippet ids in one batch), so this asserts the OUTCOME, not the call count."""
+    rank-weighted fractional bump and the full tier still gets +1.0, but only
+    the memory opened in full is enqueued (once): a snippet is not opened, so
+    it is not queued for a re-check (S72, invariant I5)."""
     store = MemoryStore(":memory:")
     result, full_mem, snippet_mem = _semantic_full_plus_snippet(store)
     before_snip = _rc(store, snippet_mem.id)
@@ -284,10 +282,10 @@ def test_semantic_snippet_bump_and_enqueue_apply_when_snippet_mode_enabled(tmp_p
     assert _rc(store, snippet_mem.id) - before_snip == pytest.approx(0.8)
     # Full tier: +1.0.
     assert _rc(store, full_mem.id) == pytest.approx(1.0)
-    # Both enqueued exactly once (full via the door, snippet via the batch).
+    # Only the full-opened memory is queued (once); the snippet is not.
     ids = _reappraisal_ids(PendingQueue(tmp_path).drain())
     assert ids.count(full_mem.id) == 1
-    assert ids.count(snippet_mem.id) == 1
+    assert ids.count(snippet_mem.id) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -399,17 +397,13 @@ def test_keyword_hit_on_a_conclusive_turn_is_merged_rendered_and_bumped_once(tmp
 
 
 # ---------------------------------------------------------------------------
-# #231 Fix 2 — reappraisal-ENQUEUE is now PATH-INDEPENDENT (owner ruling: "if
-# a memory gets opened, it doesn't matter how it surfaced, it's been opened,
-# so treat it as a memory that's been opened ... it goes back into the
-# reappraisal queue"). Fix 1 (above) made the fading recall_count BUMP
-# path-independent but left the reappraisal ENQUEUE gated to
-# `semantic_result is None` — a surfaced fading memory on a CONCLUSIVE turn
-# got bumped but was never queued for reappraisal. These tests prove the
-# enqueue now fires on both branches, matching the bump's parity, and that a
-# conclusive turn's fading id is enqueued exactly once (no double-enqueue
-# against `_bump_active_entries`'s own enqueue for the semantic
-# active ids).
+# Reappraisal ENQUEUE: only a memory OPENED IN FULL is queued, on every path
+# (owner ruling: "if a memory gets opened, it doesn't matter how it surfaced
+# ... it goes back into the reappraisal queue"; and S72: "If the rule says
+# opened in full, that is what it means"). A snippet (a fading row or an
+# active snippet with snippet mode on) is bumped fractionally and not queued.
+# These tests prove the enqueue does not depend on the retrieval path, and
+# that an opened id is enqueued exactly once.
 # ---------------------------------------------------------------------------
 
 
@@ -417,13 +411,13 @@ def _reappraisal_ids(rows: list[dict]) -> list[str]:
     return [r["memory_id"] for r in rows if r.get("_route") == "reappraise_importance"]
 
 
-def test_reappraisal_enqueue_fires_on_conclusive_semantic_turn(tmp_path: Path) -> None:
-    """Pre-fix (enqueue path-parity bug): the fading memory is bumped (Fix 1)
-    on a conclusive-semantic turn but never enqueued for reappraisal, because
-    the enqueue call was gated entirely on `semantic_result is None`.
-    Post-fix: the fading id is enqueued here too, exactly once — alongside
-    (not instead of) the semantic active id's own enqueue from
-    `_bump_active_entries`."""
+def test_reappraisal_enqueue_on_conclusive_semantic_turn_is_the_full_open_only(tmp_path: Path) -> None:
+    """On a conclusive-semantic turn the semantic standout rendered in full is
+    enqueued exactly once. The fading memory renders as a snippet (it is
+    bumped fractionally, Fix 1, but not opened in full), so it is NOT queued
+    for a re-check (S72, invariant I5: "opened in full"). The earlier
+    #231 Fix 2 reading queued every surfaced id; the owner's S72 ruling
+    replaced it."""
     store, active_mem, fading_mem = _seed_fixture(tmp_path)
     PendingQueue(tmp_path).drain()  # clear anything a fixture helper may have queued
 
@@ -440,22 +434,19 @@ def test_reappraisal_enqueue_fires_on_conclusive_semantic_turn(tmp_path: Path) -
 
     reappraisal_ids = _reappraisal_ids(PendingQueue(tmp_path).drain())
 
-    # The fading memory is now enqueued for reappraisal on the conclusive
-    # branch, matching the inconclusive branch's existing behaviour.
-    assert reappraisal_ids.count(fading_mem.id) == 1
+    # The fading memory is a snippet: not opened in full, so not queued.
+    assert reappraisal_ids.count(fading_mem.id) == 0
 
-    # The semantic-active standout is ALSO enqueued (its own pre-existing
-    # `_bump_active_entries` enqueue) — both ids present, neither
-    # duplicated: no double-enqueue between the two enqueue call sites.
+    # The semantic-active standout (rendered in full) is enqueued once.
     assert reappraisal_ids.count(active_mem.id) == 1
     assert len(reappraisal_ids) == len(set(reappraisal_ids))
 
 
-def test_reappraisal_enqueue_matches_across_conclusive_and_inconclusive_turns(tmp_path: Path) -> None:
-    """The core enqueue path-parity assertion: the SAME fading memory,
-    surfaced on a CONCLUSIVE-semantic turn, is enqueued for reappraisal just
-    as it is on an INCONCLUSIVE turn — proving the enqueue no longer depends
-    on which retrieval path produced the surfacing."""
+def test_fading_snippet_is_not_queued_on_conclusive_or_inconclusive_turns(tmp_path: Path) -> None:
+    """The enqueue does not depend on which retrieval path produced the
+    surfacing: the SAME fading memory (a snippet, bumped but not opened in
+    full) is not queued on a CONCLUSIVE-semantic turn nor on an INCONCLUSIVE
+    one."""
     store_a, active_mem, fading_a = _seed_fixture(tmp_path)
     PendingQueue(tmp_path).drain()
     with (
@@ -467,7 +458,7 @@ def test_reappraisal_enqueue_matches_across_conclusive_and_inconclusive_turns(tm
     ):
         _build_recall_block(store_a, "workshop rooftop Marcus", persona_dir=tmp_path)
     ids_conclusive = _reappraisal_ids(PendingQueue(tmp_path).drain())
-    assert fading_a.id in ids_conclusive
+    assert fading_a.id not in ids_conclusive
 
     store_b, _active_mem_b, fading_b = _seed_fixture(tmp_path)
     PendingQueue(tmp_path).drain()
@@ -480,7 +471,7 @@ def test_reappraisal_enqueue_matches_across_conclusive_and_inconclusive_turns(tm
     ):
         _build_recall_block(store_b, "workshop rooftop Marcus", persona_dir=tmp_path)
     ids_inconclusive = _reappraisal_ids(PendingQueue(tmp_path).drain())
-    assert fading_b.id in ids_inconclusive
+    assert fading_b.id not in ids_inconclusive
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +703,108 @@ def test_lexical_full_open_batches_multiple_ids_into_one_enqueue_call(tmp_path: 
     assert ids.count(full_mem_a.id) == 1
     assert ids.count(full_mem_b.id) == 1
     assert len(ids) == 2  # exactly these two ids, nothing extra, nothing dropped
+
+
+def _seed_full_and_three_snippets(store: MemoryStore) -> tuple[Memory, list[Memory]]:
+    full_mem = Memory.create_new(
+        content="the lighthouse keeper's oath, never once broken",
+        memory_type="event",
+        domain="d",
+        importance=9.5,
+    )
+    snippets = [
+        Memory.create_new(
+            content=f"a passing glance number {n} at the lighthouse from the far shore",
+            memory_type="event",
+            domain="d",
+            importance=2.0,
+        )
+        for n in range(3)
+    ]
+    store.create(full_mem)
+    for mem in snippets:
+        store.create(mem)
+    return full_mem, snippets
+
+
+def test_mixed_turn_queues_only_the_memory_opened_in_full(tmp_path: Path) -> None:
+    """S72 (invariant I5): a turn with one memory opened in full and three
+    snippets queues exactly the one opened in full. Every snippet still gets
+    its rank-weighted fractional bump (the snippet bump is unchanged)."""
+    from brain.chat.prompt import _snippet_bump_amount
+
+    store = MemoryStore(":memory:")
+    full_mem, snippets = _seed_full_and_three_snippets(store)
+    before = {m.id: _rc(store, m.id) for m in snippets}
+    PendingQueue(tmp_path).drain()
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=None),
+        patch("brain.chat.prompt._extract_recall_tokens", return_value=["lighthouse"]),
+        patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True),
+    ):
+        block = _build_recall_block(store, "lighthouse", persona_dir=tmp_path)
+
+    assert all(m.id in block for m in snippets)
+    ids = _reappraisal_ids(PendingQueue(tmp_path).drain())
+    assert ids == [full_mem.id]
+    bumps = sorted(round(_rc(store, m.id) - before[m.id], 6) for m in snippets)
+    assert bumps == sorted(round(_snippet_bump_amount(i, 3), 6) for i in range(3))
+
+
+def test_a_turn_with_only_snippets_writes_nothing_to_the_queue(tmp_path: Path) -> None:
+    """With no memory opened in full there is no flush at all: the queue file
+    is not locked, written or created."""
+    from brain.utils.file_lock import file_lock as real_file_lock
+
+    store = MemoryStore(":memory:")
+    _full_mem, snippets = _seed_full_and_three_snippets(store)
+    store._conn.execute("UPDATE memories SET importance = 2.0")  # noqa: SLF001
+    store._conn.commit()  # noqa: SLF001
+    PendingQueue(tmp_path).drain()
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=None),
+        patch("brain.chat.prompt._extract_recall_tokens", return_value=["lighthouse"]),
+        patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True),
+        patch("brain.health.json_io.file_lock", wraps=real_file_lock) as mock_lock,
+    ):
+        block = _build_recall_block(store, "lighthouse", persona_dir=tmp_path)
+
+    assert all(m.id in block for m in snippets)
+    assert mock_lock.call_count == 0
+    assert _reappraisal_ids(PendingQueue(tmp_path).drain()) == []
+
+
+def test_exception_after_a_snippet_bump_still_flushes_only_the_full_open_id(tmp_path: Path) -> None:
+    """The `finally` flush keeps the full-open id when a later snippet bump
+    raises, and the id of the snippet that was already bumped is not queued."""
+    from brain.chat.prompt import _snippet_bump_amount as real_amount
+
+    store = MemoryStore(":memory:")
+    full_mem, snippets = _seed_full_and_three_snippets(store)
+    PendingQueue(tmp_path).drain()
+    calls = {"n": 0}
+
+    def _raise_on_second(i: int, n: int) -> float:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("mid-pass failure after a snippet was bumped")
+        return real_amount(i, n)
+
+    with (
+        patch("brain.chat.prompt.run_semantic_recall", return_value=None),
+        patch("brain.chat.prompt._extract_recall_tokens", return_value=["lighthouse"]),
+        patch("brain.chat.prompt.SNIPPET_MODE_ENABLED", True),
+        patch("brain.chat.prompt._snippet_bump_amount", side_effect=_raise_on_second),
+    ):
+        with pytest.raises(RuntimeError):
+            _build_recall_block(store, "lighthouse", persona_dir=tmp_path)
+
+    assert calls["n"] == 2
+    ids = _reappraisal_ids(PendingQueue(tmp_path).drain())
+    assert ids == [full_mem.id]
+    assert not set(ids) & {m.id for m in snippets}
 
 
 # ---------------------------------------------------------------------------

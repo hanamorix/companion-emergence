@@ -252,8 +252,8 @@ class PendingQueue:
         row in place (never a new row).
 
         Single-id convenience wrapper around `enqueue_reappraisals` — see
-        that method if enqueuing more than one id (e.g. every surfaced
-        recall hit in one turn); calling this in a loop reacquires the lock
+        that method if enqueuing more than one id (e.g. every memory
+        opened in full by one recall turn); calling this in a loop reacquires the lock
         and reopens the file once per id.
         """
         self.enqueue_reappraisals([memory_id], source=source)
@@ -263,8 +263,8 @@ class PendingQueue:
         SINGLE `file_lock` + single open + single write (P3 retention
         rework, Change 3 hot-path fix).
 
-        The recall hook (`brain.chat.prompt._build_recall_block`) surfaces
-        up to ~2*limit memory ids per turn and used to call
+        The recall hook (`brain.chat.prompt._build_recall_block`) opens
+        several memories in full in one turn and used to call
         `enqueue_reappraisal` once per id — each call independently
         acquiring the lock and opening/writing the file, i.e. N lock/open/
         write syscalls on the recall hot path. This batches the whole list

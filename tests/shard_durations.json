@@ -695,7 +695,7 @@
   "tests/test_p3_change1_importance.py::test_c1_1_reflex_journal_shaped_arc_matches_add_journal_floor": 0.746,
   "tests/test_p3_change3_reappraisal.py::test_c3_1_default_noop_reappraiser_leaves_importance_unchanged": 0.53,
   "tests/test_p3_change3_reappraisal.py::test_c3_1_reappraise_updates_existing_row_no_new_row": 0.748,
-  "tests/test_p3_change3_reappraisal.py::test_c3_3_recall_enqueues_for_full_inject_and_snippet_union_not_inline": 0.834,
+  "tests/test_p3_change3_reappraisal.py::test_c3_3_recall_enqueues_only_the_full_inject_not_inline": 0.834,
   "tests/test_p3_change4_dedup_sweep.py::test_431_exact_pass_deletes_neither_when_both_duplicates_are_soul_linked": 0.698,
   "tests/test_p3_change4_dedup_sweep.py::test_431_exact_pass_keeps_the_crystallised_duplicate": 1.251,
   "tests/test_p3_change4_dedup_sweep.py::test_431_failed_exemption_read_during_a_sweep_is_logged_as_the_sweep": 0.757,
