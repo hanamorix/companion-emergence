@@ -192,11 +192,26 @@ def run_rerank_floor(*, activity_marker: object = None) -> dict | None:
     (`_bootstrap_reranker_provider`) then reuses. S253, S257: before it, the free memory
     must be at least the model file's size plus the first rung's bound unless the provider's model is already
     loaded (`reranker.model_load_blocked_by_memory`); below it nothing is built and a
-    failed attempt is recorded, so the floor is retried at the next lull and message."""
+    failed attempt is recorded, so the floor is retried at the next lull and message.
+
+    Stopping: asked before the memory check and the build. A reranker download that is already running when the bridge's
+    stop begins is a counted task and the stop waits for it (the owner's rule: a task already working is finished). One
+    that has not started does not start: when the stop has begun and this process holds no reranker provider yet, this
+    returns None, building nothing and recording nothing (it is not a failed attempt; the next start retries)."""
+    from brain.bridge import cli_throttle
+
     model_id = reranker_model_id()
     try:
         from brain.memory import reranker as reranker_mod
 
+        # The refusal at thread registration (`_register_task`) covers a thread that would START after the stop began; this
+        # covers a rerank run already going (a floor thread, or the supervisor's lull job) that has not reached the download
+        # yet. A provider already held means no download on this call, so the floor is computed as before (same rule as
+        # `ensure_embedder_built`). A stop that begins in the few instructions after this check finds a build that has
+        # started, and waits for it like any running task.
+        if cli_throttle.shutdown_requested() and reranker_mod._provider_cache.get(model_id) is None:  # noqa: SLF001
+            logger.info("floor_startup: the reranker model download is not started, the bridge is stopping")
+            return None
         blocked = reranker_mod.model_load_blocked_by_memory()
     except Exception:  # noqa: BLE001 - the check never raises by contract; if it did, nothing loads
         logger.exception("floor_startup: the free-memory check before the model load failed for %s", model_id)
@@ -366,7 +381,7 @@ def start_background(
 def _register_task(label: str) -> int | None:
     """#456 (C9): a floor computation is a counted bridge task while it runs (the stop waits for it, the model download
     inside it too), and none starts once the bridge is stopping (None = do not start). A thread already running when the
-    stop begins is not asked again: `ensure_embedder_built` holds back its download."""
+    stop begins is not asked again: `ensure_embedder_built` and `run_rerank_floor` hold back their downloads."""
     from brain.bridge import cli_throttle, shutdown_progress
 
     try:

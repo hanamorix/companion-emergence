@@ -26,6 +26,7 @@ from brain.memory import reranker as reranker_mod
 from brain.memory.embeddings import EmbeddingNotReadyError, FakeEmbeddingProvider
 from brain.memory.semantic_recall import run_semantic_recall
 from brain.memory.store import MemoryStore
+from tests.thread_support import finish_threads, release_at_teardown, wait_at_gate
 from tests.unit.brain.engines.test_consolidation_same_type_619 import (  # noqa: F401
     _capture_context,
     _mem,
@@ -577,3 +578,159 @@ def test_a_running_download_stays_a_counted_task_and_the_stop_waits_for_it(
     thread.join(timeout=10)
     assert stopping["builds"] == 1
     assert shutdown_progress.registry.seal() is True
+
+
+# ---------------------------------------------------------------------------
+# The same for the rerank floor thread's reranker download (#833c)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def rerank_stopping(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Background threads allowed; the reranker build and the rerank bootstrap are recorders (nothing real is built)."""
+    state: dict = {"builds": 0, "floors": 0}
+    monkeypatch.setattr(floor_startup, "_background_inhibited", False)
+    monkeypatch.setattr(floor_startup, "reranker_model_id", lambda: "rr")
+    monkeypatch.setattr(floor_startup, "embedder_model_id", lambda: "m")
+    monkeypatch.setattr(floor_startup, "_current_marker", lambda: 1.0)
+    monkeypatch.setattr(reranker_mod, "model_load_blocked_by_memory", lambda: False)
+
+    def _build(**_kw):
+        state["builds"] += 1
+        provider = reranker_mod.FakeRerankerProvider()
+        reranker_mod._provider_cache["rr"] = provider  # noqa: SLF001
+        return provider
+
+    def _floor(_model_id):
+        state["floors"] += 1
+        return {"floor": 0.5}
+
+    monkeypatch.setattr(reranker_mod, "build_reranker_provider", _build)
+    monkeypatch.setattr(floor_calibration, "get_bootstrap_floor", _floor)
+    return state
+
+
+def _first_need(_tmp_path: Path):
+    return floor_startup.request_rerank_bootstrap()
+
+
+def _rerank_message(tmp_path: Path):
+    floor_calibration._record_attempt("rerank", "rr", False, 0.5)  # noqa: SLF001
+    threads = floor_startup.on_incoming_message(tmp_path)
+    return threads[0] if threads else None
+
+
+_RERANK_STARTERS = {"first need": _first_need, "a message": _rerank_message}
+
+
+@pytest.mark.parametrize("blocked", [False, True], ids=["memory free", "memory short"])
+def test_the_rerank_floor_does_not_build_the_reranker_during_a_stop_and_records_no_failure(
+    rerank_stopping: dict, monkeypatch: pytest.MonkeyPatch, blocked: bool
+) -> None:
+    monkeypatch.setattr(reranker_mod, "model_load_blocked_by_memory", lambda: blocked)
+    cli_throttle.request_shutdown()
+    assert floor_startup.run_rerank_floor(activity_marker=1.0) is None
+    assert rerank_stopping["builds"] == 0
+    assert rerank_stopping["floors"] == 0
+    assert floor_calibration.bootstrap_failed("rerank", "rr") is False, "not a failed download"
+
+
+@pytest.mark.no_base_failure(reason="pins the cosine rule for the rerank run: a reranker already held in this process is not a download")
+def test_a_reranker_already_held_still_gets_its_floor_during_a_stop(rerank_stopping: dict) -> None:
+    reranker_mod._provider_cache["rr"] = reranker_mod.FakeRerankerProvider()  # noqa: SLF001
+    cli_throttle.request_shutdown()
+    assert floor_startup.run_rerank_floor(activity_marker=1.0) == {"floor": 0.5}
+    assert rerank_stopping["floors"] == 1
+
+
+def _hold_before_the_check(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, start, tmp_path: Path):
+    """Start the rerank thread parked in its first `reranker_model_id` call (before the stop check); returns (gate, thread)."""
+    owner = threading.current_thread()
+    reached = threading.Event()
+    gate = threading.Event()
+
+    def _held_id() -> str:
+        if threading.current_thread() is not owner:
+            reached.set()
+        wait_at_gate(gate, owner)
+        return "rr"
+
+    monkeypatch.setattr(floor_startup, "reranker_model_id", _held_id)
+    threads: list = []
+    release_at_teardown(request, gate, threads)
+    thread = start(tmp_path)
+    threads.append(thread)
+    assert thread is not None and reached.wait(timeout=10), "the thread is running and has not reached the download"
+    assert shutdown_progress.registry.snapshot() == ["floor rerank"]
+    return gate, thread
+
+
+@pytest.mark.parametrize("starter", list(_RERANK_STARTERS))
+def test_a_rerank_thread_already_running_does_not_build_once_the_stop_begins(
+    rerank_stopping: dict, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, tmp_path: Path, starter: str
+) -> None:
+    gate, thread = _hold_before_the_check(monkeypatch, request, _RERANK_STARTERS[starter], tmp_path)
+    cli_throttle.request_shutdown()
+    gate.set()
+    finish_threads(thread)
+    assert rerank_stopping["builds"] == 0, "the download did not start"
+    assert rerank_stopping["floors"] == 0
+    assert shutdown_progress.registry.snapshot() == []
+    assert floor_startup.inflight("rerank") is False
+    assert floor_calibration.bootstrap_failed("rerank", "rr") is (starter == "a message"), "no new failure; the old note stays"
+
+
+@pytest.mark.no_base_failure(reason="control: with no stop the held rerank thread builds and runs the bootstrap, as before")
+@pytest.mark.parametrize("starter", list(_RERANK_STARTERS))
+def test_a_rerank_thread_with_no_stop_builds_the_reranker(
+    rerank_stopping: dict, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest, tmp_path: Path, starter: str
+) -> None:
+    gate, thread = _hold_before_the_check(monkeypatch, request, _RERANK_STARTERS[starter], tmp_path)
+    gate.set()
+    finish_threads(thread)
+    assert rerank_stopping["builds"] == 1
+    assert rerank_stopping["floors"] == 1
+    assert shutdown_progress.registry.snapshot() == []
+
+
+@pytest.mark.no_base_failure(reason="pins today's behaviour: a running counted reranker download is waited for by the stop (the owner's option a)")
+def test_a_running_reranker_download_stays_a_counted_task_and_the_stop_waits_for_it(
+    rerank_stopping: dict, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    owner = threading.current_thread()
+    entered = threading.Event()
+    gate = threading.Event()
+
+    def _slow_build(**_kw):
+        rerank_stopping["builds"] += 1
+        entered.set()
+        wait_at_gate(gate, owner)
+        provider = reranker_mod.FakeRerankerProvider()
+        reranker_mod._provider_cache["rr"] = provider  # noqa: SLF001
+        return provider
+
+    monkeypatch.setattr(reranker_mod, "build_reranker_provider", _slow_build)
+    threads: list = []
+    release_at_teardown(request, gate, threads)
+    thread = floor_startup.request_rerank_bootstrap()
+    threads.append(thread)
+    assert thread is not None and entered.wait(timeout=10)
+    cli_throttle.request_shutdown()
+    assert shutdown_progress.registry.snapshot() == ["floor rerank"]
+    assert shutdown_progress.registry.seal() is False, "the stop waits for the download"
+    gate.set()
+    finish_threads(thread)
+    assert rerank_stopping["builds"] == 1
+    assert shutdown_progress.registry.seal() is True
+
+
+@pytest.mark.no_base_failure(
+    reason="pins the refusal that already exists at thread registration (floor_startup._register_task, spawner=True)"
+)
+@pytest.mark.parametrize("starter", list(_RERANK_STARTERS))
+def test_no_rerank_thread_starts_once_the_stop_has_begun(rerank_stopping: dict, tmp_path: Path, starter: str) -> None:
+    cli_throttle.request_shutdown()
+    assert _RERANK_STARTERS[starter](tmp_path) is None
+    assert rerank_stopping["builds"] == 0
+    assert shutdown_progress.registry.snapshot() == []
+    assert floor_startup.inflight("rerank") is False
