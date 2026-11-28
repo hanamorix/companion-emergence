@@ -173,9 +173,11 @@ def test_a_websocket_reply_starts_the_thread_after_the_clean_close(
     monkeypatch.setenv("NELL_STREAM_CHUNK_DELAY_MS", "0")
     _patch_provider(monkeypatch, {"fail": False})
     after_reply: list[object] = []
+    started = threading.Event()
 
     async def record(s) -> None:  # noqa: ANN001
         after_reply.append(s)
+        started.set()
 
     monkeypatch.setattr(server, "_start_pass2_drain_after_reply", record)
     with TestClient(server.build_app(persona_dir=persona_dir, client_origin="tests")) as client:
@@ -184,6 +186,10 @@ def test_a_websocket_reply_starts_the_thread_after_the_clean_close(
             ws.send_json({"message": "hi"})
             while ws.receive_json().get("type") not in ("done", "error"):
                 pass
+            # The hook runs on the server after the clean close and after the emotion drain (off the loop), so the client's
+            # last frame does not mean it ran yet. Leaving the websocket block ends the handler's task (the test client cancels
+            # it), so wait for the hook itself while the client is still attached.
+            assert started.wait(timeout=30), "the after-reply hook never ran"
         state = client.app.state.bridge
     assert after_reply == [state]
 
