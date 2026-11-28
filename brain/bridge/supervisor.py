@@ -1109,6 +1109,10 @@ def _build_gated_jobs(
         snapshot_paused_out: list[bool] = []
         try:
             with ExitStack() as stack:
+                # #839: the snapshot's extraction calls are background CLI calls, so they hold the slot. A denied slot
+                # skips the snapshot half only: the prune in `finally` still runs.
+                if not stack.enter_context(cli_throttle.background_slot()):
+                    return JobOutcome.SKIPPED
                 store = stack.enter_context(_tick_store())
                 hebbian = HebbianMatrix(persona_dir / "hebbian.db", integrity_check=False)
                 stack.callback(hebbian.close)
@@ -1508,12 +1512,15 @@ def _build_gated_jobs(
         def _compaction_run() -> JobOutcome:
             from brain.chat.compaction import build_compaction_provider
 
-            paused = _run_compaction_tick(
-                persona_dir,
-                build_compaction_provider(persona_dir),
-                is_session_busy=is_session_busy,
-                should_pause=_between_items,
-            )
+            with cli_throttle.background_slot() as slot:  # #839: the folds are background CLI calls
+                if not slot:
+                    return JobOutcome.SKIPPED
+                paused = _run_compaction_tick(
+                    persona_dir,
+                    build_compaction_provider(persona_dir),
+                    is_session_busy=is_session_busy,
+                    should_pause=_between_items,
+                )
             return JobOutcome.PAUSED if paused else JobOutcome.COMPLETED
 
         jobs.append(
@@ -1549,9 +1556,12 @@ def _build_gated_jobs(
 
         # 11. daily calibration — calibration before self-tune (S43).
         def _calibration_run() -> JobOutcome:
-            ran = _run_calibration_tick(
-                persona_dir, is_session_busy=is_session_busy, should_pause=_between_items
-            )
+            with cli_throttle.background_slot() as slot:  # #839: the tie-breaks are background CLI calls
+                if not slot:
+                    return JobOutcome.SKIPPED
+                ran = _run_calibration_tick(
+                    persona_dir, is_session_busy=is_session_busy, should_pause=_between_items
+                )
             if ran is None:
                 return JobOutcome.PAUSED
             return JobOutcome.SKIPPED if ran is False else JobOutcome.COMPLETED
@@ -1594,13 +1604,16 @@ def _build_gated_jobs(
     if finalize_interval_s is not None:
 
         def _finalize_run() -> JobOutcome:
-            paused = _run_finalize_tick(
-                persona_dir,
-                build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
-                event_bus,
-                finalize_after_hours=finalize_after_hours,
-                should_pause=_between_items,
-            )
+            with cli_throttle.background_slot() as slot:  # #839: the extractions are background CLI calls
+                if not slot:
+                    return JobOutcome.SKIPPED
+                paused = _run_finalize_tick(
+                    persona_dir,
+                    build_tier_provider(persona_dir, TIER_BACKGROUND_HOUSEKEEPING),
+                    event_bus,
+                    finalize_after_hours=finalize_after_hours,
+                    should_pause=_between_items,
+                )
             return JobOutcome.PAUSED if paused else JobOutcome.COMPLETED
 
         jobs.append(
