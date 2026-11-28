@@ -168,23 +168,26 @@ def test_a_parsed_reply_filters_and_promotes_the_candidates_its_bracket_numbers_
     assert (row["failure_type"], row["promoted_out"], row["filtered_out"]) == (None, 1, 2)
 
 
-def test_an_index_past_the_last_candidate_is_skipped_and_the_uncovered_candidate_is_promoted(tmp_path, monkeypatch) -> None:
+def test_an_index_past_the_last_candidate_is_skipped_and_the_uncovered_candidate_is_promoted(tmp_path, monkeypatch, caplog) -> None:
     persona, ids, composed = _tick(tmp_path, monkeypatch, _Gate(_decisions((1, "filter"), (2, "promote"), (4, "filter"))))
     draft = (persona / "draft_space.md").read_text(encoding="utf-8")
     assert ids[0] in draft and ids[1] not in draft and ids[2] not in draft
     assert sorted(composed) == sorted([ids[1], ids[2]])  # candidate 3 was covered by nothing
+    assert "out-of-range candidate_index=4" in caplog.text
 
 
-def test_an_index_of_0_never_selects_the_last_candidate(tmp_path, monkeypatch) -> None:
+def test_an_index_of_0_never_selects_the_last_candidate(tmp_path, monkeypatch, caplog) -> None:
     persona, ids, composed = _tick(tmp_path, monkeypatch, _Gate(_decisions((0, "filter"), (1, "promote"), (2, "promote"))))
     assert not (persona / "draft_space.md").exists()  # nothing was demoted
     assert sorted(composed) == sorted(ids)
+    assert "out-of-range candidate_index=0" in caplog.text
 
 
-def test_a_second_decision_for_the_same_candidate_is_ignored(tmp_path, monkeypatch) -> None:
+def test_a_second_decision_for_the_same_candidate_is_ignored(tmp_path, monkeypatch, caplog) -> None:
     persona, ids, composed = _tick(tmp_path, monkeypatch, _Gate(_decisions((1, "filter"), (1, "promote"))), n=1)
     assert ids[0] in (persona / "draft_space.md").read_text(encoding="utf-8")
     assert composed == []  # demoted once, never also composed
+    assert "second decision for candidate_index=1" in caplog.text
 
 
 def test_a_badly_shaped_reply_takes_the_malformed_path_and_keeps_the_raw_reply(tmp_path, monkeypatch) -> None:
@@ -282,9 +285,10 @@ def test_failed_calls_do_not_count_toward_the_drift_floor(tmp_path) -> None:
 
 
 def test_drift_is_judged_on_the_calls_that_decided(tmp_path) -> None:
-    from brain.initiate.adaptive import detect_drift
+    from brain.initiate.adaptive import _read_all_d_calls, _rows_that_decided, detect_drift
 
     _log_d_calls(tmp_path, failed=245, parsed=150, both_low_at=10)
+    assert len(_rows_that_decided(_read_all_d_calls(tmp_path))) == 150  # the both_low_confidence row is kept
     # Kept: 150 rows (the both_low_confidence one included). Historical = the 120 oldest, median 0.5; the newest 30 run
     # at 0.5, so nothing drifted. Counting the 245 failed rows as rate 0 would put the median at 0 and alert.
     assert detect_drift(tmp_path) is None

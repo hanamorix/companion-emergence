@@ -49,7 +49,7 @@ One long-running persona's `initiate_d_calls.jsonl` holds 245 calls from 2026-05
 
 ### The draft-space reason [S19]
 
-`demote_to_draft_space` writes `d_reason: ` followed by `json.dumps(reason, ensure_ascii=False)`. Quotes and line breaks in a model's reason are escaped, and characters such as an em-dash are written as they are [S19, S24]. Nothing reads the frontmatter back.
+`demote_to_draft_space` writes `d_reason: ` followed by `json.dumps(reason, ensure_ascii=False)`. Quotes and line breaks in a model's reason are escaped, and characters such as an em-dash are written as they are [S19, S24]. Nothing parses the frontmatter fields: `read_drafts_since` (`brain/initiate/draft.py`) reads the file as text, and an escaped reason keeps a line break from starting a new line there.
 
 ### Unchanged [S10, S11, S12]
 
