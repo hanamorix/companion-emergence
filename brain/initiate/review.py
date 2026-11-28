@@ -494,27 +494,33 @@ def run_initiate_review_tick(
             # Unknown failure type — promote all as safe default.
             promote_ids = {c.candidate_id for c in candidates}
     else:
-        # Build the set of promoted candidate IDs from D's decisions.
-        # decisions are in candidate_index order (0-based); map back to
-        # the ordered candidates list.
+        # Build the set of promoted candidate IDs from D's decisions. candidate_index is the number the
+        # candidate was shown under in D's user message ("[1]", "[2]", ...), counting from 1 (#841).
         promote_ids: set[str] = set()
+        decided_indices: set[int] = set()  # 0-based positions a decision was applied to
         for d in result.decisions:
-            idx = d.candidate_index
-            if 0 <= idx < len(candidates):
-                c = candidates[idx]
-                if d.decision == "filter":
-                    demote_to_draft_space(persona_dir, candidate=c, decision=d, now=now)
-                    remove_candidate(persona_dir, c.candidate_id)
-                else:
-                    promote_ids.add(c.candidate_id)
-            else:
+            if not 1 <= d.candidate_index <= len(candidates):
                 logger.warning(
                     "D returned out-of-range candidate_index=%d (queue len=%d); skipping decision",
-                    idx,
+                    d.candidate_index,
                     len(candidates),
                 )
+                continue
+            idx = d.candidate_index - 1
+            if idx in decided_indices:
+                # The first decision for a candidate counts; one candidate gets one outcome (#841).
+                logger.warning(
+                    "D returned a second decision for candidate_index=%d; keeping the first", d.candidate_index
+                )
+                continue
+            decided_indices.add(idx)
+            c = candidates[idx]
+            if d.decision == "filter":
+                demote_to_draft_space(persona_dir, candidate=c, decision=d, now=now)
+                remove_candidate(persona_dir, c.candidate_id)
+            else:
+                promote_ids.add(c.candidate_id)
         # Any candidate not covered by a D decision is promoted (safe default).
-        decided_indices = {d.candidate_index for d in result.decisions}
         for i, c in enumerate(candidates):
             if i not in decided_indices:
                 promote_ids.add(c.candidate_id)

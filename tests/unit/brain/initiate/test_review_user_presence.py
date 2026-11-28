@@ -43,7 +43,7 @@ def test_run_initiate_review_tick_passes_user_presence_to_process(
     from brain.initiate.d_call_schema import DCallRow
     from brain.initiate.reflection import DDecision, DReflectionResult
     fake_decision = DDecision(
-        candidate_index=0, decision="send_notify", reason="ok", confidence="high"
+        candidate_index=1, decision="send_notify", reason="ok", confidence="high"
     )
     fake_result = DReflectionResult(decisions=[fake_decision], tick_note=None)
     fake_dcall = DCallRow(

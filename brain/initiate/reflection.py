@@ -50,6 +50,37 @@ class DReflectionResult:
     tick_note: str | None
 
 
+_DECISIONS = ("promote", "filter")
+_CONFIDENCES = ("high", "medium", "low")
+
+
+def _parse_decision(item: object) -> DDecision:
+    """One decision item, checked against the reply format the D task states (#841). Raises ValueError on any mismatch.
+
+    A missing field or one of the wrong type (an index that is not a plain int, a text field that is not a string, null
+    included) and a decision or confidence outside the stated values are all malformed, so the caller takes its malformed
+    path (the retry, then promote all). Values are compared without regard to case and stored in lower case.
+    """
+    if not isinstance(item, dict):
+        raise ValueError("D decision item is not an object")
+    missing = [k for k in ("candidate_index", "decision", "reason", "confidence") if k not in item]
+    if missing:
+        raise ValueError(f"D decision item lacks {', '.join(missing)}")
+    index = item["candidate_index"]
+    if type(index) is not int:  # a bool is an int subclass, a "2" or a 2.0 is not the stated format
+        raise ValueError(f"D candidate_index is not an integer: {index!r}")
+    for key in ("decision", "reason", "confidence"):
+        if not isinstance(item[key], str):
+            raise ValueError(f"D {key} is not a string: {item[key]!r}")
+    decision = item["decision"].lower()
+    confidence = item["confidence"].lower()
+    if decision not in _DECISIONS:
+        raise ValueError(f"D decision is not promote or filter: {item['decision']!r}")
+    if confidence not in _CONFIDENCES:
+        raise ValueError(f"D confidence is not high, medium or low: {item['confidence']!r}")
+    return DDecision(candidate_index=index, decision=decision, reason=item["reason"], confidence=confidence)  # type: ignore[arg-type]
+
+
 def parse_structured_response(raw: str) -> DReflectionResult:
     """Parse a structured-output JSON blob into a DReflectionResult.
 
@@ -71,16 +102,7 @@ def parse_structured_response(raw: str) -> DReflectionResult:
         raise ValueError("D response missing 'decisions' list")
     decisions: list[DDecision] = []
     for item in decisions_raw:
-        if not isinstance(item, dict):
-            raise ValueError("D decision item is not an object")
-        decisions.append(
-            DDecision(
-                candidate_index=int(item["candidate_index"]),
-                decision=item["decision"],
-                reason=str(item["reason"]),
-                confidence=item["confidence"],
-            )
-        )
+        decisions.append(_parse_decision(item))
     tick_note = data.get("tick_note")
     if tick_note is not None and not isinstance(tick_note, str):
         tick_note = None  # tolerate type drift on optional field
@@ -254,6 +276,7 @@ def run(
         companion_name=deps.companion_name,
         user_name=deps.user_name,
         voice_template_path=deps.voice_template_path,
+        persona_dir=deps.persona_dir,  # an adaptive persona's calibration block (#841)
     )
     user = build_user_message(
         user_name=deps.user_name,
@@ -423,7 +446,7 @@ def demote_to_draft_space(
         "---\n"
         f"demoted_by: d_reflection\n"
         f"demoted_at: {now.isoformat()}\n"
-        f'd_reason: "{decision.reason}"\n'
+        f"d_reason: {json.dumps(decision.reason, ensure_ascii=False)}\n"  # json-io: ok -- string escape for one frontmatter value, not JSON file I/O
         f"source: {candidate.source}\n"
         f"source_id: {candidate.source_id}\n"
         f"candidate_id: {candidate.candidate_id}\n"

@@ -192,13 +192,23 @@ def _read_all_d_calls(persona_dir: Path) -> list:
     return rows
 
 
+# Failure types of a D call that made no decision: its row's promote rate is 0 only because nothing was decided (#841).
+# A both_low_confidence call did decide (every unsure candidate was forced to filter), so its row counts.
+_NO_DECISION_FAILURES = frozenset({"timeout", "rate_limit", "provider_error", "malformed_json"})
+
+
+def _rows_that_decided(rows: list) -> list:
+    """The D-call rows whose call made a decision: every row except those of the no-decision failure types."""
+    return [r for r in rows if r.failure_type not in _NO_DECISION_FAILURES]
+
+
 def detect_drift(persona_dir: Path) -> DriftAlert | None:
     """Compare recent D promote-rate against historical median.
 
     Returns a DriftAlert when |delta| > 2 * historical_stdev_via_MAD.
     Returns None when history is insufficient or flat.
     """
-    rows = _read_all_d_calls(persona_dir)
+    rows = _rows_that_decided(_read_all_d_calls(persona_dir))
     if len(rows) < 100:
         return None  # bootstrap floor
 

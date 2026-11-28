@@ -82,7 +82,7 @@ The tick writes a `malformed_json` row, and nothing raises out of `run_initiate_
 | S10 | The tick's `initiate_d_calls.jsonl` row for a parsed reply has `failure_type` null and non-zero promote or filter counts. | yes |
 | S15, S21 | A live check, through `scripts/clean_shell.sh` on a temp `KINDLED_HOME` with made-up candidates and never the live persona: the real Haiku D call parses for a 1-, a 2- and a 3-candidate tick (3–6 model calls). The result is recorded in the PR. It also records whether any reply's reason is the example's "one short sentence" [S27]. If any reply does not parse, the PR is not marked ready and the result goes back to the owner [S21]. | yes, before the PR is marked ready |
 
-Existing assertions on the old end of the user message (`tests/unit/brain/initiate/test_reflection_prompt.py`) are updated to the new text. All but S15 run in the normal suite. The live check is a script run once, and its replies are not committed.
+Existing tests that build decisions counting from 0 (`tests/unit/brain/initiate/test_review.py`, `test_review_model_tier.py`, `test_review_user_presence.py`) are updated to count from 1. The user-message test is `test_reflection.py::test_build_user_message_renders_candidates_and_time`. All but S15 run in the normal suite. The live check is a script run once, and its replies are not committed.
 
 ## Invariants [sheet invariants table]
 
