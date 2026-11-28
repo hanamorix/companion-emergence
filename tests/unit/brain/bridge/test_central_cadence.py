@@ -132,6 +132,27 @@ def _denying_slot(*, now=None):  # noqa: ARG001
     yield False
 
 
+def run_cosine_retry_inline(monkeypatch) -> None:
+    """The lull job `cosine_floor_bootstrap` only STARTS the background retry thread (#833). Tests that look at what the retry
+    does run it on the calling thread instead: the same claim, the same `_retry_body`, the chat-activity marker the bridge
+    registers; `None` (the job skips) when the claim is held."""
+    from brain.bridge import cli_throttle
+    from brain.memory import floor_startup
+
+    monkeypatch.setattr(floor_startup, "_marker_provider", lambda: cli_throttle.chat_activity_marker())
+
+    def _inline(persona_dir):
+        if not floor_startup.try_begin("cosine"):
+            return None
+        try:
+            floor_startup._retry_body("cosine", persona_dir)  # noqa: SLF001
+        finally:
+            floor_startup.end("cosine")
+        return object()
+
+    monkeypatch.setattr(floor_startup, "start_cosine_retry", _inline)
+
+
 @pytest.fixture
 def stubs(monkeypatch):
     """Replace every real job's LEAF work with a recorder (order list) and make
@@ -192,7 +213,8 @@ def stubs(monkeypatch):
         "cosine_floor_due",
         lambda _s, **_k: work["cosine_floor_bootstrap"],
     )
-    monkeypatch.setattr(supervisor.floor_startup, "run_cosine_floor", rec("cosine_floor_bootstrap"))
+    # The lull job only starts the background thread (#833): the recorder stands in for that start.
+    monkeypatch.setattr(supervisor.floor_startup, "start_cosine_retry", rec("cosine_floor_bootstrap", object()))
     monkeypatch.setattr(
         supervisor.floor_startup,
         "rerank_floor_due",
@@ -564,7 +586,8 @@ def test_c6_skip_leaves_every_cadence_file_byte_identical_and_still_due(tmp_path
 def test_c6_inner_slot_denial_is_a_skip_not_a_run(tmp_path, stubs, monkeypatch):
     """Jobs holding their own authoritative slot (embedding backfill,
     the extraction backfill, maintenance, interest sweep, self-tune) that lose
-    the race after the central peek report SKIPPED: no work, no cadence advance."""
+    the race after the central peek report SKIPPED: no work, no cadence advance. (The cosine lull job takes no slot since #833:
+    it only starts the background thread, which is no Claude call, like the start-up thread.)"""
     persona_dir = _persona(tmp_path)
     _seed_all_overdue(persona_dir)
     monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _denying_slot)
@@ -573,7 +596,6 @@ def test_c6_inner_slot_denial_is_a_skip_not_a_run(tmp_path, stubs, monkeypatch):
     skipped = {d.job for d in decisions if d.action == "skipped"}
     assert skipped == {
         "embedding_backfill",
-        "cosine_floor_bootstrap",
         "rerank_floor_bootstrap",
         "rerank_width_remeasure",
         "rerank_ram_figure",

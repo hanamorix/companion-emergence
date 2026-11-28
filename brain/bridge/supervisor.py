@@ -115,7 +115,7 @@ from brain.ingest.pipeline import (
 )
 from brain.initiate.review import _rest_state_from_energy, run_initiate_review_tick
 from brain.initiate.user_pattern import compute_user_presence
-from brain.memory import cost_series, floor_startup, recall_diagnostics, reranker
+from brain.memory import cost_series, embeddings, floor_startup, recall_diagnostics, reranker
 from brain.memory.embedding_backfill import (
     delete_legacy_embeddings_db as _delete_legacy_embeddings_db,
 )
@@ -1145,6 +1145,11 @@ def _build_gated_jobs(
             return _embedding_backfill_has_work_probe(store)
 
     def _embedding_backfill_job() -> JobOutcome:
+        if embeddings.embedding_provider_not_ready():
+            # #833: the model is still being built on the background thread; this thread never waits for the download.
+            # The pass is skipped (not advanced) and the build is asked for again under the usual retry rule.
+            floor_startup.request_embedding_build()
+            return JobOutcome.SKIPPED
         with cli_throttle.background_slot() as slot, _tick_store() as store:
             if not slot:
                 return JobOutcome.SKIPPED
@@ -1169,11 +1174,11 @@ def _build_gated_jobs(
     )
 
     # 4b. floor bootstraps — name-recall fix S85 revised / S91 / S92 (spec §2).
-    # The COSINE bootstrap is computed at process start; the RERANK bootstrap on
+    # The COSINE bootstrap (and the embedding model's build, #833) is computed at process start; the RERANK bootstrap on
     # first need, in the background (`floor_startup.request_rerank_bootstrap`);
     # a failed one is retried in the background on each incoming message. These
     # two jobs are the lull-time RETRY path: a floor is due only while it is
-    # missing (no calibrated row, not cached), it was needed or its last attempt
+    # missing (no calibrated row, not cached; the cosine one is also due while the embedding model is not built), it was needed or its last attempt
     # failed (the rerank floor is never due just because the process started),
     # chat has happened since the failed attempt (`cli_throttle.
     # chat_activity_marker`; no time constants), and no bootstrap of that floor
@@ -1196,10 +1201,15 @@ def _build_gated_jobs(
                 return JobOutcome.SKIPPED
         return JobOutcome.COMPLETED
 
+    def _cosine_floor_job() -> JobOutcome:
+        # #833: the lull retry builds the embedding model (a 2.2 GB download) when it is not built, so it only starts the
+        # background thread that does and returns: this thread never waits for it. One at a time (the cosine claim).
+        return JobOutcome.COMPLETED if floor_startup.start_cosine_retry(persona_dir) is not None else JobOutcome.SKIPPED
+
     jobs.append(
         GatedJob(
             "cosine_floor_bootstrap",
-            run=lambda: _floor_bootstrap_job("cosine", floor_startup.run_cosine_floor),
+            run=_cosine_floor_job,
             has_work=lambda: _floor_bootstrap_due("cosine", floor_startup.cosine_floor_due),
         )
     )

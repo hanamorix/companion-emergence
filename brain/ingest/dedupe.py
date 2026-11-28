@@ -10,9 +10,10 @@ Sources vectors off the memories row / warm matrix (F1 #259).
     graceful degradation semantic recall has while the backfill catches up.
     We deliberately do NOT embed-on-read to fill gaps here.
   - CANDIDATE vector: the transient, not-yet-committed `text` is embedded
-    DIRECTLY via `build_embedding_provider().embed(text)` — there is no
+    DIRECTLY via `get_ready_embedding_provider().embed(text)`, so there is no
     cache row to write (and therefore nothing to undo if the item's commit
-    later fails).
+    later fails). In the bridge, while the model is not built (its download
+    runs on one background thread, #833) the item is let through.
 
 Both the matrix and the provider key off the SAME current model id
 (`model_tier.model_for_tier(TIER_EMBEDDING)`), so a row left over from a
@@ -63,7 +64,8 @@ def is_duplicate(
         # Looked up via the MODULE (not a bare imported name) so a test's
         # monkeypatch on `embeddings.build_embedding_provider` is honored —
         # mirrors `MemoryStore.embed_row`'s identical dynamic lookup.
-        candidate = embeddings_mod.build_embedding_provider().embed(text).astype("float32")
+        # In the bridge this never waits for the model's download: not built yet raises at once (#833).
+        candidate = embeddings_mod.get_ready_embedding_provider().embed(text).astype("float32")
 
         max_sim = 0.0
         for stored_vec in existing.values():
@@ -75,6 +77,9 @@ def is_duplicate(
 
         return max_sim >= threshold
 
+    except embeddings_mod.EmbeddingNotReadyError:
+        logger.debug("is_duplicate: the embedding model is not built yet, letting item through")
+        return False
     except Exception as exc:  # noqa: BLE001
         logger.warning("is_duplicate: error during similarity check, letting item through: %s", exc)
         return False

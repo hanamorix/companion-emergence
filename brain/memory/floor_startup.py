@@ -7,7 +7,10 @@ computed while a reply is being built: `MemoryStore.get_cosine_floor` /
 `get_reranker_floor` only PEEK the process caches. Instead:
 
 * COSINE (S91): once per process, at process start, `compute_missing_floors`
-  computes it if it is missing (no calibrated row, not yet cached). Two entry
+  computes it if it is missing (no calibrated row, not yet cached). In the bridge it
+  first builds the embedding model when that is not built, whether or not a floor row
+  is saved (#833: the download runs on this one background thread, `ensure_embedder_built`;
+  every other bridge caller gets "not ready" at once and uses its keyword fallback). Two entry
   points call it: the bridge's startup background thread
   (`brain.bridge.server` lifespan) and `nell chat --no-bridge` session start
   (`brain.cli`), so the no-rerank path "works from the first message" except
@@ -21,8 +24,11 @@ computed while a reply is being built: `MemoryStore.get_cosine_floor` /
   off the reply path, on each incoming chat message until it succeeds
   (`on_incoming_message`, called by `respond()`), and also by the central
   cadence jobs `cosine_floor_bootstrap` / `rerank_floor_bootstrap` at the next
-  lull (due again only after chat activity since the failure). No time
-  constants;
+  lull (due again only after chat activity since the failure), and, for the
+  embedding model, by a caller that finds it not built (`request_embedding_build`,
+  same rule: due again only after chat activity). The cosine retry (message, lull,
+  caller) always starts the background thread; it never builds on the supervisor
+  thread. No time constants;
 * RAM FIGURE (S201, S210): `nell chat --no-bridge` has no lull cadence, so a turn that would rerank
   with no RAM figure flags the need (`request_ram_figure` records it) and the REPL, once that reply
   is finished, calls `start_requested_ram_figure`, which runs the RAM ladder (S200, S208, S220:
@@ -80,6 +86,26 @@ def set_activity_marker_provider(provider: Callable[[], object]) -> None:
     _marker_provider = provider
 
 
+# #833: the persona dir the bridge enabled the background embedding build with (None: this process builds the model on the
+# caller's own thread and waits, as `nell embed backfill`, `nell chat --no-bridge` and the one-shot commands do).
+_background_build_persona_dir: Path | None = None
+
+
+def enable_background_embedding_build(persona_dir: Path) -> None:
+    """The bridge's lifespan: from now on a caller that finds the embedding model not built gets
+    `EmbeddingNotReadyError` at once (`embeddings.get_ready_embedding_provider`) and the build runs on the background
+    thread. A no-op while background threads are inhibited (tests): nothing could build it."""
+    global _background_build_persona_dir
+    if _background_inhibited:
+        return
+    _background_build_persona_dir = Path(persona_dir)
+
+
+def background_embedding_build_enabled() -> bool:
+    """True once the bridge has enabled the background embedding build in this process."""
+    return _background_build_persona_dir is not None
+
+
 def _current_marker() -> object:
     try:
         return _marker_provider()
@@ -132,12 +158,15 @@ def reranker_model_id() -> str:
 
 
 def cosine_floor_due(store, *, activity_marker: object = None) -> bool:
-    """A cosine bootstrap is worth (re)computing: no calibrated row, not cached
-    in this process, and not already tried since the last chat activity."""
+    """A cosine bootstrap is worth (re)computing: not cached in this process, not already tried since the last chat
+    activity, and either no calibrated row or (the bridge) the embedding model is not built yet."""
+    from brain.memory import embeddings as embeddings_mod
+
     model_id = embedder_model_id()
     if not floor_calibration.cosine_bootstrap_due(model_id, activity_marker=activity_marker):
         return False
-    return store.get_persisted_cosine_floor(model_id) is None
+    # The bridge's background thread also owes the model itself when it is not built (#833), floor row or not.
+    return embeddings_mod.embedding_provider_not_ready() or store.get_persisted_cosine_floor(model_id) is None
 
 
 def rerank_floor_due(store, *, activity_marker: object = None) -> bool:
@@ -163,11 +192,26 @@ def run_rerank_floor(*, activity_marker: object = None) -> dict | None:
     (`_bootstrap_reranker_provider`) then reuses. S253, S257: before it, the free memory
     must be at least the model file's size plus the first rung's bound unless the provider's model is already
     loaded (`reranker.model_load_blocked_by_memory`); below it nothing is built and a
-    failed attempt is recorded, so the floor is retried at the next lull and message."""
+    failed attempt is recorded, so the floor is retried at the next lull and message.
+
+    Stopping: asked before the memory check and the build. A reranker download that is already running when the bridge's
+    stop begins is a counted task and the stop waits for it (the owner's rule: a task already working is finished). One
+    that has not started does not start: when the stop has begun and this process holds no reranker provider yet, this
+    returns None, building nothing and recording nothing (it is not a failed attempt; the next start retries)."""
+    from brain.bridge import cli_throttle
+
     model_id = reranker_model_id()
     try:
         from brain.memory import reranker as reranker_mod
 
+        # The refusal at thread registration (`_register_task`) covers a thread that would START after the stop began; this
+        # covers a rerank run already going (a floor thread, or the supervisor's lull job) that has not reached the download
+        # yet. A provider already held means no download on this call, so the floor is computed as before (same rule as
+        # `ensure_embedder_built`). A stop that begins in the few instructions after this check finds a build that has
+        # started, and waits for it like any running task.
+        if cli_throttle.shutdown_requested() and reranker_mod._provider_cache.get(model_id) is None:  # noqa: SLF001
+            logger.info("floor_startup: the reranker model download is not started, the bridge is stopping")
+            return None
         blocked = reranker_mod.model_load_blocked_by_memory()
     except Exception:  # noqa: BLE001 - the check never raises by contract; if it did, nothing loads
         logger.exception("floor_startup: the free-memory check before the model load failed for %s", model_id)
@@ -188,6 +232,44 @@ def run_rerank_floor(*, activity_marker: object = None) -> dict | None:
         )
         return None
     return floor_calibration.run_rerank_bootstrap(model_id, activity_marker=activity_marker)
+
+
+def ensure_embedder_built(marker: object) -> bool:
+    """Build the embedding model on this (background) thread when the bridge left it to the background thread and it is
+    not built (#833): the download waits here, never on a reply or supervisor thread. A failure is recorded in the
+    existing note under the "cosine" key with `marker`, exactly like a failed floor (the retry rules are
+    unchanged) and returns False, so the caller stops and never starts a second download; success clears that
+    note and returns True. A no-op returning True in every process that builds the model on the caller's own
+    thread (they wait, as before).
+
+    Stopping: a download that is already running when the bridge's stop begins is a counted task and the stop waits for
+    it (the owner's rule: a task already working is finished). One that has not started yet does not start: when the stop
+    has begun this returns False before the download, recording nothing (it is not a failed attempt; the next start
+    builds the model). Never raises."""
+    from brain.bridge import cli_throttle
+    from brain.memory import embeddings as embeddings_mod
+
+    try:
+        if not embeddings_mod.embedding_provider_not_ready():
+            return True
+        model_id = embedder_model_id()
+    except Exception:  # noqa: BLE001
+        logger.exception("floor_startup: could not tell whether the embedding model is built")
+        return True
+    # The refusal at thread registration (`_register_task`) covers a thread that would START after the stop began; this
+    # covers one that was already running (counted) and has not reached the download yet. A stop that begins in the few
+    # instructions after this check still finds this thread's counted task, so the stop waits for it and its download.
+    if cli_throttle.shutdown_requested():
+        logger.info("floor_startup: the embedding model download is not started, the bridge is stopping")
+        return False
+    try:
+        embeddings_mod.build_embedding_provider()
+    except Exception:  # noqa: BLE001 - recorded as a failed attempt below
+        logger.exception("floor_startup: building the embedding model failed (%s)", model_id)
+        floor_calibration._record_attempt("cosine", model_id, False, marker)  # noqa: SLF001
+        return False
+    floor_calibration.forget_failure("cosine", model_id)
+    return True
 
 
 def _record_failure(kind: str, marker: object) -> None:
@@ -221,11 +303,14 @@ def compute_missing_floors(
 ) -> None:
     """The process-start computation (S91): the COSINE bootstrap, if it is
     missing. Opens its own short-lived store to read the calibrated row and
-    closes it before any model loads. Never raises. `_registered` = the caller
-    already holds the cosine in-flight slot (`start_background`)."""
+    closes it before any model loads. In the bridge it first builds the embedding model when that is not built
+    (`ensure_embedder_built`). Never raises. `_registered` = the caller already holds the cosine in-flight slot
+    (`start_background`)."""
     if not _registered and not try_begin("cosine"):
         return
     try:
+        if not ensure_embedder_built(activity_marker()):
+            return
         try:
             from brain.memory.store import MemoryStore
 
@@ -260,9 +345,11 @@ def start_background(
 ) -> threading.Thread | None:
     """Run `compute_missing_floors` on a daemon thread and return it (started),
     or `None` when inhibited (tests) or when a cosine bootstrap is already in
-    flight. Daemon: never holds up a shutdown; a process that exits mid-compute
-    simply computes again next start. Registers the process's activity-marker
-    source for the background starters, also when inhibited."""
+    flight. The thread is a counted bridge task (`_register_task`): a stop waits for it
+    while it runs, download included (the hard-exit offer is the way out), and a stop
+    that has begun starts none. Daemon only so a hard exit or a crash never leaves it
+    behind at a normal exit; whatever it did not finish it computes again next start. Registers the
+    process's activity-marker source for the background starters, also when inhibited."""
     set_activity_marker_provider(activity_marker)
     if _background_inhibited:
         return None
@@ -292,8 +379,9 @@ def start_background(
 
 
 def _register_task(label: str) -> int | None:
-    """#456 (C9): a floor computation is a counted bridge task while it runs, and none starts once the bridge is
-    stopping (None = do not start)."""
+    """#456 (C9): a floor computation is a counted bridge task while it runs (the stop waits for it, the model download
+    inside it too), and none starts once the bridge is stopping (None = do not start). A thread already running when the
+    stop begins is not asked again: `ensure_embedder_built` and `run_rerank_floor` hold back their downloads."""
     from brain.bridge import cli_throttle, shutdown_progress
 
     try:
@@ -459,9 +547,13 @@ def start_requested_ram_figure() -> threading.Thread | None:
 
 
 def _retry_body(kind: str, persona_dir: Path) -> None:
-    """The message-retry body: skip when a calibrated row exists (the floor then
-    exists and the failed record is moot), else run the bootstrap."""
+    """The retry body (message, lull or a caller that found the model not built): in the bridge, first build the
+    embedding model when it is not built (a failure ends the body); then skip when a calibrated row exists (the floor
+    then exists and the failed record is moot), else run the bootstrap."""
     from brain.memory.store import MemoryStore
+
+    if kind == "cosine" and not ensure_embedder_built(_current_marker()):
+        return
 
     store = MemoryStore(Path(persona_dir) / "memories.db", integrity_check=False)
     try:
@@ -484,7 +576,8 @@ def _retry_body(kind: str, persona_dir: Path) -> None:
 
 def on_incoming_message(persona_dir: Path) -> list[threading.Thread]:
     """S92: called for each incoming chat message (`respond()`). For each floor
-    whose last bootstrap FAILED and that has no floor yet, retry it in the
+    whose last bootstrap FAILED (the cosine one also when only the embedding
+    model's build failed, #833), retry it in the
     background, off the reply path, unless one is already in flight for that
     floor. No time constants: the message itself is the trigger, and it repeats
     on every message until a bootstrap succeeds. Returns the threads started.
@@ -494,13 +587,80 @@ def on_incoming_message(persona_dir: Path) -> list[threading.Thread]:
         for kind, model_id in (("cosine", embedder_model_id()), ("rerank", reranker_model_id())):
             if not floor_calibration.bootstrap_failed(kind, model_id):
                 continue
-            thread = _spawn(
-                kind,
-                lambda kind=kind: _retry_body(kind, persona_dir),
-                name=f"floor-bootstrap-{kind}-retry",
-            )
+            thread = _start_retry(kind, persona_dir)
             if thread is not None:
                 started.append(thread)
     except Exception:  # noqa: BLE001
         logger.exception("floor_startup: on-message bootstrap retry failed")
     return started
+
+
+def _start_retry(kind: str, persona_dir: Path) -> threading.Thread | None:
+    """The one starter of a `kind` retry (#833): `_retry_body` on a daemon thread under the `kind` in-flight claim; `None`
+    when inhibited or one is already in flight. Used by the message retry, the lull job and a caller that found the
+    embedding model not built."""
+    return _spawn(
+        kind,
+        lambda: _retry_body(kind, persona_dir),
+        name=f"floor-bootstrap-{kind}-retry",
+    )
+
+
+def start_cosine_retry(persona_dir: Path) -> threading.Thread | None:
+    """The lull job's cosine retry (`cosine_floor_bootstrap`): starts the background thread and returns at once, so the
+    supervisor thread never waits for a model download. `None` when one is already in flight or inhibited."""
+    return _start_retry("cosine", persona_dir)
+
+
+def request_embedding_build() -> threading.Thread | None:
+    """A bridge caller found the embedding model not built (`embeddings.get_ready_embedding_provider`): start the
+    background build, one at a time, under the same rule as every other cosine retry (due once chat activity has changed
+    the marker since a failed attempt; `floor_calibration.cosine_bootstrap_due`). Returns the thread started, or `None`.
+    Never raises, never waits: it runs on a reply or supervisor thread."""
+    persona_dir = _background_build_persona_dir
+    if persona_dir is None:
+        return None
+    try:
+        if not floor_calibration.cosine_bootstrap_due(embedder_model_id(), activity_marker=_current_marker()):
+            return None
+        return _start_retry("cosine", persona_dir)
+    except Exception:  # noqa: BLE001
+        logger.exception("floor_startup: could not request the embedding model build")
+        return None
+
+
+def embedding_download_notice() -> dict | None:
+    """What the app tells the user about the embedding model (#833): `{"state": "downloading" | "failed", "size_gb":
+    float | None}`, or None. Read-only: nothing is stored.
+
+    "downloading" = the cosine claim is held, the model is not built and its files are not on this computer;
+    "failed" = no claim is held, the model is not built, the cosine failure note exists and the files are not on this
+    computer. Cheap checks first. `reranker._model_file_cached` (extended to the embedding model and every file) decides
+    "on this computer"; when it cannot decide (None) nothing is shown. The size is the registry's own `size_in_GB`."""
+    from brain.memory import embeddings as embeddings_mod
+    from brain.memory import reranker as reranker_mod
+    from brain.paths import get_cache_dir
+
+    if not embeddings_mod.embedding_provider_not_ready():
+        return None
+    model_id = embedder_model_id()
+    if inflight("cosine"):
+        state = "downloading"
+    elif floor_calibration.bootstrap_failed("cosine", model_id):
+        state = "failed"
+    else:
+        return None
+    # Two accepted edges of this check (#833), both left as they are:
+    # 1. It reads only fastembed's hub-layout paths. A model fastembed fetched through its tarball fallback is not seen,
+    #    so the notice says "downloading" while a later build runs (the files are there, the check does not see them).
+    # 2. "On this computer" (or undecidable) gives no notice at all, so a build that failed with the files already on
+    #    disk shows nothing: the failure was not the download.
+    if reranker_mod._model_file_cached(model_id, get_cache_dir()) is not False:  # noqa: SLF001
+        return None
+    size_gb: float | None = None
+    try:
+        entry = reranker_mod._registry_entry(model_id)  # noqa: SLF001
+        size_gb = reranker_mod._positive_finite((entry or {}).get("size_in_GB"))  # noqa: SLF001
+    except Exception:  # noqa: BLE001 - the size is optional
+        logger.debug("floor_startup: could not read the embedding model's size", exc_info=True)
+    return {"state": state, "size_gb": size_gb}

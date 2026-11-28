@@ -592,7 +592,8 @@ def _embed_candidate(content: str) -> tuple[np.ndarray, str] | None:
     Looked up via the MODULE (not a bare imported name) so a test's
     monkeypatch on `embeddings_mod.build_embedding_provider` is honored —
     mirrors `MemoryStore.embed_row`'s / `dedupe.is_duplicate`'s identical
-    dynamic lookup.
+    dynamic lookup. In the bridge it never waits for the model's download:
+    while the model is not built it returns None at once (#833).
 
     Fail-soft: returns None on any provider/compute failure rather than
     raising, so one bad embed cannot lose the candidate or abort the drain
@@ -602,9 +603,12 @@ def _embed_candidate(content: str) -> tuple[np.ndarray, str] | None:
     the row NULL on a repeat failure for the idle backfill to pick up).
     """
     try:
-        provider = embeddings_mod.build_embedding_provider()
+        provider = embeddings_mod.get_ready_embedding_provider()
         vec = provider.embed(content).astype("float32")
         return vec, provider.model_id()
+    except embeddings_mod.EmbeddingNotReadyError:
+        logger.debug("consolidation gate: the embedding model is not built yet; lexical context for this candidate")
+        return None
     except Exception:  # noqa: BLE001 — degrade to lexical context + post-promote embed_row
         logger.warning(
             "consolidation gate: pre-judge candidate embed failed; falling back to "
@@ -1211,6 +1215,9 @@ def _dispatch(
             store.write_embedding(cand.id, cand_vec, model_id)
         else:
             store.embed_row(cand.id, cand.content)
+    except embeddings_mod.EmbeddingNotReadyError:
+        # The bridge's background thread is still building the model (#833): no vector now, the idle backfill adds it.
+        logger.debug("consolidation._dispatch: embedding model not built yet for promoted id=%s", cand.id)
     except Exception:  # noqa: BLE001 — degrade to backfill, never abort the drain
         logger.warning(
             "consolidation._dispatch: embed persist failed for promoted id=%s — "

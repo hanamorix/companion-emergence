@@ -24,6 +24,7 @@ from tests.unit.brain.bridge.test_central_cadence import (
     _granting_slot,
     _persona,
     _real_jobs,
+    run_cosine_retry_inline,
 )
 from tests.unit.brain.memory.test_no_rerank_cosine_path import (
     _EMBEDDER_ID,
@@ -34,6 +35,12 @@ from tests.unit.brain.memory.test_no_rerank_cosine_path import (
 )
 
 _JOB = "cosine_floor_bootstrap"
+
+
+@pytest.fixture(autouse=True)
+def _the_lull_job_retries_on_this_thread(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The job only starts the background retry thread (#833); these tests look at what the retry does, so it runs inline."""
+    run_cosine_retry_inline(monkeypatch)
 
 
 def _counting_bootstrap(monkeypatch: pytest.MonkeyPatch, *, fail: bool = False) -> list[str]:
