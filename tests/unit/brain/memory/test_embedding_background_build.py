@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from brain.bridge import cli_throttle, shutdown_progress
 from brain.engines import consolidation
 from brain.ingest import dedupe
 from brain.memory import embeddings as embeddings_mod
@@ -447,3 +448,123 @@ def test_the_state_carries_the_notice_before_the_two_other_notices_and_survives_
 
     monkeypatch.setattr(floor_startup, "embedding_download_notice", _boom)
     assert build_persona_state(persona_dir)["embedding_download_notice"] is None
+
+
+# ---------------------------------------------------------------------------
+# A stop (#833b): a running download is waited for; one that has not started does not start
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def stopping(building: dict, monkeypatch: pytest.MonkeyPatch) -> dict:
+    """The `building` fixture with background threads allowed (the starters really spawn)."""
+    monkeypatch.setattr(floor_startup, "_background_inhibited", False)
+    monkeypatch.setattr(floor_startup, "reranker_model_id", lambda: "r")
+    monkeypatch.setattr(floor_startup, "_current_marker", lambda: 1.0)
+    return building
+
+
+def _start_up(tmp_path: Path):
+    return floor_startup.start_background(tmp_path, activity_marker=lambda: 1.0)
+
+
+def _message(tmp_path: Path):
+    floor_calibration._record_attempt("cosine", "m", False, 1.0)  # noqa: SLF001
+    threads = floor_startup.on_incoming_message(tmp_path)
+    return threads[0] if threads else None
+
+
+def _lull(tmp_path: Path):
+    return floor_startup.start_cosine_retry(tmp_path)
+
+
+def _caller(tmp_path: Path):
+    return floor_startup.request_embedding_build()
+
+
+_TRIGGERS = {"bridge start": _start_up, "a message": _message, "the lull job": _lull, "a caller": _caller}
+
+
+@pytest.mark.no_base_failure(
+    reason="pins the refusal that already exists at thread registration (floor_startup._register_task, spawner=True)"
+)
+@pytest.mark.parametrize("trigger", list(_TRIGGERS))
+def test_no_download_thread_starts_once_the_stop_has_begun(stopping: dict, tmp_path: Path, trigger: str) -> None:
+    cli_throttle.request_shutdown()
+    assert _TRIGGERS[trigger](tmp_path) is None
+    assert stopping["builds"] == 0
+    assert shutdown_progress.registry.snapshot() == []
+    assert floor_startup.inflight("cosine") is False
+
+
+@pytest.mark.no_base_failure(
+    reason="pins the refusal that already exists at thread registration (floor_startup._register_task, spawner=True)"
+)
+def test_a_caller_in_a_stopping_bridge_still_gets_not_ready_and_starts_nothing(stopping: dict) -> None:
+    cli_throttle.request_shutdown()
+    with pytest.raises(EmbeddingNotReadyError):
+        embeddings_mod.get_ready_embedding_provider()
+    assert stopping["builds"] == 0
+    assert shutdown_progress.registry.snapshot() == []
+
+
+def test_the_ensure_step_does_not_start_the_download_during_a_stop_and_records_no_failure(stopping: dict) -> None:
+    cli_throttle.request_shutdown()
+    assert floor_startup.ensure_embedder_built(1.0) is False
+    assert stopping["builds"] == 0
+    assert floor_calibration.bootstrap_failed("cosine", "m") is False, "not a failed download"
+
+
+@pytest.mark.parametrize("how", ["start-up thread", "retry thread"])
+def test_a_thread_already_running_does_not_start_the_download_once_the_stop_begins(
+    stopping: dict, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, how: str
+) -> None:
+    reached = threading.Event()
+    gate = threading.Event()
+    real = embeddings_mod.embedding_provider_not_ready
+
+    def _held() -> bool:
+        reached.set()
+        gate.wait(timeout=10)
+        return real()
+
+    monkeypatch.setattr(embeddings_mod, "embedding_provider_not_ready", _held)
+    thread = _start_up(tmp_path) if how == "start-up thread" else floor_startup.request_embedding_build()
+    assert thread is not None and reached.wait(timeout=10), "the thread is running and has not reached the download"
+    assert len(shutdown_progress.registry.snapshot()) == 1
+    cli_throttle.request_shutdown()
+    gate.set()
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    assert stopping["builds"] == 0, "the download did not start"
+    assert stopping["floors"] == 0, "nor did the floor computation"
+    assert shutdown_progress.registry.snapshot() == []
+    assert floor_startup.inflight("cosine") is False
+    assert floor_calibration.bootstrap_failed("cosine", "m") is False
+
+
+@pytest.mark.no_base_failure(reason="pins today's behaviour: a running counted download is waited for by the stop (the owner's option a)")
+def test_a_running_download_stays_a_counted_task_and_the_stop_waits_for_it(
+    stopping: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered = threading.Event()
+    gate = threading.Event()
+
+    def _slow_build():
+        stopping["builds"] += 1
+        entered.set()
+        gate.wait(timeout=10)
+        provider = FakeEmbeddingProvider(dim=8)
+        embeddings_mod._provider_cache[embeddings_mod.resolve_embedding_model_id()] = provider  # noqa: SLF001
+        return provider
+
+    monkeypatch.setattr(embeddings_mod, "build_embedding_provider", _slow_build)
+    thread = floor_startup.request_embedding_build()
+    assert thread is not None and entered.wait(timeout=10)
+    cli_throttle.request_shutdown()
+    assert shutdown_progress.registry.snapshot() == ["floor cosine"]
+    assert shutdown_progress.registry.seal() is False, "the stop waits for the download"
+    gate.set()
+    thread.join(timeout=10)
+    assert stopping["builds"] == 1
+    assert shutdown_progress.registry.seal() is True

@@ -225,7 +225,13 @@ def ensure_embedder_built(marker: object) -> bool:
     existing note under the "cosine" key with `marker`, exactly like a failed floor (the retry rules are
     unchanged) and returns False, so the caller stops and never starts a second download; success clears that
     note and returns True. A no-op returning True in every process that builds the model on the caller's own
-    thread (they wait, as before). Never raises."""
+    thread (they wait, as before).
+
+    Stopping: a download that is already running when the bridge's stop begins is a counted task and the stop waits for
+    it (the owner's rule: a task already working is finished). One that has not started yet does not start: when the stop
+    has begun this returns False before the download, recording nothing (it is not a failed attempt; the next start
+    builds the model). Never raises."""
+    from brain.bridge import cli_throttle
     from brain.memory import embeddings as embeddings_mod
 
     try:
@@ -235,6 +241,12 @@ def ensure_embedder_built(marker: object) -> bool:
     except Exception:  # noqa: BLE001
         logger.exception("floor_startup: could not tell whether the embedding model is built")
         return True
+    # The refusal at thread registration (`_register_task`) covers a thread that would START after the stop began; this
+    # covers one that was already running (counted) and has not reached the download yet. A stop that begins in the few
+    # instructions after this check finds a download that has started, and waits for it like any running task.
+    if cli_throttle.shutdown_requested():
+        logger.info("floor_startup: the embedding model download is not started, the bridge is stopping")
+        return False
     try:
         embeddings_mod.build_embedding_provider()
     except Exception:  # noqa: BLE001 - recorded as a failed attempt below
@@ -318,9 +330,11 @@ def start_background(
 ) -> threading.Thread | None:
     """Run `compute_missing_floors` on a daemon thread and return it (started),
     or `None` when inhibited (tests) or when a cosine bootstrap is already in
-    flight. Daemon: never holds up a shutdown; a process that exits mid-compute
-    simply computes again next start. Registers the process's activity-marker
-    source for the background starters, also when inhibited."""
+    flight. The thread is a counted bridge task (`_register_task`): a stop waits for it
+    while it runs, download included (the hard-exit offer is the way out), and a stop
+    that has begun starts none. Daemon only so a hard exit or a crash never leaves it
+    behind; whatever it did not finish it computes again next start. Registers the
+    process's activity-marker source for the background starters, also when inhibited."""
     set_activity_marker_provider(activity_marker)
     if _background_inhibited:
         return None
@@ -350,8 +364,9 @@ def start_background(
 
 
 def _register_task(label: str) -> int | None:
-    """#456 (C9): a floor computation is a counted bridge task while it runs, and none starts once the bridge is
-    stopping (None = do not start)."""
+    """#456 (C9): a floor computation is a counted bridge task while it runs (the stop waits for it, the model download
+    inside it too), and none starts once the bridge is stopping (None = do not start). A thread already running when the
+    stop begins is not asked again: `ensure_embedder_built` holds back its download."""
     from brain.bridge import cli_throttle, shutdown_progress
 
     try:
@@ -620,6 +635,11 @@ def embedding_download_notice() -> dict | None:
         state = "failed"
     else:
         return None
+    # Two accepted edges of this check (#833), both left as they are:
+    # 1. It reads only fastembed's hub-layout paths. A model fastembed fetched through its tarball fallback is not seen,
+    #    so the notice says "downloading" while a later build runs (the files are there, the check does not see them).
+    # 2. "On this computer" (or undecidable) gives no notice at all, so a build that failed with the files already on
+    #    disk shows nothing: the failure was not the download.
     if reranker_mod._model_file_cached(model_id, get_cache_dir()) is not False:  # noqa: SLF001
         return None
     size_gb: float | None = None
