@@ -1628,7 +1628,10 @@ def build_app(
                 # takes a leftover of an earlier run (or of `nell chat --no-bridge`), which would otherwise wait for the
                 # next reply.
                 app.state.bridge.pass2_drain_enabled = True
-                _start_pass2_drain(app.state.bridge)
+                try:
+                    _start_pass2_drain(app.state.bridge)
+                except Exception:  # noqa: BLE001 - an optional leftover drain must never keep the bridge from starting
+                    logger.exception("pass-2 leftover drain not started; the queue stays saved")
 
         # Idle-shutdown watcher (only if requested)
         idle_task = None

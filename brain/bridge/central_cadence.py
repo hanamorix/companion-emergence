@@ -247,7 +247,7 @@ def run_central_pass(
             _decide(job.name, "skip-deferred")
             continue
         # S43: ask is-chat-idle again before EVERY job; the first "not idle"
-        # ends the sequence — the rest wait for the next lull.
+        # ends the sequence, the rest wait for the next lull.
         if not is_idle():
             _decide(job.name, "skip-no-lull")
             break

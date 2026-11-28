@@ -41,8 +41,8 @@ enqueue(record, *, persona_dir)
     ``_MAX_QUEUE``. Nothing is started: the queue is drained by its callers
     below (ram-spike-fix INC-9 removed the daemon worker thread).
 queue_length(persona_dir) -> int
-    Items currently saved in the queue (the central cadence function's
-    "pass 2 has work" probe, S53).
+    Items currently saved in the queue (the bridge's "start pass 2's thread?"
+    probe after a reply and at start, and the thread's "work left?" check).
 drain_all_locked(persona_dir, *, should_pause=None, on_progress=None,
                  time_budget_s=None) -> int
     Take ``pass2_drain.lock`` (non-blocking); drain queued items serially,
@@ -52,7 +52,7 @@ drain_all_locked(persona_dir, *, should_pause=None, on_progress=None,
     Two callers in this codebase: pass 2's own short-lived thread
     (``drain_in_own_thread``, below; one per reply that queued work, with
     ``should_pause`` = "a stop was requested or a reply is in flight") and
-    ``nell chat --no-bridge``'s exit drain (cli.py, S78/S80 — no
+    ``nell chat --no-bridge``'s exit drain (cli.py, S78/S80: no
     ``should_pause`` at all, a bounded ``time_budget_s`` instead).
 drain_in_own_thread(persona_dir) -> None
     The thread body: wait for no reply in flight, take the background slot
@@ -172,8 +172,8 @@ def _queue_len_locked(persona_dir: Path) -> int:
 
 def queue_length(persona_dir: Path) -> int:
     """Number of items currently saved in the queue (fresh read under the
-    queue-file lock). The central cadence function's "pass 2 has work"
-    probe (ram-spike-fix INC-9, S53)."""
+    queue-file lock). The probe that decides whether pass 2's own thread
+    is started, and that thread's own "work left?" check."""
     return _queue_len_locked(Path(persona_dir))
 
 
@@ -320,6 +320,9 @@ def drain_in_own_thread(persona_dir: Path) -> None:
     Edge (L2 item 32): an item queued in the instant before an earlier thread lets go of the drain lock gets a ``drained == 0``
     from its own thread. The earlier thread looks at the queue length again after its drain returns, so it takes that item;
     what remains is another process's enqueue after that look, picked up by the next reply's thread or the next start.
+
+    As in ``drain_all_locked``, the reply gate is looked at after an item, so a reply that starts after the slot was taken
+    still lets the first item run.
 
     Failures: any other exception is logged and ends the thread; the queue stays saved (an item is popped only after it ran).
     """
