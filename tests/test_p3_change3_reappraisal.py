@@ -138,6 +138,7 @@ def test_c3_3_recall_enqueues_only_the_full_inject_not_inline(tmp_path):
 
     block = _build_recall_block(store, "lighthouse beacon marker", persona_dir=tmp_path)
     assert block.strip() != ""
+    assert lo.id in block  # the snippet surfaced, yet is not queued below
 
     # Enqueue-only: no inline appraisal happened — importance untouched.
     assert store.get(hi.id, bump=False).importance == pytest.approx(9.5)

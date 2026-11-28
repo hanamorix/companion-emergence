@@ -19,7 +19,9 @@ companion test proves the SAME graveyard hit still fires grief-touch
 exactly once on an INCONCLUSIVE (`semantic_result=None`) turn — no
 double-fire, no skip, across the fork.
 
-Defect 4 (bundled): the semantic render's own snippet-tier fractional
+Defect 4 (bundled; written when a snippet was also queued for a re-check,
+which S72 later removed: only a memory opened in full is queued now): the
+semantic render's own snippet-tier fractional
 recall_count bump + `enqueue_reappraisals` call ran UNCONDITIONALLY, unlike
 the lexical path's `SNIPPET_MODE_ENABLED` gate (dormant today since that
 flag is hardcoded True, but inconsistent — when snippet mode is off,
@@ -456,8 +458,9 @@ def test_fading_snippet_is_not_queued_on_conclusive_or_inconclusive_turns(tmp_pa
             return_value=["workshop", "rooftop", "Marcus"],
         ),
     ):
-        _build_recall_block(store_a, "workshop rooftop Marcus", persona_dir=tmp_path)
+        block_a = _build_recall_block(store_a, "workshop rooftop Marcus", persona_dir=tmp_path)
     ids_conclusive = _reappraisal_ids(PendingQueue(tmp_path).drain())
+    assert "softened (fading" in block_a  # it surfaced
     assert fading_a.id not in ids_conclusive
 
     store_b, _active_mem_b, fading_b = _seed_fixture(tmp_path)
@@ -469,8 +472,9 @@ def test_fading_snippet_is_not_queued_on_conclusive_or_inconclusive_turns(tmp_pa
             return_value=["workshop", "rooftop", "Marcus"],
         ),
     ):
-        _build_recall_block(store_b, "workshop rooftop Marcus", persona_dir=tmp_path)
+        block_b = _build_recall_block(store_b, "workshop rooftop Marcus", persona_dir=tmp_path)
     ids_inconclusive = _reappraisal_ids(PendingQueue(tmp_path).drain())
+    assert "softened (fading" in block_b  # it surfaced
     assert fading_b.id not in ids_inconclusive
 
 
