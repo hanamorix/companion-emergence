@@ -740,7 +740,7 @@ user_message_segments = [
   "  —  ",
   "\n\n=== Recent outbound (last 5 sends + acknowledged_unclear from last 24h) ===\n",
   "\n\n=== Candidates surfaced since last tick ===\n",
-  "\n\n=== Your task ===\nFor each candidate, decide: promote or filter.\nPromote at most 2. The default is filter.\n",
+  "\n\n=== Your task ===\nFor each candidate, decide: promote or filter.\nPromote at most 2. The default is filter.\nReply with only this JSON object and nothing else:\n{\"decisions\": [{\"candidate_index\": 1, \"decision\": \"filter\", \"reason\": \"one short sentence\", \"confidence\": \"high\"}], \"tick_note\": null}\nGive one decision for each candidate. candidate_index is the number in brackets before the candidate. decision is \"promote\" or \"filter\". confidence is \"high\", \"medium\" or \"low\". tick_note is one short sentence about this tick, or null.\n",
 ]
 
 [initiate.review]

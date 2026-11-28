@@ -24,7 +24,7 @@ def test_full_pipeline_dream_to_audit(tmp_path: Path, monkeypatch) -> None:
     from brain.initiate.reflection import DDecision, DReflectionResult
 
     def _promote_all(candidates, *, deps):
-        decisions = [DDecision(i, "promote", "test stub", "high") for i in range(len(candidates))]
+        decisions = [DDecision(i, "promote", "test stub", "high") for i in range(1, len(candidates) + 1)]
         result = DReflectionResult(decisions=decisions, tick_note=None)
         dcall = DCallRow(
             d_call_id=make_d_call_id(deps.now),

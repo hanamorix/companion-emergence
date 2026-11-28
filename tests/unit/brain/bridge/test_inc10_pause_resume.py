@@ -614,7 +614,7 @@ def test_c8_initiate_review_pauses_between_candidates_and_resumes(tmp_path: Path
         from brain.initiate.d_call_schema import DCallRow, make_d_call_id
         from brain.initiate.reflection import DDecision, DReflectionResult
 
-        decisions = [DDecision(i, "promote", "test stub", "high") for i in range(len(candidates))]
+        decisions = [DDecision(i, "promote", "test stub", "high") for i in range(1, len(candidates) + 1)]
         result = DReflectionResult(decisions=decisions, tick_note=None)
         dcall = DCallRow(
             d_call_id=make_d_call_id(deps.now), ts=deps.now.isoformat(), tick_id=deps.tick_id,

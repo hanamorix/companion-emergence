@@ -810,6 +810,7 @@ def test_cs2_h_the_allowlist_end_state_has_only_not_file_io_and_held_entries() -
         "brain/cli.py",
         "brain/health/log_rotation.py",
         "brain/ingest/buffer.py",
+        "brain/initiate/reflection.py",  # #841: d_reason's string escape (owner decision 2026-11-28)
         "brain/migrator/og.py",
         "brain/update/overlay_hook.py",
     }, marked
