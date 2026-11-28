@@ -86,6 +86,7 @@ from brain.chat.session import (
     get_or_hydrate_session,
 )
 from brain.emotion import engine as emotion_engine
+from brain.emotion import vocabulary_swap
 from brain.health.alarm import compute_pending_alarms
 from brain.health.json_io import Recovery, iter_jsonl, read_json
 from brain.health.parse_failures import count_recent as count_recent_parse_failures
@@ -1427,6 +1428,12 @@ def build_app(
         finally:
             _vocab_store.close()
 
+        # The one-time swap of the persona's own entries for contentment, calm, peace and groundedness (#648). A start that needs a
+        # rebuild has already run it in the rebuild child (`_supervisor_rebuild_handler`), right before that rebuild; this call covers
+        # a start that needs none and a bridge started around the supervisor. The marker makes the second run a no-op. Fail-soft: it
+        # logs and never raises.
+        vocabulary_swap.run_vocabulary_swap_648(persona_dir)
+
         # No emotion-engine switch-over here (S107): the starter runs the rebuild as its own process before this bridge starts, so a
         # bridge started around the supervisor (python -m brain.bridge.runner) starts on the saved state.
 
@@ -1489,7 +1496,11 @@ def build_app(
         # Floor bootstraps (name-recall fix S85, revised; spec §2): the cosine
         # (S91: only the COSINE one) bootstrap floor is computed ONCE per
         # process, here at process start, on a daemon thread off every reply
-        # path (recall only peeks the caches). Until it finishes, the no-rerank
+        # path (recall only peeks the caches). That thread also builds the
+        # embedding model (its 2.2 GB download) whenever it is not built, floor
+        # or no floor (#833): `enable_background_embedding_build` below makes
+        # every other caller in this process take its keyword fallback until it
+        # is built instead of waiting. Until the floor exists, the no-rerank
         # path renders keyword results only. The RERANK floor bootstraps on
         # first need in the background; a failed bootstrap is retried in the
         # background on each incoming message (`respond()`, S92) and at the
@@ -1503,6 +1514,7 @@ def build_app(
                 from brain.bridge import cli_throttle as _cli_throttle
                 from brain.memory import floor_startup as _floor_startup
 
+                _floor_startup.enable_background_embedding_build(persona_dir)
                 app.state.bridge.floor_bootstrap_thread = _floor_startup.start_background(
                     persona_dir,
                     activity_marker=_cli_throttle.chat_activity_marker,

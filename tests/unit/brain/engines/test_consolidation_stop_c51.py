@@ -56,6 +56,11 @@ def _reappraiser(_m):
     return Reappraisal(importance=9.0)
 
 
+def _no_tagger(_m):
+    """These tests follow the judge's calls; a tagger built from the provider would add calls of its own (#747)."""
+    return {}
+
+
 def _enqueue(queue, *contents) -> None:
     for c in contents:
         queue.enqueue(Memory.create_new(content=c, memory_type="dream", domain="us", emotions={}), source="dream")
@@ -88,7 +93,7 @@ def test_a_stop_mid_consolidation_promotes_nothing_unclassified_loses_nothing_an
     _enqueue(queue, A, B, C)
     provider = _StopAwareProvider(stop_during=1)
 
-    run_consolidation(store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser)
+    run_consolidation(store, persona_dir=tmp, provider=provider, hebbian=heb, reappraiser=_reappraiser, emotion_tagger=_no_tagger)
 
     assert [_which(p) for p in provider.calls] == [A]
     assert _contents(store) == [A]  # B and C were never classified: not promoted
@@ -98,7 +103,7 @@ def test_a_stop_mid_consolidation_promotes_nothing_unclassified_loses_nothing_an
     _enqueue(queue, D)
     cli_throttle.reset()
     after = _StopAwareProvider(stop_during=None)
-    run_consolidation(store, persona_dir=tmp, provider=after, hebbian=heb, reappraiser=_reappraiser)
+    run_consolidation(store, persona_dir=tmp, provider=after, hebbian=heb, reappraiser=_reappraiser, emotion_tagger=_no_tagger)
 
     order = [_which(p) for p in after.calls]
     assert sorted(order[:2]) == sorted([B, C]) and order[2:] == [D]  # the unsettled remainder first

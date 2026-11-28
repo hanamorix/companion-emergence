@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from brain.migrator.transform import (
     SkippedMemory,
     transform_memory,
@@ -187,7 +189,8 @@ def test_skipped_memory_dataclass_shape() -> None:
     assert s.raw_snippet == "..."
 
 
-def test_transform_non_numeric_importance_degrades_to_emotion_backfill() -> None:
+@pytest.mark.no_base_failure(reason="a rename of an existing test (it ended _degrades_to_emotion_backfill); the behaviour is unchanged and already holds on main")
+def test_transform_non_numeric_importance_falls_back_to_the_emotion_bucket() -> None:
     """Non-numeric importance (e.g. 'high') must not crash float() — it is
     treated as malformed/missing and backfilled from emotions (P3 retention
     rework, Change 1: `_og()`'s default emotions={"love": 9.0} -> emotion_score
@@ -198,7 +201,8 @@ def test_transform_non_numeric_importance_degrades_to_emotion_backfill() -> None
     assert mem.importance == 3.0
 
 
-def test_transform_list_importance_degrades_to_emotion_backfill() -> None:
+@pytest.mark.no_base_failure(reason="a rename of an existing test (it ended _degrades_to_emotion_backfill); the behaviour is unchanged and already holds on main")
+def test_transform_list_importance_falls_back_to_the_emotion_bucket() -> None:
     """A list-valued importance field degrades gracefully (no crash) and is
     backfilled from emotions the same way a missing importance is, not a
     hard 0.0."""

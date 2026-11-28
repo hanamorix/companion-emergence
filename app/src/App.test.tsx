@@ -482,6 +482,72 @@ describe("App rebuild notice (HRF)", () => {
   });
 });
 
+describe("App embedding download notice (#833)", () => {
+  const stateWith = (extra: Partial<PersonaState> = {}): PersonaState => ({
+    persona: "nell",
+    emotions: {},
+    body: null,
+    interior: { dream: null, research: null, heartbeat: null, reflex: null },
+    soul_highlight: null,
+    connection: { provider: "claude-cli", model: null, last_heartbeat_at: null },
+    mode: "live",
+    recovering: false,
+    felt_time_recovered: false,
+    ...extra,
+  });
+
+  beforeEach(() => {
+    readAppConfig.mockReset().mockResolvedValue(baseConfig("nell"));
+    writeAppConfig.mockReset().mockResolvedValue(undefined);
+    listPersonas.mockReset();
+    ensureBridgeRunning.mockReset().mockResolvedValue(undefined);
+    ensureBridgeCurrent.mockReset().mockResolvedValue("ok");
+    setAlwaysOnTop.mockReset().mockResolvedValue(undefined);
+    brainLoginStatus.mockReset().mockResolvedValue({ authorized: true });
+  });
+
+  afterEach(cleanup);
+
+  it("shows the downloading text in the notice box, with no button", async () => {
+    fetchPersonaState
+      .mockReset()
+      .mockResolvedValue(stateWith({ embedding_download_notice: { state: "downloading", size_gb: 2.24 } }));
+    render(<App />);
+
+    const el = await screen.findByTestId("embedding-download-notice");
+    expect(el).toHaveAttribute("role", "status");
+    expect(el.textContent).toBe(
+      "Downloading the memory search model (2.2 GB). Memory search uses keywords until it finishes.",
+    );
+    expect(within(el).queryAllByRole("button")).toHaveLength(0);
+  });
+
+  it("shows the failed text", async () => {
+    fetchPersonaState
+      .mockReset()
+      .mockResolvedValue(stateWith({ embedding_download_notice: { state: "failed", size_gb: null } }));
+    render(<App />);
+
+    const el = await screen.findByTestId("embedding-download-notice");
+    expect(el.textContent).toBe(
+      "The memory search model could not be downloaded. Memory search uses keywords only, and the download will be tried again.",
+    );
+  });
+
+  it.each<[PersonaState["embedding_download_notice"]]>([[null], [undefined]])(
+    "shows no notice when the field is %s",
+    async (notice) => {
+      fetchPersonaState
+        .mockReset()
+        .mockResolvedValue(stateWith(notice === undefined ? {} : { embedding_download_notice: notice }));
+      render(<App />);
+
+      await screen.findByTestId("chat-panel");
+      expect(screen.queryByTestId("embedding-download-notice")).toBeNull();
+    },
+  );
+});
+
 describe("App presence column (glass redesign)", () => {
   beforeEach(() => {
     readAppConfig.mockReset().mockResolvedValue(baseConfig("nell"));

@@ -232,7 +232,7 @@ def test_migrate_writes_emotion_vocabulary(tmp_path: Path, monkeypatch: pytest.M
             "memory_type": "conversation",
             "domain": "us",
             "created_at": "2024-01-01T00:00:00+00:00",
-            "emotions": {"body_grief": 5.0, "moonache": 3.0},
+            "emotions": {"anchor_pull": 5.0, "moonache": 3.0},
             "emotion_score": 5.0,
         },
     ]
@@ -262,14 +262,14 @@ def test_migrate_writes_emotion_vocabulary(tmp_path: Path, monkeypatch: pytest.M
     assert target.exists()
     data = json.loads(target.read_text(encoding="utf-8"))
     names = {e["name"] for e in data["emotions"]}
-    assert "body_grief" in names
+    assert "anchor_pull" in names
     assert "moonache" in names
     assert report.vocabulary_emotions_migrated == 2
 
-    # Canonical entry for body_grief
-    body_grief = next(e for e in data["emotions"] if e["name"] == "body_grief")
-    assert body_grief["decay_half_life_days"] is None
-    assert "physical form" in body_grief["description"]
+    # Canonical entry for anchor_pull
+    anchor_pull = next(e for e in data["emotions"] if e["name"] == "anchor_pull")
+    assert anchor_pull["decay_half_life_days"] is None
+    assert "gravitational draw" in anchor_pull["description"]
 
     # Placeholder for custom emotion
     moonache = next(e for e in data["emotions"] if e["name"] == "moonache")
