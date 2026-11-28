@@ -1175,6 +1175,13 @@ class ClaudeCliProvider(LLMProvider):
                 f"ClaudeCliProvider: unexpected output format: {result.stdout[:200]!r}"
             ) from exc
 
+    def open_session(self, system: str | None) -> ClaudeCliSession:
+        """A live ``claude`` process that answers one prompt at a time and forgets each before the next.
+
+        Same job as ``generate(prompt, system=system)`` called once per prompt, without paying the process start-up
+        and teardown every time. The process is started by the first prompt; the caller closes the session."""
+        return ClaudeCliSession(self, system)
+
     def probe(self, prompt: str) -> str:
         """One tiny tools-less call whose only job is to find out whether the model is usable (#448).
 
@@ -1969,6 +1976,301 @@ class ClaudeCliProvider(LLMProvider):
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+
+
+def _user_message_line(text: str) -> str:
+    """One ``--input-format stream-json`` user message as a line of stdin (ASCII-safe JSON, so no platform newline or
+    encoding issue can change it)."""
+    return json.dumps({"type": "user", "message": {"role": "user", "content": text}}) + "\n"
+
+
+class _SessionLostError(RuntimeError):
+    """The live process can no longer be trusted (it ended, sent a frame out of turn, or did not confirm a clear)."""
+
+
+class _LiveProcess:
+    """One spawned ``claude`` of a session, with the threads and the temp file that go with it."""
+
+    def __init__(self, proc: Any, frames: _queue_mod.Queue, reader: threading.Thread, stderr: _StderrDrain,
+                 files: contextlib.ExitStack, cmd: list[str]) -> None:
+        self.cmd = cmd
+        self.proc = proc
+        self.frames = frames
+        self.reader = reader
+        self.stderr = stderr
+        self.files = files
+        self.session_id: str | None = None
+        self.saw_frame = False
+
+
+class ClaudeCliSession:
+    """One live ``claude`` process that judges one prompt at a time, with everything cleared between prompts (S71).
+
+    ``generate`` is ``ClaudeCliProvider.generate`` for a caller that has many prompts under one instruction text: the
+    process (``--input-format stream-json``) stays alive, the system prompt stays, and the conversation is dropped before
+    every prompt after the first by sending ``/clear`` as its own user message and waiting for its confirmation (no model
+    call, measured in docs/cli-provider-capabilities.md). A prompt is only ever sent on a process that has just started
+    or whose clear was confirmed; otherwise the process is discarded and a fresh one takes the prompt, so no reply can
+    come from a conversation that holds an earlier prompt.
+
+    A confirmed clear is a ``result`` frame with ``num_turns`` 0 and a ``session_id`` different from the one before (the
+    id changes on every clear). A reply is a ``result`` frame with ``num_turns`` of 1 or more and the id the clear
+    confirmed. A result frame in any other place (arriving with nothing outstanding, a second one for a message, one from
+    the old conversation) discards the process. Any failure of a call discards the process and raises what
+    ``generate`` raises; the next prompt starts a fresh one. One thread uses a session at a time.
+    """
+
+    def __init__(self, provider: ClaudeCliProvider, system: str | None) -> None:
+        self._provider = provider
+        self._system = system
+        self._live: _LiveProcess | None = None
+
+    def __enter__(self) -> ClaudeCliSession:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def generate(self, prompt: str, *, persona_dir: Path | None = None) -> str:
+        shutdown_progress.abandon_gate()  # #456 (D17)
+        if cli_throttle.shutdown_requested():  # #456: a stopping bridge starts no new background call
+            raise cli_throttle.ShutdownDeferred("bridge is stopping")
+        if provider_auth.should_skip_background():  # #246
+            raise provider_auth.ProviderAuthDeferred("provider auth expired — deferred")
+        try:
+            if self._live is not None and not self._clear():
+                self._discard()
+            if self._live is None:
+                self._live = self._spawn()
+            frame = self._ask(prompt)
+            assert self._live is not None
+            model = _argv_model(self._live.cmd)  # the model this process was started with
+            cli_err = _cli_error_detail(frame, model=model)
+            if cli_err is not None:
+                raise RuntimeError(f"ClaudeCliProvider: {cli_err}")
+            log_usage(persona_dir, call_type="generate", model=model or "", frame=frame)
+            try:
+                return _text_only(frame["result"])
+            except (KeyError, TypeError) as exc:
+                raise RuntimeError(f"ClaudeCliProvider: unexpected output frame: {str(frame)[:200]!r}") from exc
+        except BaseException:
+            self._discard()  # whatever went wrong, the next prompt must not meet this conversation
+            raise
+
+    def close(self) -> None:
+        """End the process: stdin closed so the CLI leaves on its own, then reaped. Safe to call twice."""
+        live, self._live = self._live, None
+        if live is not None:
+            self._end(live, finished=True)
+
+    # -- one process ---------------------------------------------------------------------------------------------
+
+    def _spawn(self) -> _LiveProcess:
+        model = self._provider._cli_model()
+        cmd = [
+            "claude",
+            "-p",
+            "--dangerously-skip-permissions",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            model,
+        ]
+        _apply_lean_flags(cmd)  # #329: background calls get no tools at all
+        files = contextlib.ExitStack()
+        try:
+            sp_path = files.enter_context(_system_prompt_tempfile(self._system))
+            if sp_path is not None:
+                cmd.extend(["--system-prompt-file", sp_path])
+            shutdown_progress.abandon_gate()  # #456 (D17)
+            proc = subprocess.Popen(  # an OSError here propagates as it does from `generate`
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=_subprocess_env(),
+                cwd=_claude_work_dir(),  # #122: memory-free working directory
+                creationflags=_NO_WINDOW,
+                start_new_session=_OWN_SESSION,  # #456 D23
+            )
+        except BaseException:
+            files.close()  # the system prompt file of a spawn that failed
+            raise
+        frames: _queue_mod.Queue[str | object] = _queue_mod.Queue()
+
+        def _reader(stdout=proc.stdout, out_q=frames) -> None:  # type: ignore[assignment]
+            try:
+                for line in stdout:
+                    out_q.put(line)
+            finally:
+                out_q.put(_STREAM_EOF)
+
+        reader = threading.Thread(target=_reader, daemon=True)
+        reader.start()
+        # #482: stderr is read while the process runs, so a chatty CLI cannot fill the pipe and stall stdout.
+        return _LiveProcess(proc, frames, reader, _StderrDrain(proc.stderr), files, cmd)
+
+    def _end(self, live: _LiveProcess, *, finished: bool) -> None:
+        """Reap a process: every step bounded, nothing left running, the temp file removed (#482)."""
+        try:
+            if live.proc.stdin is not None:
+                live.proc.stdin.close()
+        except (OSError, ValueError):
+            pass
+        _stop_child(live.proc, finished=finished)
+        live.reader.join(timeout=_child_exit_grace_seconds())
+        live.stderr.text()  # joins the stderr drain
+        live.files.close()
+
+    def _discard(self) -> None:
+        live, self._live = self._live, None
+        if live is not None:
+            self._end(live, finished=False)
+
+    # -- one message ---------------------------------------------------------------------------------------------
+
+    def _drain_idle(self, live: _LiveProcess) -> None:
+        """While nothing is outstanding the process must be silent: a result frame (or its end) now is out of turn."""
+        while True:
+            try:
+                item = live.frames.get_nowait()
+            except _queue_mod.Empty:
+                return
+            if item is _STREAM_EOF:
+                raise _SessionLostError("the claude process ended between prompts")
+            frame = self._parse(item)
+            if frame is not None and frame.get("type") == "result":
+                raise _SessionLostError("the claude process sent a result with nothing outstanding")
+
+    def _send(self, live: _LiveProcess, text: str) -> None:
+        """Write one user message. Only called with nothing outstanding, so the child is reading, not writing."""
+        self._drain_idle(live)
+        shutdown_progress.abandon_gate()  # #456 (D17)
+        try:
+            assert live.proc.stdin is not None
+            live.proc.stdin.write(_user_message_line(text))
+            live.proc.stdin.flush()
+        except (OSError, ValueError) as exc:
+            raise _SessionLostError(f"could not write to the claude process: {exc}") from exc
+
+    @staticmethod
+    def _parse(item: object) -> dict | None:
+        try:
+            frame = json.loads(str(item).strip())
+        except _JSON_LINE_ERRORS:
+            return None
+        return frame if isinstance(frame, dict) else None
+
+    def _await_result(self, live: _LiveProcess, deadline: float) -> dict:
+        """The next ``result`` frame, by one monotonic deadline for the whole wait (not per frame)."""
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"ClaudeCliProvider: subprocess timed out after {self._provider._timeout}s")
+            try:
+                item = live.frames.get(timeout=remaining)
+            except _queue_mod.Empty:
+                continue  # the deadline check above raises
+            shutdown_progress.abandon_gate()  # #456 (D17): no frame of a killed call is acted on
+            if item is _STREAM_EOF:
+                try:
+                    rc = live.proc.wait(timeout=_child_exit_grace_seconds())
+                except subprocess.TimeoutExpired:
+                    rc = None
+                stderr_text = live.stderr.text()
+                provider_auth.note_cli_failure(stderr_text)  # #246
+                if not live.saw_frame:  # #329: failed before any frame, e.g. a rejected --tools
+                    _note_tools_flag_rejected(stderr_text)
+                raise _SessionLostError(f"ClaudeCliProvider failed (exit {rc}): {stderr_text[:200]}")
+            live.saw_frame = True
+            frame = self._parse(item)
+            if frame is not None and frame.get("type") == "result":
+                return frame
+
+    def _clear(self) -> bool:
+        """Drop the conversation. True once the CLI has confirmed it; False when it did not (the caller discards)."""
+        live = self._live
+        assert live is not None
+        try:
+            self._send(live, "/clear")
+            frame = self._await_result(live, time.monotonic() + self._provider._timeout)
+        except (_SessionLostError, TimeoutError) as exc:
+            logger.warning("claude session: the clear was not confirmed, starting a new process (%s)", exc)
+            return False
+        session_id = frame.get("session_id")
+        num_turns = frame.get("num_turns")
+        if (
+            frame.get("is_error")
+            or isinstance(num_turns, bool)
+            or num_turns != 0
+            or not isinstance(session_id, str)
+            or not session_id
+            or session_id == live.session_id
+        ):
+            logger.warning("claude session: the clear was not confirmed, starting a new process")
+            return False
+        live.session_id = session_id
+        try:
+            self._drain_idle(live)  # a reply or its duplicate that landed after the clear's own
+        except _SessionLostError as exc:
+            logger.warning("claude session: the clear was not confirmed, starting a new process (%s)", exc)
+            return False
+        return True
+
+    def _ask(self, prompt: str) -> dict:
+        """Send one prompt on the (fresh or just-cleared) process and return its reply frame."""
+        live = self._live
+        assert live is not None
+        try:
+            self._send(live, prompt)
+            frame = self._await_result(live, time.monotonic() + self._provider._timeout)
+        except _SessionLostError as exc:
+            raise RuntimeError(str(exc)) from exc
+        session_id = frame.get("session_id")
+        num_turns = frame.get("num_turns")
+        if frame.get("is_error"):
+            return frame  # the caller turns an error frame into the same RuntimeError generate raises
+        if (
+            isinstance(num_turns, bool)
+            or not isinstance(num_turns, int)
+            or num_turns < 1
+            or not isinstance(session_id, str)
+            or not session_id
+            or (live.session_id is not None and session_id != live.session_id)
+        ):
+            raise RuntimeError("ClaudeCliProvider: a result that is not the reply to this prompt")
+        live.session_id = session_id
+        return frame
+
+
+class _PerCallSession:
+    """What a provider with no live process gives a caller that judges many prompts: one ``generate`` call each."""
+
+    def __init__(self, provider: Any, system: str | None) -> None:
+        self._provider = provider
+        self._system = system
+
+    def generate(self, prompt: str) -> str:
+        return self._provider.generate(prompt, system=self._system)
+
+    def close(self) -> None:
+        return None
+
+
+def judge_session(provider: Any, system: str | None) -> ClaudeCliSession | _PerCallSession:
+    """The session a run uses to judge its prompts under one instruction text (S71).
+
+    The claude CLI keeps one live process, cleared between prompts; every other provider (a stub, ``FakeProvider``,
+    Ollama) has no process to keep, so each prompt is the ``generate`` call it always was."""
+    if isinstance(provider, ClaudeCliProvider):
+        return provider.open_session(system)
+    return _PerCallSession(provider, system)
 
 
 _CLI_BUILTIN_ORIGIN = "cli_builtin"

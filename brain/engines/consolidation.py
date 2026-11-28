@@ -31,12 +31,13 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 
 from brain import prompt_strings
 from brain.bridge.cli_throttle import ThrottleDeferred
+from brain.bridge.provider import judge_session
 from brain.dev_constants import MONOLOGUE_MERGE_TYPES
 from brain.emotion import engine
 from brain.emotion.vocabulary import canonical_name
@@ -223,6 +224,37 @@ def _promote_all_classifier(_cand: Memory, _context: list[Memory]) -> Decision:
     return Decision("new")
 
 
+class _JudgeSessions:
+    """The sessions one gate run judges its items in: one per instruction text (the classifier's, the re-appraiser's).
+
+    Each is opened when the first item that needs it is judged, so a kind with no item in the run opens nothing, and all
+    are closed when the run ends (``run_consolidation`` closes them on every way out). Each item is still judged on its
+    own: ``judge_session`` clears the conversation before every item after the first, so no earlier item is in context
+    (S71, L2 batch question 6). A provider with no live process judges each item with one ``generate`` call."""
+
+    def __init__(self, provider) -> None:
+        self._provider = provider
+        self._sessions: dict[str, Any] = {}
+
+    def generate(self, system: str, prompt: str) -> str:
+        session = self._sessions.get(system)
+        if session is None:
+            session = self._sessions[system] = judge_session(self._provider, system)
+        return session.generate(prompt)
+
+    def close(self) -> None:
+        """Close every session, whether or not an earlier close raised; the first error is raised after the last."""
+        sessions, self._sessions = list(self._sessions.values()), {}
+        first: BaseException | None = None
+        for session in sessions:
+            try:
+                session.close()
+            except BaseException as exc:  # noqa: BLE001 — every session gets its close; the first failure is re-raised below
+                first = first or exc
+        if first is not None:
+            raise first
+
+
 def run_consolidation(
     store: MemoryStore,
     *,
@@ -248,6 +280,9 @@ def run_consolidation(
     the raw reply as evidence) instead of promoting it. ``result.failed`` /
     ``result.quarantined`` count them.
 
+    The Haiku classifier and re-appraiser judge in one live Claude session each for the whole run (opened at the first
+    item of that kind, cleared between items, closed when the run ends on any way out); see ``_JudgeSessions``.
+
     reappraiser: Change 3's injectable importance re-appraiser. None (default)
         builds the Haiku-backed default when `provider` is given, else
         degrades to the no-op fallback (importance unchanged) — mirrors the
@@ -263,24 +298,28 @@ def run_consolidation(
         if not acquired:
             logger.debug("consolidation gate: lock contended — skipping this run")
             return ConsolidationResult(skipped=True)
-        if classifier is None:
-            if provider is not None:
-                classifier = _make_haiku_classifier(provider)
-            else:
-                logger.warning(
-                    "consolidation gate: no classifier and no provider — "
-                    "degrading to promote-all (Pass-1 dedup only)"
+        sessions = _JudgeSessions(provider)
+        try:
+            if classifier is None:
+                if provider is not None:
+                    classifier = _make_haiku_classifier(sessions)
+                else:
+                    logger.warning(
+                        "consolidation gate: no classifier and no provider — "
+                        "degrading to promote-all (Pass-1 dedup only)"
+                    )
+                    classifier = _promote_all_classifier
+            if reappraiser is None:
+                reappraiser = (
+                    _make_haiku_reappraiser(sessions, persona_dir)
+                    if provider is not None
+                    else _noop_reappraiser
                 )
-                classifier = _promote_all_classifier
-        if reappraiser is None:
-            reappraiser = (
-                _make_haiku_reappraiser(provider, persona_dir)
-                if provider is not None
-                else _noop_reappraiser
-            )
-        if emotion_tagger is None and provider is not None:
-            emotion_tagger = make_emotion_tagger(provider)
-        result = _run_locked(store, persona_dir, classifier, hebbian, salience_floor, reappraiser, emotion_tagger)
+            if emotion_tagger is None and provider is not None:
+                emotion_tagger = make_emotion_tagger(provider)
+            result = _run_locked(store, persona_dir, classifier, hebbian, salience_floor, reappraiser, emotion_tagger)
+        finally:
+            sessions.close()  # the step is over: no judge process outlives it, on any way out
     logger.info("consolidation gate run: %s", json.dumps(result.as_log()))
     return result
 
@@ -845,8 +884,8 @@ def _parse_reappraisal(raw: str, current: float) -> Reappraisal:
     return Reappraisal(float(keyed.group(1)) if keyed else current)
 
 
-def _make_haiku_reappraiser(provider, persona_dir: Path | None = None) -> Reappraiser:
-    """Build the Haiku-backed default importance re-appraiser (Change 3).
+def _make_haiku_reappraiser(sessions: _JudgeSessions, persona_dir: Path | None = None) -> Reappraiser:
+    """Build the Haiku-backed default importance re-appraiser (Change 3), judging in the run's re-appraiser session.
 
     Judges importance fresh from the memory's content in the moment it is
     re-appraised, not from how often it has been recalled: a still-relevant
@@ -867,7 +906,7 @@ def _make_haiku_reappraiser(provider, persona_dir: Path | None = None) -> Reappr
     def _reappraise(memory: Memory) -> Reappraisal:
         try:
             offered = listed_display_forms(persona_dir, memory.content)
-            raw = provider.generate(_reappraiser_user_message(memory, offered), system=prompt)
+            raw = sessions.generate(prompt, _reappraiser_user_message(memory, offered))
             return _parse_reappraisal(raw, memory.importance)
         except ThrottleDeferred:
             raise  # "not now" (expired login, shutdown): the item is retried, not consumed unchanged (#473)
@@ -1201,8 +1240,8 @@ def _fold(existing: str, addition: str) -> str:
     return f"{existing.rstrip()}\n{addition.strip()}"
 
 
-def _make_haiku_classifier(provider) -> Classifier:
-    """Build a Haiku-backed Pass-2 classifier from a generation provider.
+def _make_haiku_classifier(sessions: _JudgeSessions) -> Classifier:
+    """Build a Haiku-backed Pass-2 classifier that judges in the run's classifier session.
 
     Decision QUALITY is advisory (C16, live-only) — the gate mechanism is what
     the gating criteria verify. A failed CALL propagates (the candidate is kept for a
@@ -1219,7 +1258,7 @@ def _make_haiku_classifier(provider) -> Classifier:
         user = _classifier_user_message(cand, context)
         # The CALL is outside any try: a call that fails (a deferral, a CLI error, a timeout) means the candidate was not
         # classified, so the exception goes to the gate, which keeps the candidate for a later run (#473).
-        raw = provider.generate(user, system=prompt)
+        raw = sessions.generate(prompt, user)
         reply = raw if isinstance(raw, str) else ""
         if not reply.strip():
             raise UnusableClassifierReply("empty reply", reply)

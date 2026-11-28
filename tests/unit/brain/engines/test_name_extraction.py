@@ -21,6 +21,7 @@ from brain.engines import consolidation as cons
 from brain.engines.consolidation import (
     Decision,
     Reappraisal,
+    _JudgeSessions,
     _make_haiku_classifier,
     _make_haiku_reappraiser,
     _noop_reappraiser,
@@ -294,7 +295,7 @@ def test_classifier_reads_whole_candidate_directly(persona):
     tmp, store, hebbian, queue = persona
     provider = FakeProvider(json.dumps({"verdict": "new", "names": ["Wren"]}))
     text = _long_text("TAILWORD")
-    decision = _make_haiku_classifier(provider)(_mem(text), [])
+    decision = _make_haiku_classifier(_JudgeSessions(provider))(_mem(text), [])
     assert "TAILWORD" in provider.calls[0][0]
     assert decision == Decision("new", names=("Wren",))
 
@@ -512,7 +513,7 @@ def test_noop_reappraiser_returns_current_importance_and_no_names():
 
 def test_haiku_reappraiser_direct_call_returns_a_reappraisal():
     provider = FakeProvider('{"importance": 2, "names": ["Wren"]}')
-    got = _make_haiku_reappraiser(provider)(_mem("Bob and Wren", importance=6.0))
+    got = _make_haiku_reappraiser(_JudgeSessions(provider))(_mem("Bob and Wren", importance=6.0))
     assert got == Reappraisal(2.0, ("Wren",))
 
 

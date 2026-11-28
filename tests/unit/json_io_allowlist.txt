@@ -3,7 +3,7 @@
 
 brain/bridge/chat.py::not-file-io::1   # not-file: model-reply
 brain/bridge/persona_state.py::read::1   # held: felt-time audit first (Roy 2026-10-14)
-brain/bridge/provider.py::not-file-io::15   # not-file: subprocess
+brain/bridge/provider.py::not-file-io::17   # not-file: subprocess
 brain/bridge/provider.py::read::1   # held: #464, provider config on the chat path (guarded-change); #406/#417 merged
 brain/bridge/provider.py::write::2   # held: #464, provider config on the chat path (guarded-change); #406/#417 merged
 brain/bridge/server.py::not-file-io::3   # not-file: sqlite-or-wire

@@ -7,7 +7,7 @@ Guards that every ClaudeCliProvider argv builder:
    the list decides what she can reach (#71).
 2. Adds ``--strict-mcp-config`` to pin the session to the configured MCP server.
 
-Since #329 every ``claude -p`` spawn site (five argv builders plus the save-time probe) apply the posture through
+Since #329 every ``claude -p`` spawn site (five argv builders plus the save-time probe, and since S71 the live judge session) apply the posture through
 ``_apply_lean_flags``: the CLI's exclusive ``--tools=`` allowlist (WebSearch,WebFetch
 for chat; nothing for background ``generate()``) when the CLI supports it, then the
 disallow list and ``--strict-mcp-config``.
@@ -97,6 +97,27 @@ def _capture_argv(site: str, tmp_path) -> list[str]:
     persona.mkdir(exist_ok=True)
     tools = [{"name": "search_memories"}]
 
+    if site == "session":  # the memory-sorting step's live judge process (S71): stream-json in and out
+        reply = '{"type": "result", "is_error": false, "result": "ok", "num_turns": 1, "session_id": "s1"}\n'
+        import threading
+
+        sent = threading.Event()  # the reply comes only after the prompt was written
+        proc = _fake_popen([])
+        proc.stdin.write.side_effect = lambda _line: sent.set()
+
+        def _after_the_prompt():
+            sent.wait(5)
+            yield reply
+
+        proc.stdout = _after_the_prompt()
+        with patch("brain.bridge.provider.subprocess.Popen", return_value=proc) as popen:
+            session = provider.open_session("instructions")
+            try:
+                assert session.generate("hi") == "ok"
+            finally:
+                session.close()
+        return list(popen.call_args.args[0])
+
     if site.startswith("chat_stream"):
         with patch(
             "brain.bridge.provider.subprocess.Popen",
@@ -124,16 +145,16 @@ def _capture_argv(site: str, tmp_path) -> list[str]:
     return list(run.call_args.args[0])
 
 
-_SITES = ["generate", "probe", "chat_text", "chat_stream_tools", "chat_stream_no_tools", "chat_mcp_tools"]
+_SITES = ["generate", "probe", "session", "chat_text", "chat_stream_tools", "chat_stream_no_tools", "chat_mcp_tools"]
 
 
 @pytest.mark.parametrize("site", _SITES)
 def test_every_site_applies_the_posture(site, tmp_path):
-    """C1: background calls (generate and the save-time probe) get no built-ins at all; every chat path gets
+    """C1: background calls (generate, the save-time probe and the live judge session) get no built-ins at all; every chat path gets
     exactly the web tools. The disallow list and --strict-mcp-config stay on
     as the second layer."""
     argv = _capture_argv(site, tmp_path)
-    expected = "--tools=" if site in ("generate", "probe") else _CHAT_TOOLS
+    expected = "--tools=" if site in ("generate", "probe", "session") else _CHAT_TOOLS
     assert [a for a in argv if a.startswith("--tools")] == [expected], argv
     assert "--disallowedTools" in argv, argv
     assert "--strict-mcp-config" in argv, argv
