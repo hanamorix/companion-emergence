@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import ast
 import random
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -143,7 +144,12 @@ _MEASURES = 3
 
 
 def _cpu() -> float:
-    """This process's CPU time. Waiting (descheduled, a page fault served from disk) is not counted, wall time is (#780)."""
+    """This process's CPU time, so waiting (descheduled, a page fault served from disk) is not counted (#780).
+
+    On Windows the wall clock instead: its process CPU time only moves in timer ticks of about 15.6 ms, so a match of a few
+    ms reads as 0.0 and every ratio fails. The re-measure (``_holds``) still covers a burst there."""
+    if sys.platform == "win32":
+        return time.perf_counter()
     return time.process_time()
 
 
@@ -186,6 +192,18 @@ def _cold_pair(names_a: list[str], names_b: list[str], text: str) -> tuple[float
             kn.match_known_names(text, known)
             best[i] = min(best[i], _cpu() - t0)
     return best[0], best[1]
+
+
+@pytest.mark.no_base_failure(reason="#780 test infrastructure: checks this file's own clock choice, not brain code")
+def test_windows_times_on_the_wall_clock_because_its_cpu_clock_ticks_in_15_ms(monkeypatch) -> None:
+    import sys
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(time, "perf_counter", lambda: 123.0)
+    monkeypatch.setattr(time, "process_time", lambda: 0.0)
+    assert _cpu() == 123.0
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert _cpu() == 0.0
 
 
 @pytest.mark.no_base_failure(reason="#780 test infrastructure: checks this file's own re-measure helper, not brain code")
