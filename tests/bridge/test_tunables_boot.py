@@ -145,7 +145,7 @@ def test_a_fresh_process_boot_writes_every_registered_key_with_its_default(tmp_p
         "model.background_housekeeping": "haiku",
         "model.compaction": "haiku",
         "model.self_model_articulate": "haiku",
-        "model.attunement_detector": "claude-haiku-4-5",
+        "model.attunement_detector": "haiku",
     }
     # Every literal key registered anywhere in brain/ is in the file the real boot wrote: the boot imports every module
     # that registers one (spec s12.3, C56), so no key waits for another process to add it.

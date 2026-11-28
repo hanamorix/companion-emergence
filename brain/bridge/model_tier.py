@@ -120,10 +120,8 @@ _CLAUDE_JOBS: dict[str, tuple[str, str]] = {
         "model.self_model_articulate", "haiku",
         description="The model that puts the kindled's measured self-model into plain sentences.",
     )),
-    # The detector stays on Haiku 4.5, not the `haiku` alias (the alias moves to newer Haiku generations). The dateless id
-    # follows the newest 4.5 snapshot.
     TIER_ATTUNEMENT_DETECTOR: ("model.attunement_detector", tunables.register(
-        "model.attunement_detector", "claude-haiku-4-5",
+        "model.attunement_detector", "haiku",
         description="The model that reads recent turns to notice your current state and recurring patterns.",
     )),
 }

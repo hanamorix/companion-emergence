@@ -45,11 +45,12 @@ _DEFAULTS = {
     TIER_BACKGROUND_HOUSEKEEPING: "haiku",
     TIER_COMPACTION: "haiku",
     TIER_SELF_MODEL_ARTICULATE: "haiku",
-    TIER_ATTUNEMENT_DETECTOR: "claude-haiku-4-5",
+    TIER_ATTUNEMENT_DETECTOR: "haiku",
 }
 
 # `--model` values captured on origin/main (4d5a9381) with the same capture (a fake `claude` answering a clean frame),
-# recorded once for C27: the four Haiku jobs must run exactly what they ran there (the detector: see below). The chat and
+# recorded once for C27: the four Haiku jobs below must run exactly what they ran there (the detector ran a dated id there,
+# see below, and now runs the alias). The chat and
 # background-generative jobs ran the alias "sonnet" there and run the pinned Sonnet id now (D1, on purpose).
 _ORIGIN_MAIN_UNCHANGED = {
     TIER_BACKGROUND_CLASSIFIER: "haiku",
@@ -57,8 +58,7 @@ _ORIGIN_MAIN_UNCHANGED = {
     TIER_COMPACTION: "haiku",
     TIER_SELF_MODEL_ARTICULATE: "haiku",
 }
-# The detector ran the dated snapshot id there; the owner replaced it with the dateless `claude-haiku-4-5` (2026-10-21,
-# C27 amended): still Haiku 4.5, a different spelling, on purpose.
+# The detector ran the dated snapshot id there; it now runs the `haiku` alias like the other Haiku jobs (#831, 2026-11-27).
 _ORIGIN_MAIN_DETECTOR = "claude-haiku-4-5-20251001"
 
 _KEYS = {tier: "model." + tier.replace("-", "_") for tier in CLAUDE_TIERS}
@@ -136,12 +136,12 @@ def test_the_save_time_probe_pins_the_id_it_checks(capture_claude_argv) -> None:
     assert capture_claude_argv.last_model == "claude-opus-9"
 
 
-def test_the_detector_runs_the_dateless_haiku_4_5_id_not_the_origin_main_snapshot(
+def test_the_detector_runs_the_haiku_alias_not_the_origin_main_snapshot(
     persona_dir, capture_claude_argv
 ) -> None:
     for path in _PATHS:
         _call(ClaudeCliProvider(TIER_ATTUNEMENT_DETECTOR), path, persona_dir)
-        assert capture_claude_argv.last_model == "claude-haiku-4-5" != _ORIGIN_MAIN_DETECTOR, path
+        assert capture_claude_argv.last_model == "haiku" != _ORIGIN_MAIN_DETECTOR, path
 
 
 def test_haiku_jobs_run_what_they_ran_on_origin_main(persona_dir, capture_claude_argv) -> None:
