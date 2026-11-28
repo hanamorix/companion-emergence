@@ -608,7 +608,8 @@ def test_c6_skip_leaves_every_cadence_file_byte_identical_and_still_due(tmp_path
 
 def test_c6_inner_slot_denial_is_a_skip_not_a_run(tmp_path, stubs, monkeypatch):
     """Jobs holding their own authoritative slot (pass 2, embedding backfill,
-    the extraction backfill, maintenance, interest sweep, self-tune) that lose
+    the extraction backfill, maintenance, interest sweep, self-tune, and since
+    #839 the session snapshot, compaction, calibration and finalize) that lose
     the race after the central peek report SKIPPED: no work, no cadence advance."""
     persona_dir = _persona(tmp_path)
     _seed_all_overdue(persona_dir)
@@ -618,6 +619,7 @@ def test_c6_inner_slot_denial_is_a_skip_not_a_run(tmp_path, stubs, monkeypatch):
     skipped = {d.job for d in decisions if d.action == "skipped"}
     assert skipped == {
         "pass2",
+        "session_snapshot_prune",
         "embedding_backfill",
         "cosine_floor_bootstrap",
         "rerank_floor_bootstrap",
@@ -626,12 +628,62 @@ def test_c6_inner_slot_denial_is_a_skip_not_a_run(tmp_path, stubs, monkeypatch):
         "extraction_backfill",
         "maintenance",
         "interest_sweep",
+        "compaction",
+        "daily_calibration",
         "weekly_selftune",
+        "finalize",
     }
+    for name in ("session_snapshot_prune", "compaction", "daily_calibration", "finalize"):
+        assert name not in stubs.order, name  # its model work never started
     after = _snapshot_bytes(persona_dir)
-    for name in ("maintenance", "interest_sweep", "weekly_selftune"):
+    for name in ("maintenance", "interest_sweep", "compaction", "daily_calibration", "weekly_selftune", "finalize"):
         filename = INTERVAL_JOBS[name][0]
         assert after[filename] == before[filename], name
+
+
+def test_c6_a_denied_snapshot_slot_still_prunes_empty_sessions(tmp_path, stubs, monkeypatch):
+    """#839: the snapshot half needs the slot, but the prune is indivisible (once per pass), so it runs without one."""
+    persona_dir = _persona(tmp_path)
+    pruned: list[int] = []
+    monkeypatch.setattr(supervisor, "prune_empty_sessions", lambda **_k: pruned.append(1) or [])
+    monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _denying_slot)
+    (job,) = [j for j in _real_jobs(persona_dir) if j.name == "session_snapshot_prune"]
+    assert job.run() is JobOutcome.SKIPPED
+    assert "session_snapshot_prune" not in stubs.order and pruned == [1]
+
+
+@pytest.mark.parametrize(
+    ("job_name", "leaf", "ret"),
+    [
+        ("session_snapshot_prune", "snapshot_stale_sessions", []),
+        ("compaction", "_run_compaction_tick", False),
+        ("daily_calibration", "_run_calibration_tick", True),
+        ("finalize", "_run_finalize_tick", False),
+    ],
+)
+def test_c6_the_model_work_of_each_job_runs_while_it_holds_the_slot(tmp_path, stubs, monkeypatch, job_name, leaf, ret):
+    """#839: these four make background CLI calls, so their work runs inside `cli_throttle.background_slot()`."""
+    persona_dir = _persona(tmp_path)
+    held = [False]
+    seen: list[bool] = []
+
+    @contextmanager
+    def _held_slot(*, now=None):  # noqa: ARG001
+        held[0] = True
+        try:
+            yield True
+        finally:
+            held[0] = False
+
+    def _leaf(*_a, **_k):
+        seen.append(held[0])
+        return ret
+
+    monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _held_slot)
+    monkeypatch.setattr(supervisor, leaf, _leaf)
+    (job,) = [j for j in _real_jobs(persona_dir) if j.name == job_name]
+    job.run()
+    assert seen == [True]
 
 
 def test_c6_calibration_deferred_for_a_busy_session_does_not_advance(tmp_path, stubs, monkeypatch):
