@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import brain.bridge.provider as provider_mod
-from brain.bridge import cli_throttle
+from brain.bridge import cli_throttle, shutdown_progress
 from brain.bridge.provider import (
     ClaudeCliProvider,
     ClaudeCliSession,
@@ -171,12 +171,83 @@ def test_a_spawn_failure_raises_the_os_error_generate_raises_and_leaves_no_file_
     assert paths and not Path(paths[0]).exists()
 
 
+def test_the_process_starts_in_its_own_session_with_the_same_spawn_as_generate(tmp_path, monkeypatch):
+    fake, session = _session(tmp_path, monkeypatch)
+    real_popen = provider_mod.subprocess.Popen
+    seen: list[dict] = []
+
+    def _recording(cmd, **kwargs):
+        seen.append({"cmd": list(cmd), **kwargs})
+        return real_popen(cmd, **kwargs)
+
+    monkeypatch.setattr(provider_mod.subprocess, "Popen", _recording)
+    with session:
+        session.generate("item 1")
+    (spawn,) = seen
+    assert spawn["start_new_session"] is True  # D23: a terminal Ctrl-C reaches the bridge only
+    assert spawn["cwd"] == str(tmp_path) and "CAVEMAN_DEFAULT_MODE" in spawn["env"]
+    cmd = spawn["cmd"]
+    assert cmd[:3] == ["claude", "-p", "--dangerously-skip-permissions"]
+    assert cmd[cmd.index("--model") + 1] == provider_mod.model_for_tier(provider_mod.TIER_INTERACTIVE_CHAT)
+    assert "--strict-mcp-config" in cmd and "--tools=" in cmd and "--system-prompt-file" in cmd
+
+
 def test_a_stopping_bridge_defers_before_any_process_is_started(tmp_path, monkeypatch):
     fake, session = _session(tmp_path, monkeypatch)
     monkeypatch.setattr(cli_throttle, "shutdown_requested", lambda: True)
     with pytest.raises(cli_throttle.ShutdownDeferred):
         session.generate("x")
     assert fake.events("spawn") == []
+
+
+def test_a_reply_of_the_old_conversation_arriving_after_the_clear_is_never_taken_as_the_reply(tmp_path, monkeypatch):
+    fake, session = _session(tmp_path, monkeypatch, mode="echo,stale_before_answer")
+    with session:
+        first = session.generate("item 1")
+        with pytest.raises(RuntimeError, match="not the reply"):  # the stale frame came before the real answer
+            session.generate("item 2")
+        third = session.generate("item 3")
+    assert _held(first) == ["item 1"] and _held(third) == ["item 3"]
+    assert not any(_pid_alive(s["pid"]) for s in fake.events("spawn"))  # the process that sent it was discarded
+    assert len(fake.events("spawn")) == 2
+
+
+def test_a_second_clear_style_result_before_the_answer_is_never_taken_as_the_reply(tmp_path, monkeypatch):
+    fake, session = _session(tmp_path, monkeypatch, mode="echo,zero_turn_before_answer")
+    with session:
+        session.generate("item 1")
+        with pytest.raises(RuntimeError, match="not the reply"):
+            session.generate("item 2")
+        third = session.generate("item 3")
+    assert _held(third) == ["item 3"] and len(fake.events("spawn")) == 2
+
+
+def test_a_clear_answered_with_an_error_frame_is_not_trusted(tmp_path, monkeypatch):
+    fake, session = _session(tmp_path, monkeypatch, mode="echo,clear_error")
+    with session:
+        replies = [session.generate(f"item {n}") for n in (1, 2)]
+    assert [_held(r) for r in replies] == [["item 1"], ["item 2"]]
+    assert len(fake.events("spawn")) == 2
+
+
+def test_an_expired_login_defers_before_any_process_is_started(tmp_path, monkeypatch):
+    fake, session = _session(tmp_path, monkeypatch)
+    monkeypatch.setattr(provider_mod.provider_auth, "should_skip_background", lambda: True)
+    with pytest.raises(provider_mod.provider_auth.ProviderAuthDeferred):
+        session.generate("x")
+    assert fake.events("spawn") == []
+
+
+def test_the_hard_exit_gate_is_checked_before_a_send_after_a_wait_and_after_the_call(tmp_path, monkeypatch):
+    fake, session = _session(tmp_path, monkeypatch)
+    calls: list[int] = []
+    monkeypatch.setattr(shutdown_progress, "abandon_gate", lambda: calls.append(1))
+    with session:
+        session.generate("item 1")
+        first_call = len(calls)
+        session.generate("item 2")
+    # spawn, send, wait (at least one frame), end of call: the second call also sends a clear and waits for it.
+    assert first_call >= 4 and len(calls) - first_call >= 7
 
 
 def test_judge_session_gives_a_live_session_only_to_the_claude_cli_provider(tmp_path, monkeypatch):

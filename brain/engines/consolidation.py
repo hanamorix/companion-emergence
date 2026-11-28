@@ -249,7 +249,7 @@ class _JudgeSessions:
         for session in sessions:
             try:
                 session.close()
-            except BaseException as exc:  # noqa: BLE001 — every session gets its close; the first failure is re-raised below
+            except BaseException as exc:  # noqa: BLE001  every session gets its close; the first failure is re-raised below
                 first = first or exc
         if first is not None:
             raise first

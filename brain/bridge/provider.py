@@ -2056,6 +2056,8 @@ class ClaudeCliSession:
         except BaseException:
             self._discard()  # whatever went wrong, the next prompt must not meet this conversation
             raise
+        finally:
+            shutdown_progress.abandon_gate()  # #456 (D17): no answer, and no failure, of a killed call is acted on
 
     def close(self) -> None:
         """End the process: stdin closed so the CLI leaves on its own, then reaped. Safe to call twice."""

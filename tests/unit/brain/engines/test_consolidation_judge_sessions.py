@@ -56,6 +56,10 @@ def _run(tmp, store, heb, **kw):
     )
 
 
+def _contents(store) -> list[str]:
+    return sorted(r[0] for r in store._conn.execute("SELECT content FROM memories"))
+
+
 def _alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -141,6 +145,27 @@ def test_the_sessions_are_closed_when_the_run_is_killed_by_a_base_exception(pers
     assert len(fake.events("exit")) == 1
 
 
+def test_an_item_whose_session_reply_is_refused_is_kept_and_the_next_run_judges_it_on_a_fresh_process(
+    persona, tmp_path, monkeypatch
+):
+    tmp, store, heb, queue = persona
+    fake = install(tmp_path, monkeypatch, mode="stale_before_answer")
+    for text in (A, B):
+        queue.enqueue(_mem(text), source="dream")
+
+    _run(tmp, store, heb)  # A is judged; B's reply is preceded by a stale frame, so B is refused and kept
+
+    assert _contents(store) == [A]
+    assert not any(_alive(s["pid"]) for s in fake.events("spawn"))
+    _run(tmp, store, heb)  # B goes to a fresh process
+
+    assert _contents(store) == sorted([A, B])
+    assert all(len(a["held"]) == 1 for a in fake.answers())
+    assert len(fake.events("spawn")) == 2
+    assert not any(_alive(s["pid"]) for s in fake.events("spawn"))
+
+
+@pytest.mark.no_base_failure(reason="control: a provider with no live process keeps the one-generate-call-per-item behaviour the base code has, so this passes on base by design; the tests above are the ones that bite")
 def test_a_provider_that_is_not_the_claude_cli_judges_each_item_with_one_generate_call(persona):
     tmp, store, heb, queue = persona
     for text in (A, B):

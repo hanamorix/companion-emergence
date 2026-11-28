@@ -10,10 +10,13 @@ one JSON line, so a test can see what each process held when it answered.
 Behaviour switches (environment, set by `install`):
   FAKE_SESSION_MODE   comma list of: echo (the reply is the JSON of the history the fake holds), swallow_clear (a `/clear`
                       is confirmed with the OLD session id and the history is kept), late_clear (the clear's result is
-                      delayed), dup_result (an extra result frame follows the first answer), no_reset_frames.
+                      delayed), dup_result (an extra result frame follows the first answer), no_reset_frames,
+                      clear_error (the clear is answered with an error frame), stale_before_answer (the first answer after
+                      a clear is preceded by a reply of the OLD conversation: old session id), zero_turn_before_answer (it
+                      is preceded by a second clear-style result with the new id and num_turns 0).
   FAKE_SESSION_DIE_AFTER  exit after writing the Nth answer (the process dies between items).
 A prompt containing FAIL is answered with an error frame ("boom"); one containing HANG is never answered (non-result frames
-trickle until stdin closes); one containing LATE_STALE gets its reply followed by a second reply for the same message.
+trickle until stdin closes).
 A non-session call (`--output-format json`, prompt on stdin) is answered once with a json result, as `generate` expects.
 """
 
@@ -71,22 +74,31 @@ def _main() -> None:
                 "result": text, "num_turns": num_turns, "session_id": session_id, "duration_api_ms": 1,
                 "total_cost_usd": 0, "usage": {}}
 
+    old_session_id: str | None = None  # the id the conversation had before the last clear
+    after_clear = False
     for line in sys.stdin:
         content = json.loads(line)["message"]["content"]
         if content == "/clear":
             log(event="clear", held=list(history))
             if "swallow_clear" not in modes:
                 history = []
-                session_id = str(uuid.uuid4())
+                old_session_id, session_id = session_id, str(uuid.uuid4())
+            after_clear = True
             if "no_reset_frames" not in modes:
                 out({"type": "conversation_reset", "trigger": "clear", "session_id": session_id})
                 out({"type": "system", "subtype": "init", "session_id": session_id})
             if "late_clear" in modes:
                 time.sleep(0.4)
-            out(result(num_turns=0, text=""))
+            out(result(num_turns=0, text="", is_error="clear_error" in modes))
             continue
         history.append(content)
         log(event="message", held=list(history))
+        if after_clear and "stale_before_answer" in modes and old_session_id is not None:
+            # A reply of the OLD conversation, arriving after the clear was confirmed and the next prompt was sent.
+            out({**result(num_turns=1, text="STALE REPLY"), "session_id": old_session_id})
+        if after_clear and "zero_turn_before_answer" in modes:
+            out(result(num_turns=0, text="STALE CLEAR CONFIRMATION"))
+        after_clear = False
         if "HANG" in content:
             while True:
                 out({"type": "system", "subtype": "hook_progress", "session_id": session_id})
@@ -100,7 +112,7 @@ def _main() -> None:
         answered += 1
         log(event="answer", held=list(history))
         out(result(num_turns=1, text=reply))
-        if ("dup_result" in modes and answered == 1) or "LATE_STALE" in content:
+        if "dup_result" in modes and answered == 1:
             out(result(num_turns=1, text=reply))
         if die_after and answered >= die_after:
             log(event="died")
