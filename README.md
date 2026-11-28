@@ -49,7 +49,7 @@ This is the other thing.
 |---|---|---|
 | **Memory** | per-session context window | persistent SQLite store with Hebbian edges between memories |
 | **Emotional state** | none, or single mood string | weighted vector across dozens of emotions, decays + shifts over time |
-| **Body** | none | energy, words-this-session, hours-since-rest, body-emotions like arousal + grief + comfort-seeking |
+| **Body** | none | energy, hours-since-rest, body-emotions like arousal + grief + comfort-seeking |
 | **Off-conversation behaviour** | none — exits when you close the tab | dreams nightly, runs reflex arcs on emotional thresholds, researches threads, journals privately |
 | **Creative voice** | system prompt, static | a fingerprint that grows from the conversations you have together |
 | **Data location** | vendor servers | your machine, owner-only file permissions, nothing phones home |

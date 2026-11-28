@@ -2,16 +2,17 @@
 
 Spec: docs/source-spec/2026-04-29-body-state-design.md §3.1.
 
-The session, words and contact-gap rules, the clamps and the exhaustion derivation are tested here through
-`body_state_from_short`, the one function that builds a body state. Which feelings count as high is the engine's
-predicate (`feels_high`); its per-feeling effects are in test_body_state_from_short.py.
+The contact-gap rules, the clamps, the saved energy level passing through unrounded and the absence of any exhaustion reading are
+tested here through `body_state_from_short`, the one function that builds a body state. The energy is the level felt
+time saved, handed in by the caller (#650). Which feelings count as high is the engine's predicate (`feels_high`); its
+per-feeling effects are in test_body_state_from_short.py.
 
 Spec section 7 (inviolate property 4): "the body projection blocks chat composition because it's slow: pure function,
 sub-ms. No I/O. No LLM call." The spec asked for a timing test; a wall-clock budget cannot tell a fast I/O call from a
 pure one and flakes under load (removed in #540), so the property is held structurally by the last two tests: the
 module imports only pure modules and calls nothing that does I/O (static, branch-independent), and running the
 function over a grid that reaches every branch of the projection fires no I/O audit event (behaviour). The inputs
-the caller reads (store rows, session hours, words) are the caller's; they are outside the property.
+the caller reads (store rows, session hours, the saved energy level) are the caller's; they are outside the property.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ def _now() -> datetime:
 def _body(
     *high: str,
     session_hours: float = 0.0,
-    words_written: int = 0,
+    energy: float = 6.5,
     days_since_contact: float = 0.0,
 ) -> BodyState:
     """The body state with the named feelings high and every other feeling not high."""
@@ -42,7 +43,7 @@ def _body(
         {},
         feels_high=lambda name: name in high,
         session_hours=session_hours,
-        words_written=words_written,
+        energy=energy,
         days_since_contact=days_since_contact,
         now=_now(),
     )
@@ -50,9 +51,8 @@ def _body(
 
 def test_body_state_to_dict_shape():
     bs = BodyState(
-        energy=8,
+        energy=8.0,
         temperature=4,
-        exhaustion=0,
         session_hours=0.0,
         days_since_contact=0.0,
         body_emotions={
@@ -69,7 +69,7 @@ def test_body_state_to_dict_shape():
     assert d["loaded"] is True
     assert d["energy"] == 8
     assert d["temperature"] == 4
-    assert d["exhaustion"] == 0
+    assert "exhaustion" not in d
     assert d["session_hours"] == 0.0
     assert d["days_since_contact"] == 0.0
     assert set(d["body_emotions"].keys()) == {
@@ -84,32 +84,17 @@ def test_body_state_to_dict_shape():
     assert d["computed_at"].endswith("+00:00") or d["computed_at"].endswith("Z")
 
 
-def test_energy_baseline_no_inputs():
-    assert _body().energy == 8
+def test_energy_is_the_given_level_unrounded_whatever_else_is_high_or_long():
+    # The projection holds no energy rule of its own: the saved level comes out as it went in, not rounded (A1).
+    assert _body(energy=6.326923076923077).energy == 6.326923076923077
+    assert _body("rest_need", "peace", session_hours=10.0, energy=2.25).energy == 2.25
+    assert isinstance(_body(energy=7.0).energy, float)
 
 
-def test_energy_session_band_60_to_120():
-    # band: -1 (>60min); continuous: -0.75 → energy 6.25 → round 6
-    assert _body(session_hours=1.5).energy == 6
-
-
-def test_energy_session_band_120_to_180():
-    # band: -2 (>120min); continuous: -1.25 → energy 4.75 → round 5
-    assert _body(session_hours=2.5).energy == 5
-
-
-def test_energy_session_band_over_180():
-    # band: -3 (>180min); continuous: -1.75 → energy 3.25 → round 3
-    assert _body(session_hours=3.5).energy == 3
-
-
-def test_energy_words_drain():
-    # band: 0 (not >60min); continuous: -0.25; words: -1.0 → energy 6.75 → round 7
-    assert _body(session_hours=0.5, words_written=2500).energy == 7
-
-
-def test_energy_clamped_at_1():
-    assert _body("rest_need", session_hours=10.0, words_written=20000).energy == 1
+def test_to_dict_rounds_the_energy_for_display_only():
+    bs = _body(energy=6.326923076923077)
+    assert bs.to_dict()["energy"] == 6.3
+    assert bs.energy == 6.326923076923077  # the level itself keeps its digits
 
 
 def test_temperature_baseline():
@@ -129,21 +114,22 @@ def test_temperature_medium_no_contact():
     assert _body(days_since_contact=4.0).temperature == 3  # 4 - 1 (>3 days)
 
 
-def test_temperature_clamped_at_1():
-    # 4 - 1 - 1 - 2 = 0 → clamp 1
-    assert _body("body_grief", "touch_hunger", days_since_contact=10.0).temperature == 1
+@pytest.mark.no_base_failure(reason="renamed from the clamp test (#652): touch_hunger alone with more than 7 days gives 1 on the base code as well; it pins the lowest reachable temperature, not a changed behaviour")
+def test_temperature_lowest_reachable_is_1():
+    # 4 - 1 (touch_hunger) - 2 (>7 days) = 1, the floor of the 1-9 range
+    assert _body("touch_hunger", days_since_contact=10.0).temperature == 1
 
 
-def test_exhaustion_derivation():
-    # energy 8 → exhaustion max(0, 7-8) = 0
-    assert _body().exhaustion == 0
+def test_the_body_state_carries_energy_alone_with_no_exhaustion_reading():
+    """#650 spec section 3: energy is the only level shown; there is no exhaustion field and no key."""
+    import dataclasses
 
-
-def test_exhaustion_high_when_energy_low():
-    bs = _body("rest_need", session_hours=10.0, words_written=20000)
-    # energy clamped at 1 → exhaustion 6
-    assert bs.energy == 1
-    assert bs.exhaustion == 6
+    names = {f.name for f in dataclasses.fields(BodyState)}
+    assert "exhaustion" not in names
+    assert {"energy", "temperature", "session_hours", "days_since_contact", "body_emotions", "computed_at"} == names
+    low = _body("rest_need", session_hours=10.0, energy=1.0)
+    assert low.energy == 1.0
+    assert "exhaustion" not in low.to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +140,7 @@ _STATE_FILE = "brain/body/state.py"
 # What the module may import: nothing that reaches a file, a socket, a process, a database, a clock-wait or a model.
 _PURE_MODULES = frozenset({"__future__", "collections.abc", "dataclasses", "datetime", "typing"})
 # A brain module may be added here only after checking that it does no I/O; it is then scanned by the same rule.
-_PURE_BRAIN_MODULES: tuple[str, ...] = ("brain.dev_constants",)  # constants only: no import but `__future__`, no call
+_PURE_BRAIN_MODULES: tuple[str, ...] = ()  # the projection imports no brain module today (it read a constant before #650)
 _FORBIDDEN_CALLS = frozenset({"__import__", "open", "input", "exec", "eval", "compile", "print"})
 
 
@@ -213,36 +199,36 @@ def test_body_state_from_short_raises_no_io_audit_event() -> None:
         _AUDIT["installed"] = True
     every = (
         "love", "joy", "grief", "peace", "belonging", "arousal", "desire", "climax", "touch_hunger", "comfort_seeking",
-        "rest_need", "body_grief",
+        "rest_need",
     )  # fmt: skip
     short = dict.fromkeys(every, 5.0)
     high_grid = [
         frozenset(),
-        frozenset(every),  # every feeling high: more than six loud, every warming and cooling feeling
+        frozenset(every),  # every feeling high: every warming and cooling feeling
         frozenset({"peace"}),
-        frozenset({"body_grief", "touch_hunger"}),
+        frozenset({"touch_hunger"}),
         frozenset({"rest_need"}),
         frozenset({"arousal", "desire", "belonging", "love", "climax"}),
     ]
     grid = [
-        (shorts, high, hours, words, days)
+        (shorts, high, hours, energy, days)
         for shorts in ({}, short)  # an empty read and a full one
         for high in high_grid
-        for hours in (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5)  # both sides of 60, 120 and 180 minutes
-        for words in (0, 5000)
+        for hours in (0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5)  # session hours (shown, not an energy input)
+        for energy in (1.0, 6.5, 10.0)  # the floor, the baseline and the top of the saved level
         for days in (0.0, 3.0, 5.0, 7.0, 40.0)  # both sides of 3 and 7 days
     ]
     now = _now()
     # One call first, outside the window: a tracer in this thread (coverage) reads and compiles state.py the first time
     # it sees it, which is not the function's own I/O.
     body_state_from_short(
-        {}, feels_high=lambda name: False, session_hours=0.0, words_written=0, days_since_contact=0.0, now=now
+        {}, feels_high=lambda name: False, session_hours=0.0, energy=6.5, days_since_contact=0.0, now=now
     )
     _AUDIT.update(events=[], thread=threading.get_ident(), on=True)
     try:
-        for shorts, high, hours, words, days in grid:
+        for shorts, high, hours, energy, days in grid:
             body_state_from_short(
-                shorts, feels_high=high.__contains__, session_hours=hours, words_written=words,
+                shorts, feels_high=high.__contains__, session_hours=hours, energy=energy,
                 days_since_contact=days, now=now,
             )
     finally:

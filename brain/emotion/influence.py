@@ -75,7 +75,7 @@ _TONE_RULES: tuple[tuple[str, float, str], ...] = (
 )
 
 
-def calculate_influence(state: EmotionalState, arousal_tier: int, energy: int) -> InfluenceHints:
+def calculate_influence(state: EmotionalState, arousal_tier: int, energy: float) -> InfluenceHints:
     """Derive provider-agnostic biasing hints from emotional + body state.
 
     Args:

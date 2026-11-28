@@ -260,8 +260,8 @@ SCHEMAS: dict[str, dict] = {
     "get_body_state": {
         "name": "get_body_state",
         "description": (
-            "Get your current body state — energy (1-10), temperature (1-9), "
-            "exhaustion (0-10), session_hours, days_since_contact with the user, "
+            "Get your current body state: energy (1-10), temperature (1-9), "
+            "session_hours, days_since_contact with the user, "
             "and the six body emotions (arousal, desire, climax, touch_hunger, "
             "comfort_seeking, rest_need)."
         ),

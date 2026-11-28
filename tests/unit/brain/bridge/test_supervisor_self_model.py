@@ -852,15 +852,18 @@ def test_cooldown_filter_prunes_directions_with_per_channel(tmp_path, emotion_en
     assert state.current_gap.directions == {"calm": -1}
 
 
-def test_live_tick_asks_the_engines_predicate_for_body_energy(tmp_path, emotion_engine_stub) -> None:
+def test_live_tick_asks_the_engines_predicate_for_the_body_projection(tmp_path, emotion_engine_stub) -> None:
     import brain.body.state as body_state
 
     persona_dir = _persona_dir(tmp_path)
+    (persona_dir / "felt_time_state.json").write_text('{"energy_level": 6.25}')
     seen: list[object] = []
+    seen_energy: list[object] = []
     real = body_state.body_state_from_short
 
     def recording(short, *, feels_high, **kwargs):
         seen.append(feels_high)
+        seen_energy.append(kwargs.get("energy"))
         return real(short, feels_high=feels_high, **kwargs)
 
     body_state.body_state_from_short = recording
@@ -873,3 +876,5 @@ def test_live_tick_asks_the_engines_predicate_for_body_energy(tmp_path, emotion_
     finally:
         body_state.body_state_from_short = real
     assert seen == [emotion_engine_stub.feels_high]
+    # The energy is the saved level, handed over unrounded (#650), not recomputed from the session.
+    assert seen_energy == [6.25]

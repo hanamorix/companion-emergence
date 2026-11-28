@@ -10,14 +10,16 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from brain import prompt_strings
+from brain import dev_constants, prompt_strings
 from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, build_tier_provider
 from brain.bridge.provider import LLMProvider
-from brain.engines._interests import Interest, InterestSet, spawn_interest
+from brain.engines._interests import Interest, InterestSet, interests_lock, spawn_interest
+from brain.engines.heartbeat import HeartbeatConfig
 from brain.engines.research_notes import append_session_notes, read_notes_tail
 from brain.engines.research_session import extract_felt_lines, parse_session_output
 from brain.health.json_io import Recovery, read_json_result, write_json
@@ -27,6 +29,7 @@ from brain.search.base import WebSearcher
 from brain.utils.emotion import format_emotion_summary
 from brain.utils.llm_output import extract_json_object
 from brain.utils.memory import days_since_human
+from brain.utils.spline import monotone_spline
 from brain.utils.time import iso_utc, parse_iso_utc
 
 logger = logging.getLogger(__name__)
@@ -55,6 +58,31 @@ _RENDER_SYSTEM_PROMPT_SEGMENTS = prompt_strings.register_segments(
 _RENDER_SYSTEM_PROMPT_SEGMENTS_LIVE = prompt_strings.register_segments(
     "engines.research.render_system_prompt_segments_live"
 )
+
+
+def opposing_threshold(opp: float) -> float:
+    """The value a high opening feeling must be strictly above for the research gate, given `opp`.
+
+    `opp` is the highest plain value (0-10) among the opposing feelings in the read (0 when none is present). The answer is
+    the monotone cubic curve through `dev_constants.RESEARCH_GATE_OPPOSING_CURVE`, built at call time (seven points cost
+    almost nothing). `feeling_half_passes` is its one caller outside tests.
+    """
+    return monotone_spline(dev_constants.RESEARCH_GATE_OPPOSING_CURVE)(opp)
+
+
+def feeling_half_passes(values: Mapping[str, float], feels_high: Callable[[str], bool]) -> bool:
+    """The research gate's feeling half: does an opening feeling in the read pass?
+
+    `values` is the read as plain values (name -> 0-10); `feels_high(name)` is the caller's "high" test. opp is the highest
+    value among `dev_constants.RESEARCH_GATE_OPPOSING_FEELINGS` present in `values` (a missing one counts as 0). The half
+    passes when some name that is not opposing has a value strictly above `opposing_threshold(opp)` and `feels_high(name)`.
+    The value test runs first, so `feels_high` is only asked about names that are above the threshold; the answer is the
+    same in either order. `ResearchEngine.run_tick` and the research row of `scripts/measure_feels_high_thresholds.py` both
+    call this one function; neither keeps its own copy of the loop.
+    """
+    opposing = dev_constants.RESEARCH_GATE_OPPOSING_FEELINGS
+    threshold = opposing_threshold(max((values.get(n, 0.0) for n in opposing), default=0.0))
+    return any(name not in opposing and value > threshold and feels_high(name) for name, value in values.items())
 
 
 def _compute_topic_overlap_via_haiku(
@@ -157,6 +185,8 @@ class ResearchEngine:
 
     pull_threshold: float = 6.0
     cooldown_hours: float = 24.0
+    # The persona's `research_days_since_human_min` (HeartbeatConfig): its callers pass it; the default is the config's own.
+    research_days_since_human_min: float = HeartbeatConfig.research_days_since_human_min
 
     def run_tick(
         self,
@@ -192,7 +222,7 @@ class ResearchEngine:
                 evaluated_at=now,
             )
 
-        # Gate: need a trigger signal (days-since-human or emotion-peak).
+        # Gate: need a trigger signal (days-since-human, or the feeling half below).
         days_since = (
             days_since_human_override
             if days_since_human_override is not None
@@ -213,13 +243,12 @@ class ResearchEngine:
             # Built through the constructor, not `.set` (which drops zeros and raises on unknown names).
             emo_state = EmotionalState(emotions=engine.short_values(live_engine.read()))
 
-        # The engine's own reading of "high" (`engine.feels_high`): the research gate holds no level of its own.
-        emotion_gate = any(live_engine.feels_high(name) for name in emo_state.emotions)
+        # The feeling half: an opening feeling (any name in the read that is not in RESEARCH_GATE_OPPOSING_FEELINGS) opens it when
+        # the engine calls it high (`live_engine.feels_high`) and its plain value is strictly above the opposing-feelings
+        # threshold; opposing feelings never open it. The rule is `feeling_half_passes`, shared with the measuring script.
+        emotion_gate = feeling_half_passes(emo_state.emotions, live_engine.feels_high)
 
-        gate_ok = (
-            days_since >= 1.5  # research_days_since_human_min default
-            or emotion_gate
-        )
+        gate_ok = days_since >= self.research_days_since_human_min or emotion_gate
         if not gate_ok:
             return ResearchResult(
                 fired=None,
@@ -383,20 +412,27 @@ class ResearchEngine:
 
             # Update interest — status flips to dormant on 'close'; 'spawn'
             # keeps this thread going while seeding tangents below.
-            new_status = "dormant" if session.verdict == "close" else winner.status
-            updated = dataclasses.replace(winner, last_researched_at=now, status=new_status)
-            interests = interests.upsert(updated)
-            for topic in session.spawn_topics:
-                interests, _ = spawn_interest(
-                    interests,
-                    topic=topic,
-                    keywords=(),
-                    why=f"tangent from {winner.topic}",
-                    origin="side_quest",
-                    now=now,
-                    pull_threshold=self.pull_threshold,
-                )
-            interests.save(self.interests_path)
+            # Applied to a fresh read under the lock: the model call above can take a while, and pass 2's spawn or the
+            # heartbeat's bump may have saved the interests meanwhile (the winner's own pull_score included).
+            with interests_lock(self.interests_path):
+                interests = InterestSet.load(self.interests_path, default_path=self.default_interests_path)
+                current = next((i for i in interests.interests if i.id == winner.id), None)
+                if current is not None:
+                    new_status = "dormant" if session.verdict == "close" else current.status
+                    interests = interests.upsert(
+                        dataclasses.replace(current, last_researched_at=now, status=new_status)
+                    )
+                for topic in session.spawn_topics:
+                    interests, _ = spawn_interest(
+                        interests,
+                        topic=topic,
+                        keywords=(),
+                        why=f"tangent from {winner.topic}",
+                        origin="side_quest",
+                        now=now,
+                        pull_threshold=self.pull_threshold,
+                    )
+                interests.save(self.interests_path)
 
             # Append log
             fire = ResearchFire(
@@ -566,7 +602,12 @@ class ResearchEngine:
                 )
                 for t in str_topics
             ]
-            InterestSet(interests=tuple(new_interests)).save(self.interests_path)
+            # The model call is over: seed only if the list is still empty (pass 2's spawn may have added one meanwhile).
+            with interests_lock(self.interests_path):
+                current = InterestSet.load(self.interests_path, default_path=self.default_interests_path)
+                if current.interests:
+                    return False
+                InterestSet(interests=tuple(new_interests)).save(self.interests_path)
             logger.info(
                 "research bootstrap: seeded %d interests from voice.md", len(new_interests)
             )

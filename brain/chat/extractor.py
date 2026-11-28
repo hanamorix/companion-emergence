@@ -387,7 +387,7 @@ def _apply_memory_writes(writes: list[MemoryWrite], persona_dir: Path) -> None:
 def _filter_to_registered(emotions: dict[str, float]) -> dict[str, float]:
     """Drop channels whose names are not in the process-global emotion registry.
 
-    Mirrors the pattern in brain/ingest/emotion_backfill.py::_normalize.
+    Mirrors the pattern in brain/ingest/emotion_tagger.py::_normalize.
     Fail-soft: on ANY error the input dict is returned unchanged so extraction
     never breaks on a vocab read error.  A debug log is emitted so the failure
     is visible without surfacing into the chat path.
@@ -428,7 +428,7 @@ def _apply_emotion_delta(delta: dict[str, float], persona_dir: Path) -> None:
     can't peg a channel (#94).
 
     Channel names are constrained to the registered emotion vocabulary first: LLM-invented names are dropped here
-    (mirrors the _normalize pattern in brain/ingest/emotion_backfill.py).
+    (mirrors the _normalize pattern in brain/ingest/emotion_tagger.py).
     """
     # PASS2-AT-LEAST-ONCE: a pass-2 crash/restart repeat (see
     # pass2_queue.py's drain_all_locked pop-after-process step) can call
@@ -454,7 +454,7 @@ def _apply_interest_candidate(candidate: InterestCandidate, persona_dir: Path) -
     `<persona_dir>/interest_spawn_state.json` keyed by UTC date; a stale or
     corrupt state file resets to a fresh day rather than failing.
     """
-    from brain.engines._interests import InterestSet, spawn_interest
+    from brain.engines._interests import InterestSet, interests_lock, spawn_interest
 
     now = datetime.now(UTC)
     state_path = persona_dir / _INTEREST_SPAWN_STATE
@@ -468,17 +468,21 @@ def _apply_interest_candidate(candidate: InterestCandidate, persona_dir: Path) -
 
     interests_path = persona_dir / "interests.json"
     default_path = Path(__file__).parent.parent / "engines" / "default_interests.json"
-    interests = InterestSet.load(interests_path, default_path=default_path)
-    interests, created = spawn_interest(
-        interests,
-        topic=candidate.topic,
-        keywords=tuple(candidate.keywords),
-        why=candidate.why,
-        origin="conversation",
-        now=now,
-    )
+    # Pass 2 runs on its own thread, beside the heartbeat's interest bump and the research and sweep steps: the read..save is
+    # one locked step so a change another writer saved meanwhile is not lost.
+    with interests_lock(interests_path):
+        interests = InterestSet.load(interests_path, default_path=default_path)
+        interests, created = spawn_interest(
+            interests,
+            topic=candidate.topic,
+            keywords=tuple(candidate.keywords),
+            why=candidate.why,
+            origin="conversation",
+            now=now,
+        )
+        if created:
+            interests.save(interests_path)
     if created:
-        interests.save(interests_path)
         state["count"] = int(state.get("count", 0)) + 1
         write_json(state_path, state, indent=None, fsync=False)
 

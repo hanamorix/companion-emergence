@@ -214,6 +214,12 @@ Storage is UTC everywhere; local time is for display only.
 |---|---|---|
 | `clamp_nonfinite` | brain/utils/finite.py:33 | Copy a nested value with every NaN/Infinity float replaced (default 0.0) and log one warning if any were replaced. |
 
+### `brain/utils/spline.py`
+
+| function | where (path:line) | what it is for |
+|---|---|---|
+| `monotone_spline` | brain/utils/spline.py:35 | Build a monotone cubic (PCHIP) curve through given (x, y) points and return it as a function: exact at the points, no overshoot between them, flat hold outside the range; raises ValueError for fewer than 2 points or x not strictly increasing. Hand-written, no scipy. |
+
 ### `brain/memory/embeddings.py`
 
 | function | where (path:line) | what it is for |

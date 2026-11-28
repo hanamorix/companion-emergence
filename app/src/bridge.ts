@@ -217,6 +217,11 @@ export interface PersonaState {
    *  keeps it until a later attempt clears the record, so the window shows it while it is non-null and cannot close it.
    *  Null/absent when there is nothing to say. Optional so older bridge builds degrade to no notice. */
   rebuild_notice?: RebuildNotice | null;
+  /** The memory-search model is being downloaded by the bridge's background thread ("downloading"), or its download failed and
+   *  it is not on this computer ("failed"); `size_gb` is the library's own figure, null when it has none. The brain keeps no
+   *  copy of this: it is read from its state on each poll, so it goes when the download succeeds. Null/absent when there is
+   *  nothing to say. Optional so older bridge builds degrade to no notice (#833). */
+  embedding_download_notice?: EmbeddingDownloadNotice | null;
   /** #456 (Q6): the supervisor's state ("restarted" with its error, or "failed"); absent on older bridges. */
   supervisor?: SupervisorInfo | null;
 }
@@ -227,6 +232,12 @@ export interface TunablesNotice {
   line: number | null;
   column: number | null;
   reason: string | null;
+}
+
+/** See `PersonaState.embedding_download_notice`. */
+export interface EmbeddingDownloadNotice {
+  state: "downloading" | "failed";
+  size_gb: number | null;
 }
 
 /** See `PersonaState.rebuild_notice`. */
@@ -261,7 +272,6 @@ export interface PendingWrite {
 export interface BodyState {
   energy: number;
   temperature: number;
-  exhaustion: number;
   session_hours: number;
   days_since_contact: number;
   body_emotions: Record<string, number>;

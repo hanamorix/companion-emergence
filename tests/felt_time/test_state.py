@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from brain.felt_time.state import (
     Anchor,
     FeltTimeState,
@@ -196,6 +198,153 @@ def test_load_seeds_arc_anchors_from_existing_arc_anchor(tmp_path):
     state, _ = load_or_recover(tmp_path)
     assert len(state.arc_anchors) == 1
     assert state.arc_anchors[0].label == "The Long Work"
+
+
+# --- body energy fields (#650 step 2, spec 1.1, 1.3, 1.6) ---------------------------------------------------------------------
+
+
+def _write_state_file(persona_dir, data):
+    (persona_dir / "felt_time_state.json").write_text(json.dumps(data))
+
+
+def test_energy_fields_start_at_the_baseline_with_no_long_average_and_no_saved_feelings():
+    from brain import dev_constants
+
+    s = FeltTimeState.cold_start()
+    assert s.energy_level == dev_constants.BODY_ENERGY_BASELINE == 6.5
+    assert s.energy_long_avg == 0.0
+    assert s.energy_long_weight == 0.0
+    assert s.energy_feelings is None
+
+
+def test_energy_fields_round_trip_unrounded(tmp_path):
+    s = FeltTimeState(
+        last_tick_ts="2026-05-17T22:00:00+00:00",
+        energy_level=6.326923076923077,
+        energy_long_avg=5.25,
+        energy_long_weight=12.5,
+        energy_feelings={"joy": 3.1415926, "grief": 0.0},
+    )
+    persist(s, tmp_path)
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is False
+    assert loaded.energy_level == 6.326923076923077
+    assert loaded.energy_long_avg == 5.25
+    assert loaded.energy_long_weight == 12.5
+    assert loaded.energy_feelings == {"joy": 3.1415926, "grief": 0.0}
+
+
+def test_missing_saved_feelings_are_absent_from_the_file_and_load_as_none(tmp_path):
+    persist(FeltTimeState(last_tick_ts="2026-05-17T22:00:00+00:00"), tmp_path)
+    assert "energy_feelings" not in json.loads((tmp_path / "felt_time_state.json").read_text())
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.energy_feelings is None
+
+
+def test_an_empty_saved_feelings_map_is_not_missing(tmp_path):
+    persist(FeltTimeState(last_tick_ts="2026-05-17T22:00:00+00:00", energy_feelings={}), tmp_path)
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.energy_feelings == {}
+
+
+def test_an_old_file_without_the_energy_fields_loads_the_defaults(tmp_path):
+    _write_state_file(tmp_path, {"lived_age_hours": 77.0, "last_tick_ts": "2026-05-17T22:00:00+00:00"})
+    loaded, recovered = load_or_recover(tmp_path)
+    assert recovered is False
+    assert loaded.lived_age_hours == 77.0
+    assert (loaded.energy_level, loaded.energy_long_avg, loaded.energy_long_weight, loaded.energy_feelings) == (6.5, 0.0, 0.0, None)
+
+
+@pytest.mark.parametrize("bad", ["7.5", None, True, float("nan"), float("inf"), [7.5], {"a": 1}])
+def test_an_unsound_energy_field_loads_as_its_default_and_does_not_raise(tmp_path, bad):
+    _write_state_file(
+        tmp_path,
+        {
+            "last_tick_ts": "2026-05-17T22:00:00+00:00",
+            "energy_level": bad,
+            "energy_long_avg": bad,
+            "energy_long_weight": bad,
+        },
+    )
+    loaded, _ = load_or_recover(tmp_path)
+    assert (loaded.energy_level, loaded.energy_long_avg, loaded.energy_long_weight) == (6.5, 0.0, 0.0)
+
+
+def test_a_negative_long_average_weight_loads_as_no_long_average(tmp_path):
+    _write_state_file(tmp_path, {"last_tick_ts": "2026-05-17T22:00:00+00:00", "energy_long_avg": 5.0, "energy_long_weight": -1.0})
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.energy_long_weight == 0.0
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["joy", [1.0], {"joy": "3"}, {"joy": None}, {"joy": float("nan")}, {"joy": True}, {"joy": 2.0, "grief": "x"}],
+)
+def test_an_unsound_saved_feelings_map_loads_as_absent(tmp_path, bad):
+    _write_state_file(tmp_path, {"last_tick_ts": "2026-05-17T22:00:00+00:00", "energy_feelings": bad})
+    loaded, _ = load_or_recover(tmp_path)
+    assert loaded.energy_feelings is None
+
+
+def test_read_energy_level_returns_the_saved_level_unrounded(tmp_path):
+    from brain.felt_time.state import read_energy_level
+
+    persist(FeltTimeState(last_tick_ts="2026-05-17T22:00:00+00:00", energy_level=6.326923076923077), tmp_path)
+    assert read_energy_level(tmp_path) == 6.326923076923077
+
+
+def test_read_energy_level_does_not_round_or_hold_a_stored_number(tmp_path):
+    from brain.felt_time.state import read_energy_level
+
+    _write_state_file(tmp_path, {"energy_level": 50.0})
+    assert read_energy_level(tmp_path) == 50.0
+    _write_state_file(tmp_path, {"energy_level": 0.25})
+    assert read_energy_level(tmp_path) == 0.25
+
+
+def test_read_energy_level_is_the_baseline_when_there_is_no_file(tmp_path):
+    from brain.felt_time.state import read_energy_level
+
+    assert read_energy_level(tmp_path) == 6.5
+
+
+@pytest.mark.parametrize("text", ["", "not json", "[1, 2]", "null", "{}", '{"lived_age_hours": 4}'])
+def test_read_energy_level_is_the_baseline_for_an_unreadable_file_or_an_absent_field(tmp_path, text):
+    from brain.felt_time.state import read_energy_level
+
+    (tmp_path / "felt_time_state.json").write_text(text)
+    assert read_energy_level(tmp_path) == 6.5
+
+
+@pytest.mark.parametrize("bad", ["7.5", None, True, float("nan"), float("inf"), [7.5]])
+def test_read_energy_level_is_the_baseline_for_an_unsound_field(tmp_path, bad):
+    from brain.felt_time.state import read_energy_level
+
+    _write_state_file(tmp_path, {"energy_level": bad})
+    assert read_energy_level(tmp_path) == 6.5
+
+
+def test_read_energy_level_is_a_light_read_that_never_rewrites_the_file(tmp_path, monkeypatch):
+    from brain.felt_time import state as state_module
+    from brain.felt_time.state import read_energy_level
+
+    def boom(*_a, **_k):
+        raise AssertionError("the accessor must not use the full loader or scan the logs")
+
+    monkeypatch.setattr(state_module, "load_or_recover", boom)
+    monkeypatch.setattr(state_module, "_newest_log_ts", boom)
+    path = tmp_path / "felt_time_state.json"
+    path.write_text("not json")
+    before = (path.read_bytes(), sorted(p.name for p in tmp_path.iterdir()))
+    assert read_energy_level(tmp_path) == 6.5
+    assert (path.read_bytes(), sorted(p.name for p in tmp_path.iterdir())) == before
+
+
+def test_the_baseline_default_is_read_at_call_time(monkeypatch):
+    from brain import dev_constants
+
+    monkeypatch.setattr(dev_constants, "BODY_ENERGY_BASELINE", 4.0)
+    assert FeltTimeState.cold_start().energy_level == 4.0
 
 
 def test_weather_shift_is_not_an_anchor_type():

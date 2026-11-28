@@ -184,7 +184,6 @@ def _drive_ticks(
         patch.object(supervisor, "_maybe_run_notes_tick", side_effect=_spy_notes),
         patch.object(supervisor, "_attunement_should_run_backfill", return_value=False),
         patch.object(supervisor, "_attunement_should_run_supplementary_backfill", return_value=False),
-        patch.object(supervisor, "_emotion_backfill_has_work", return_value=False),
         patch.object(supervisor, "_vocab_repair_should_run", return_value=False),
         patch.object(supervisor, "_soul_candidate_repair_should_run", return_value=False),
         patch(
@@ -278,31 +277,6 @@ def test_run_folded_per_tick_opens_skip_integrity_check(tmp_path):
     assert seen["store"] is mem[0]["obj"]
     # No per-session age threshold on an idle pass (S66/S72/S83).
     assert seen["silence_minutes"] == 0.0
-
-
-def test_emotion_backfill_job_reuses_the_per_tick_store(tmp_path):
-    """#132 invariant under ram-spike-fix INC-9 (stage-6 red-team MAJOR, fixed):
-    a tick on which the emotion-backfill gated job runs still opens exactly ONE
-    memories.db connection — the job is handed the per-tick shared store
-    instead of opening its own."""
-    persona_dir = _persona_dir(tmp_path)
-    seen: dict = {}
-
-    def _fake_run(persona_dir, *, provider, store=None, **_kw):
-        seen["store"] = store
-
-    result = _drive_ticks(
-        persona_dir,
-        num_ticks=1,
-        central_pass=True,
-        extra_patches=(
-            patch.object(supervisor, "_emotion_backfill_has_work", return_value=True),
-            patch.object(supervisor, "_emotion_backfill_run", side_effect=_fake_run),
-        ),
-    )
-    mem = _mem_constructions(result)
-    assert len(mem) == 1
-    assert seen["store"] is mem[0]["obj"]
 
 
 def test_maker_and_notes_reuse_the_sweeps_live_store_object(tmp_path):
@@ -437,7 +411,6 @@ def test_store_closed_before_uncaught_exception_propagates(tmp_path):
         ),
         patch.object(supervisor, "_attunement_should_run_backfill", return_value=False),
         patch.object(supervisor, "_attunement_should_run_supplementary_backfill", return_value=False),
-        patch.object(supervisor, "_emotion_backfill_has_work", return_value=False),
         patch.object(supervisor, "_vocab_repair_should_run", return_value=False),
         patch.object(supervisor, "_soul_candidate_repair_should_run", return_value=False),
         patch(
@@ -621,7 +594,7 @@ def _drive_one_maintenance_tick(persona_dir: Path, *, throttle_grants: bool):
     sidecar_spy = MagicMock()
 
     @contextmanager
-    def _fake_slot(*, now=None):
+    def _fake_slot(*, now=None, lull_required=True):
         yield throttle_grants
 
     with (
@@ -635,7 +608,6 @@ def _drive_one_maintenance_tick(persona_dir: Path, *, throttle_grants: bool):
         patch("brain.health.sidecar_sweep.sweep_stale_sidecars", sidecar_spy),
         patch.object(supervisor, "_attunement_should_run_backfill", return_value=False),
         patch.object(supervisor, "_attunement_should_run_supplementary_backfill", return_value=False),
-        patch.object(supervisor, "_emotion_backfill_has_work", return_value=False),
         patch.object(supervisor, "_vocab_repair_should_run", return_value=False),
         patch.object(supervisor, "_soul_candidate_repair_should_run", return_value=False),
         patch(
@@ -716,7 +688,7 @@ def test_forgetting_failure_does_not_skip_narrative_pass(tmp_path):
     narrative_spy = MagicMock()
 
     @contextmanager
-    def _granting_slot(*, now=None):
+    def _granting_slot(*, now=None, lull_required=True):
         yield True
 
     with (
@@ -730,7 +702,6 @@ def test_forgetting_failure_does_not_skip_narrative_pass(tmp_path):
         patch("brain.health.sidecar_sweep.sweep_stale_sidecars"),
         patch.object(supervisor, "_attunement_should_run_backfill", return_value=False),
         patch.object(supervisor, "_attunement_should_run_supplementary_backfill", return_value=False),
-        patch.object(supervisor, "_emotion_backfill_has_work", return_value=False),
         patch.object(supervisor, "_vocab_repair_should_run", return_value=False),
         patch.object(supervisor, "_soul_candidate_repair_should_run", return_value=False),
         patch(

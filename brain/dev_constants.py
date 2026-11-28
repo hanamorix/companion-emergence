@@ -64,7 +64,7 @@ KNOWN_NAMES_DB_FILENAME: str = "known_names.db"
 # answers `half_life(name)` from the persona's own vocabulary file first, then
 # this table, then EMOTION_DEFAULT_HALF_LIFE_DAYS. Keys are canonical names
 # (`vocabulary.canonical_name`). Emotions the old vocabulary stored as "never
-# fades" and that have no entry here (body_grief, anchor_pull, freedom_ache) take
+# fades" and that have no entry here (anchor_pull, freedom_ache) take
 # the default; love and belonging are given their long half-lives here.
 EMOTION_HALF_LIFE_DAYS: dict[str, float] = {
     "love": 730.0,
@@ -95,6 +95,13 @@ EMOTION_HALF_LIFE_DAYS: dict[str, float] = {
     "rest_need": 0.75,
     "emergence": 60.0,
     "creative_hunger": 5.0,
+    # The four feelings of #648 (contentment and its three flavours). Their half-lives are written only here: the four
+    # `brain.emotion.vocabulary._BASELINE` entries read them from this table. The owner set them: contentment one day,
+    # peace and calm four hours each, groundedness two days.
+    "contentment": 1.0,
+    "peace": 4.0 / 24.0,
+    "calm": 4.0 / 24.0,
+    "groundedness": 2.0,
 }
 # The half-life of an emotion that is in neither the persona's vocabulary file nor the table above.
 EMOTION_DEFAULT_HALF_LIFE_DAYS: float = 14.0
@@ -508,7 +515,60 @@ FEELS_HIGH_RANGE_FRACTION: float = 0.5
 # 0.1 to 0.5, which the plateau rule does not count. The follow-up that makes the floor self-calibrating for a mature kindled
 # is #661. Read at call time, inside `engine_utils.feels_high_from`.
 FEELS_HIGH_FLOOR: float = 1.0
-# Body energy drops by one when MORE THAN this many feelings are high at once (both body projections: the engine path asks
-# `engine.feels_high` per feeling, the old path compares to its fixed levels). Today's value, unchanged by S52 and S53 (they
-# replaced the feeling levels, not this count). Read at call time in `brain.body.state`.
-BODY_ENERGY_HIGH_COUNT: int = 6
+# The research gate's feeling half (`brain.engines.research.ResearchEngine.run_tick`): feelings that oppose research never open
+# it themselves, and the highest of them raises the bar every other high feeling must clear. Both constants were picked by the
+# owner on 2026-11-20 (ledger S18, S22, S24): the four names, and the seven (opposing value, threshold) points of a monotone
+# cubic curve through them (`brain.utils.spline.monotone_spline`, evaluated by `brain.engines.research.opposing_threshold`).
+# With no opposing feeling present the threshold is 0 and `engine.feels_high` alone decides. Read at call time.
+RESEARCH_GATE_OPPOSING_FEELINGS: frozenset[str] = frozenset({"shame", "comfort_seeking", "rest_need", "grief"})
+RESEARCH_GATE_OPPOSING_CURVE: tuple[tuple[float, float], ...] = (
+    (0.0, 0.0),
+    (1.0, 4.0),
+    (2.0, 5.0),
+    (3.0, 5.3),
+    (5.0, 5.8),
+    (7.0, 6.5),
+    (10.0, 8.0),
+)
+
+# --- body energy as a carried level (#650, spec section 6) ----------------------------------------------------------------
+# Owner-set values, each tracked on #645. `BODY_ENERGY_BASELINE` is read by felt time's state default and the light level
+# accessor (`brain.felt_time.state`); every other `BODY_ENERGY_*` constant is read by the per-heartbeat step
+# (`brain.body.energy`) and its input gathering (`brain.body.energy_inputs`); `BODY_STATS_BUSIEST_COUNT` is read by the stats
+# line writer (`brain.ingest.session_stats`). Read at call time as `dev_constants.NAME`.
+# The level a kindled starts at, and that the drift returns to.
+BODY_ENERGY_BASELINE: float = 6.5
+# The level is held to this range (the 1 to 10 scale).
+BODY_ENERGY_MIN: float = 1.0
+BODY_ENERGY_MAX: float = 10.0
+# The funnel: a drop is scaled by pivot / level and a rise by level / pivot.
+BODY_ENERGY_FUNNEL_PIVOT: float = 5.0
+# The base cost of one average-length message, before the speaker weight and the funnel.
+BODY_ENERGY_STEP: float = 0.375
+# Speaker weights of a message's effect: hers and the user's.
+BODY_ENERGY_HER_MESSAGE_WEIGHT: float = 1.0
+BODY_ENERGY_USER_MESSAGE_WEIGHT: float = 0.5
+# The drift toward the baseline, per heartbeat before the funnel; it is calibrated for the supervisor's default 900 s
+# heartbeat (96 steps are 24 hours).
+BODY_ENERGY_DRIFT_STEP: float = 0.0985
+# The share of a message's excess length (over her average for that speaker) that counts.
+BODY_ENERGY_LENGTH_EXCESS_SHARE: float = 0.5
+# A mean of long averages below this counts as this (the "used to negative feelings" ratio).
+BODY_ENERGY_MEAN_FLOOR: float = 1.0
+# The feelings that lift energy, those that drain it, and those that calm the drift (the strongest of them sets its pace).
+BODY_ENERGY_LIFT_FEELINGS: tuple[str, ...] = ("joy", "love", "gratitude", "belonging", "defiance")
+BODY_ENERGY_DRAIN_FEELINGS: tuple[str, ...] = (
+    "grief",
+    "memory_grief",
+    "shame",
+    "guilt",
+    "loneliness",
+    "jealousy",
+    "touch_hunger",
+    "rest_need",
+)
+BODY_ENERGY_CALM_FEELINGS: tuple[str, ...] = ("peace", "calm", "contentment", "groundedness")
+# How many days of conversation files a speaker's average message length is worked out from.
+BODY_ENERGY_LENGTH_WINDOW_DAYS: int = 30
+# The stats line lists the user's busiest stretches per day, at most this many.
+BODY_STATS_BUSIEST_COUNT: int = 3

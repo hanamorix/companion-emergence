@@ -80,12 +80,14 @@ from brain.bridge.shutdown import (
 )
 from brain.bridge.shutdown import REASON_UNKNOWN as _STOP_REASON_UNKNOWN
 from brain.bridge.shutdown_progress import tracked_to_thread
+from brain.chat import pass2_queue
 from brain.chat.session import (
     all_sessions,
     create_session,
     get_or_hydrate_session,
 )
 from brain.emotion import engine as emotion_engine
+from brain.emotion import vocabulary_swap
 from brain.health.alarm import compute_pending_alarms
 from brain.health.json_io import Recovery, iter_jsonl, read_json
 from brain.health.parse_failures import count_recent as count_recent_parse_failures
@@ -180,6 +182,32 @@ async def _drain_emotion_engine(persona_dir: Path) -> None:
         )
     except cli_throttle.ShutdownDeferred:
         logger.info("emotion drain not run: the bridge is stopping; the queue is left for the next drain")
+
+
+def _start_pass2_drain(s: BridgeAppState) -> None:
+    """Start pass 2's own short-lived thread when the saved queue has work (blocking: one file-locked read).
+
+    Only a bridge with its background threads on starts it (`pass2_drain_enabled`: never the test-hook bridge or a bridge built
+    with background threads off). A counted task through `start_tracked_thread`, which starts nothing once the stop has begun."""
+    if not s.pass2_drain_enabled or pass2_queue.queue_length(s.persona_dir) == 0:
+        return
+    shutdown_progress.start_tracked_thread(
+        "pass-2 drain",
+        lambda: pass2_queue.drain_in_own_thread(s.persona_dir),
+        name="pass2-drain",
+        daemon=True,
+    )
+
+
+async def _start_pass2_drain_after_reply(s: BridgeAppState) -> None:
+    """After a reply was sent: start pass 2's thread if that reply (or an earlier one) left work queued, off the event loop.
+
+    Like `_drain_emotion_engine`, only the success path calls it (a turn that failed after queuing work waits for the next
+    reply or the next start), and a refusal after the stop began is not an error (the queue stays saved)."""
+    try:
+        await tracked_to_thread("pass-2 start", _start_pass2_drain, s)
+    except cli_throttle.ShutdownDeferred:
+        logger.info("pass-2 thread not started: the bridge is stopping; the queue is left for the next start")
 
 
 def _now() -> str:
@@ -1182,6 +1210,8 @@ class BridgeAppState:
     # #456 (Q6): the supervisor's state ("running" / "restarted" / "failed" ...), shown on /health and /persona/state.
     supervisor_status: Any | None = None
     migration_thread: Any | None = None  # compaction-backlog-migration (None when background threads are off)
+    # True only on a bridge with background threads on (not the test-hook bridge): replies may start pass 2's own thread.
+    pass2_drain_enabled: bool = False
     auth_token: str | None = None
     shutdown_controller: BridgeShutdownController | None = None
     # #523: the one in-flight launch decision of GET /sessions/active (``_shared_sessions_active_task``); None when idle.
@@ -1427,6 +1457,12 @@ def build_app(
         finally:
             _vocab_store.close()
 
+        # The one-time swap of the persona's own entries for contentment, calm, peace and groundedness (#648). A start that needs a
+        # rebuild has already run it in the rebuild child (`_supervisor_rebuild_handler`), right before that rebuild; this call covers
+        # a start that needs none and a bridge started around the supervisor. The marker makes the second run a no-op. Fail-soft: it
+        # logs and never raises.
+        vocabulary_swap.run_vocabulary_swap_648(persona_dir)
+
         # No emotion-engine switch-over here (S107): the starter runs the rebuild as its own process before this bridge starts, so a
         # bridge started around the supervisor (python -m brain.bridge.runner) starts on the saved state.
 
@@ -1489,7 +1525,11 @@ def build_app(
         # Floor bootstraps (name-recall fix S85, revised; spec §2): the cosine
         # (S91: only the COSINE one) bootstrap floor is computed ONCE per
         # process, here at process start, on a daemon thread off every reply
-        # path (recall only peeks the caches). Until it finishes, the no-rerank
+        # path (recall only peeks the caches). That thread also builds the
+        # embedding model (its 2.2 GB download) whenever it is not built, floor
+        # or no floor (#833): `enable_background_embedding_build` below makes
+        # every other caller in this process take its keyword fallback until it
+        # is built instead of waiting. Until the floor exists, the no-rerank
         # path renders keyword results only. The RERANK floor bootstraps on
         # first need in the background; a failed bootstrap is retried in the
         # background on each incoming message (`respond()`, S92) and at the
@@ -1503,6 +1543,7 @@ def build_app(
                 from brain.bridge import cli_throttle as _cli_throttle
                 from brain.memory import floor_startup as _floor_startup
 
+                _floor_startup.enable_background_embedding_build(persona_dir)
                 app.state.bridge.floor_bootstrap_thread = _floor_startup.start_background(
                     persona_dir,
                     activity_marker=_cli_throttle.chat_activity_marker,
@@ -1587,6 +1628,15 @@ def build_app(
             app.state.bridge.supervisor_thread = sup_thread
             if hooks is not None:
                 hooks["start_tasks"](persona_dir)
+            else:
+                # Pass 2 runs on its own short-lived thread per reply; replies may start it from here on. One start now
+                # takes a leftover of an earlier run (or of `nell chat --no-bridge`), which would otherwise wait for the
+                # next reply.
+                app.state.bridge.pass2_drain_enabled = True
+                try:
+                    _start_pass2_drain(app.state.bridge)
+                except Exception:  # noqa: BLE001 - an optional leftover drain must never keep the bridge from starting
+                    logger.exception("pass-2 leftover drain not started; the queue stays saved")
 
         # Idle-shutdown watcher (only if requested)
         idle_task = None
@@ -3071,6 +3121,8 @@ def build_app(
             )
             # The emotion engine's drain runs after the response is sent (spec 3.1 S4), and only on this success path.
             background_tasks.add_task(_drain_emotion_engine, s.persona_dir)
+            # Pass 2's own thread for any work this reply queued (it waits for no reply in flight itself).
+            background_tasks.add_task(_start_pass2_drain_after_reply, s)
             return {
                 "session_id": sid,
                 "reply": result.content,
@@ -3326,6 +3378,7 @@ def build_app(
         # lock is released so the next turn does not wait behind a catch-up, and only on the success path.
         if drain_after_close:
             await _drain_emotion_engine(s.persona_dir)
+            await _start_pass2_drain_after_reply(s)
 
     # ── WS /events — server-push only broadcast ────────────────────────────
     @app.websocket("/events")

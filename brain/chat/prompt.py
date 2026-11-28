@@ -113,7 +113,7 @@ def build_system_message(
           consciously call `search_memories` for "remember when we talked
           about X" cases. ``user_input=None`` (or empty / too short) skips
           the block entirely.
-      5. Body block (energy/temperature/exhaustion + body emotions — spec §4)
+      5. Body block (energy, temperature and body emotions; spec §4)
       6. Recent journal block (private — spec §4.3)
       7. Recent growth block (behavioral_log — spec §4.4)
 
@@ -660,15 +660,16 @@ def _build_creative_dna_block(persona_dir: Path) -> str:
 
 
 def _build_body_block(persona_dir: Path) -> str:
-    """Render the body block: computed energy/temperature/exhaustion +
+    """Render the body block: the saved energy level, temperature +
     six body emotions inline.
 
-    Per spec §4 + §7.3 — fail-soft. Any exception during body_state_from_short,
-    the engine read, or count_words_in_session → block omitted, chat
-    continues. Token cost ~80 (raw metadata, no LLM summarization).
+    Per spec §4 + §7.3, fail-soft. Any exception during body_state_from_short
+    or the engine read → block omitted, chat continues. Token cost ~80 (raw
+    metadata, no LLM summarization).
 
-    The body is projected from the emotion engine's short averages (the recent feeling); the mood summary below
-    shows the long averages. The two differ on purpose.
+    The energy is the level felt time saved (`read_energy_level`), shown to one decimal. The rest of the body is
+    projected from the emotion engine's short averages (the recent feeling); the mood summary below shows the long
+    averages. The two differ on purpose.
 
     Inviolate properties enforced here:
     - #4 the body projection does no I/O and no LLM call (guarded by tests/unit/brain/body/test_state.py);
@@ -680,8 +681,8 @@ def _build_body_block(persona_dir: Path) -> str:
         from datetime import UTC, datetime
 
         from brain.body.state import body_state_from_short
-        from brain.body.words import count_words_in_session
         from brain.emotion import engine
+        from brain.felt_time.state import read_energy_level
         from brain.utils.memory import days_since_human
 
         live_engine = engine.engine_for(persona_dir)
@@ -694,19 +695,13 @@ def _build_body_block(persona_dir: Path) -> str:
         short = engine.short_values(live_engine.read())
         now = datetime.now(UTC)
         days = days_since_human(now=now, persona_dir=persona_dir)
-        # Chat composer doesn't track session_hours yet — passes 0.0; words
-        # falls back to 1-hour window. Bridge daemon callers will hand a real
+        # Chat composer doesn't track session_hours yet, so it passes 0.0. Bridge daemon callers will hand a real
         # value through their own composition path when SP-7 wires it.
-        words = count_words_in_session(
-            persona_dir=persona_dir,
-            session_hours=0.0,
-            now=now,
-        )
         body = body_state_from_short(
             short,
             feels_high=live_engine.feels_high,
             session_hours=0.0,
-            words_written=words,
+            energy=read_energy_level(persona_dir),
             days_since_contact=days,
             now=now,
         )
@@ -714,10 +709,7 @@ def _build_body_block(persona_dir: Path) -> str:
         return ""
 
     lines = ["── body ──"]
-    lines.append(
-        f"energy: {body.energy}/10, temperature: {body.temperature}/9, "
-        f"exhaustion: {body.exhaustion}/10"
-    )
+    lines.append(f"energy: {body.energy:.1f}/10, temperature: {body.temperature}/9")
     if body.days_since_contact > 0.5:
         lines.append(f"days since user contact: {body.days_since_contact:.1f}")
 
@@ -1040,21 +1032,21 @@ def _bump_active_entries(
     persona_dir: Path,
     seen: set[str],
     pending_ids: list[str],
-    snippet_ids: list[str],
 ) -> None:
     """Apply the recall-counter ticks for the rendered "active:" entries.
 
     Render-loop rule (#231 consolidation): the bump follows the ACTUAL render.
     A row rendered FULL goes through the one `open_memory` door (+1.0 and
-    last_accessed_at, one engine report, per-id enqueue via ``pending_ids`` when
-    persona_dir is set). A row rendered as a snippet takes the shared rank-weighted
-    fractional bump (`_snippet_bump_amount`: 0.8 top -> 0.1 bottom over the
-    snippet rows in rendered order; a lone snippet -> 0.8) and its id joins
-    ``snippet_ids`` for the caller's one batched enqueue. When
-    `SNIPPET_MODE_ENABLED` is off every row renders full, so every row goes
-    through the door. ``seen`` is the ONE per-turn dedup set across every tier,
-    so a memory is bumped/enqueued once per turn (a memory found by both the
-    semantic and keyword paths is one entry, at its semantic tier: one bump).
+    last_accessed_at, one engine report, and its id joins ``pending_ids`` for
+    the caller's one batched re-check enqueue). A row rendered as a snippet
+    takes the shared rank-weighted fractional bump (`_snippet_bump_amount`:
+    0.8 top -> 0.1 bottom over the snippet rows in rendered order; a lone
+    snippet -> 0.8) and nothing else: it is not opened in full, so it is not
+    queued for a re-check (S72, invariant I5). When `SNIPPET_MODE_ENABLED` is
+    off every row renders full, so every row goes through the door. ``seen``
+    is the ONE per-turn dedup set across every tier, so a memory is bumped
+    once per turn (a memory found by both the semantic and keyword paths is
+    one entry, at its semantic tier: one bump).
     """
     for mem, full in entries:
         if full or not SNIPPET_MODE_ENABLED:
@@ -1074,7 +1066,6 @@ def _bump_active_entries(
             continue
         seen.add(mem.id)
         store.bump_recall(mem.id, _snippet_bump_amount(i, n_snip))
-        snippet_ids.append(mem.id)
 
 
 def _build_recall_block(
@@ -1523,20 +1514,20 @@ def _build_recall_block(
 
     # ONE per-turn dedup set threaded through EVERY passive tier (#231
     # consolidation, reconciliation D): the active tier (semantic + keyword,
-    # merged) and the fading tier both consult/extend it, so a memory opened
-    # once is bumped/enqueued once across the whole turn.
+    # merged) and the fading tier both consult/extend it, so a memory is
+    # bumped once across the whole turn and opened (and queued) at most once.
     seen: set[str] = set()
 
     # Collector for every full-open id surfaced this turn, across every tier
-    # (active full renders, fading-rendered-full).
+    # (active full renders, fading-rendered-full): the only ids queued for a
+    # re-check (S72, invariant I5: a memory opened in full).
     # `open_memory` appends to this instead of enqueuing immediately; flushed
     # with ONE batched `enqueue_reappraisals` call near the end of this
     # function, restoring the pre-consolidation (4c916b24) batched write
     # instead of one file-lock/open/append per full-open id (#231 follow-up).
     full_open_ids: list[str] = []
-    snippet_enqueue_ids: list[str] = []
 
-    # Crash-safety (#231): the batched reappraisal flushes for this pass live
+    # Crash-safety (#231): the batched reappraisal flush for this pass lives
     # in a `finally` so ids collected before a mid-pass exception are still
     # enqueued. The pre-consolidation code enqueued each id immediately as it
     # surfaced, so it was crash-safe; batching the writes (4c916b24 follow-up)
@@ -1557,7 +1548,6 @@ def _build_recall_block(
                 persona_dir=persona_dir,
                 seen=seen,
                 pending_ids=full_open_ids,
-                snippet_ids=snippet_enqueue_ids,
             )
 
         lines = ["recall"]
@@ -1590,19 +1580,16 @@ def _build_recall_block(
         # --- Passive recall bumps + reappraisal enqueues (#231 consolidation) ---
         # The render-loop rule replaces the old scattered per-tier gating: a row
         # rendered in FULL goes through the one door (`open_memory`: +1.0 and
-        # last_accessed_at, one engine report, per-id enqueue when persona_dir is set), a genuine
-        # snippet takes the rank-weighted fractional bump and is folded into one
-        # batched enqueue. `seen` (created before the active tier is rendered and
-        # threaded through it and the fading tier) dedups every id across every
-        # tier this turn, so a memory opened once is bumped/enqueued once.
+        # last_accessed_at, one engine report, and its id joins `full_open_ids`
+        # for the one batched enqueue), a genuine snippet takes the rank-weighted
+        # fractional bump and nothing else (it is not opened in full, so it is
+        # not queued for a re-check: S72, invariant I5). `seen` (created before
+        # the active tier is rendered and threaded through it and the fading
+        # tier) dedups every id across every tier this turn, so a memory is
+        # bumped once and opened at most once.
         #
-        # Behaviour preservation (SNIPPET_MODE_ENABLED True, production): full-open
-        # ids -> +1.0, snippet/fading ids -> the identical fractional-by-rank amount,
-        # and the enqueue SET is unchanged (every surfaced id once). The only
-        # intended deltas are on the flag-OFF path, which now becomes correct by
-        # construction: a fading/semantic-snippet row rendered full (because snippet
-        # mode is off) is bumped and enqueued through the door instead of being
-        # silently skipped.
+        # With SNIPPET_MODE_ENABLED off (a flag-off path), a fading/semantic-snippet
+        # row is rendered full, so it is bumped and enqueued through the door.
 
         # FADING tier renders on EVERY branch, always `_recall_snippet(mem,
         # full=False)`, so `rendered_full` here is exactly `not SNIPPET_MODE_ENABLED`.
@@ -1616,7 +1603,6 @@ def _build_recall_block(
             if SNIPPET_MODE_ENABLED:
                 seen.add(mem.id)
                 store.bump_recall(mem.id, _snippet_bump_amount(i, n_fade))
-                snippet_enqueue_ids.append(mem.id)
             else:
                 open_memory(
                     mem,
@@ -1637,20 +1623,15 @@ def _build_recall_block(
                 persona_dir=persona_dir,
                 seen=seen,
                 pending_ids=full_open_ids,
-                snippet_ids=snippet_enqueue_ids,
             )
     finally:
-        # Two batched reappraisal enqueues cover every surfaced id exactly once
-        # (restored batching, #231 follow-up matching 4c916b24's single combined
-        # write per pass), and now fire even on a mid-pass exception:
-        #   - `full_open_ids`: every full-open id from every tier this turn
-        #     (active full renders, fading-rendered-full), collected via
-        #     `open_memory`'s `pending_ids` sink.
-        #   - `snippet_enqueue_ids`: the genuine-snippet ids (active snippets,
-        #     semantic and keyword alike, and the fading tier).
-        # Together every surfaced id is enqueued exactly once. Order: full-open
-        # ids first, then snippet ids.
-        # Each flush is guarded so a failure here cannot mask the original
+        # ONE batched reappraisal enqueue covers every memory opened in full this
+        # turn (restored batching, #231 follow-up matching 4c916b24's single
+        # combined write per pass), and fires even on a mid-pass exception:
+        # `full_open_ids` holds every full-open id from every tier (active full
+        # renders, fading-rendered-full), collected via `open_memory`'s
+        # `pending_ids` sink. A snippet is never in it (S72, invariant I5).
+        # The flush is guarded so a failure here cannot mask the original
         # exception or crash (fail-soft, matching this module's convention).
         if full_open_ids:
             from brain.memory.pending import PendingQueue
@@ -1659,14 +1640,6 @@ def _build_recall_block(
                 PendingQueue(persona_dir).enqueue_reappraisals(full_open_ids, source="recall")
             except Exception:  # noqa: BLE001
                 log.exception("_build_recall_block: full-open reappraisal flush failed")
-
-        if snippet_enqueue_ids:
-            from brain.memory.pending import PendingQueue
-
-            try:
-                PendingQueue(persona_dir).enqueue_reappraisals(snippet_enqueue_ids, source="recall")
-            except Exception:  # noqa: BLE001
-                log.exception("_build_recall_block: snippet reappraisal flush failed")
 
     return "\n".join(lines)
 

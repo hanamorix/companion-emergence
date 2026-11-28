@@ -123,12 +123,13 @@ def test_c3_2_row_already_missing_at_read_is_skipped(tmp_path):
 
 
 # --------------------------------------------------------------------------- C3.3
-def test_c3_3_recall_enqueues_for_full_inject_and_snippet_union_not_inline(tmp_path):
-    """Exercising the recall-block hook enqueues a re-appraise request for
-    BOTH a full-inject (full_ids) and a snippet (bump_targets) surfaced
-    memory id (finding #5), and does NOT invoke any appraiser/provider
-    inline: importance is bit-for-bit unchanged immediately after the call
-    (appraisal only ever happens later, at the gate's own tick)."""
+def test_c3_3_recall_enqueues_only_the_full_inject_not_inline(tmp_path):
+    """Exercising the recall-block hook enqueues a re-appraise request for a
+    memory opened in full (full_ids) and none for a snippet (bump_targets)
+    surfaced memory (S72, invariant I5), and does NOT invoke any
+    appraiser/provider inline: importance is bit-for-bit unchanged
+    immediately after the call (appraisal only ever happens later, at the
+    gate's own tick)."""
     store = MemoryStore(tmp_path / "memories.db")
     hi = _mem("lighthouse beacon primary marker signal", importance=9.5)  # -> full_ids
     lo = _mem("lighthouse beacon secondary marker signal", importance=2.0)  # -> bump_targets
@@ -137,6 +138,7 @@ def test_c3_3_recall_enqueues_for_full_inject_and_snippet_union_not_inline(tmp_p
 
     block = _build_recall_block(store, "lighthouse beacon marker", persona_dir=tmp_path)
     assert block.strip() != ""
+    assert lo.id in block  # the snippet surfaced, yet is not queued below
 
     # Enqueue-only: no inline appraisal happened — importance untouched.
     assert store.get(hi.id, bump=False).importance == pytest.approx(9.5)
@@ -147,7 +149,7 @@ def test_c3_3_recall_enqueues_for_full_inject_and_snippet_union_not_inline(tmp_p
         e["memory_id"] for e in entries if e.get("_route") == "reappraise_importance"
     }
     assert hi.id in reappraise_ids
-    assert lo.id in reappraise_ids
+    assert lo.id not in reappraise_ids
     store.close()
 
 

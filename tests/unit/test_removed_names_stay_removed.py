@@ -785,6 +785,55 @@ REMOVED: tuple[Removed, ...] = (
             "brain/memory/store.py",
         ),
     ),
+    # --- the predefined `body_grief` feeling (#652) -----------------------------------------------------------------------
+    Removed(
+        names=("body_grief",),
+        why="a feeling like this comes from the kindled naming it herself, so it is not predefined: it left the migrator's canonical personal-emotions list and the body temperature rule; a persona whose memories carry it keeps it as an ordinary feeling through the vocabulary repair",
+        ref="#652 (draft PR #656)",
+        kind="code",
+    ),
+    # --- the research gate's emotion setting (#653) ------------------------------------------------------------------------
+    Removed(
+        names=("research_emotion_threshold",),
+        why="the research gate asks the emotion engine's own reading of high (`feels_high`) and holds no level of its own, so the setting had no reader and left HeartbeatConfig; an old heartbeat_config.json that still holds the key loads and drops it on the next save",
+        ref="#653 (draft PR #656)",
+        kind="code",
+    ),
+    # --- the emotion backfill job (#747) -----------------------------------------------------------------------------------
+    Removed(
+        names=(
+            "run_emotion_backfill",
+            "has_emotion_backfill_work",
+            "should_run_emotion_backfill",
+            "EmotionBackfillState",
+            "_make_default_tagger",
+            "has_active_without_emotions",
+            "emotion_backfill",
+            "emotion_backfill_state.json",
+            "emotion_backfill_budget.json",
+        ),
+        why="the emotion backfill is a step of the consolidation gate (a written or recalled memory without feelings is tagged by `tag_if_feelingless`), so the idle job with its cursor, daily cap, pacing, yield-to-chat and two state files is gone; the tagger now lives in brain/ingest/emotion_tagger.py and its prompt-string section is `[ingest.emotion_tagger]`",
+        ref="#747 (draft PR #656)",
+        kind="code",
+    ),
+    Removed(
+        names=("ingest.emotion_backfill",),
+        why="the tagger's prompt-string section is `[ingest.emotion_tagger]`; the old section name belonged to the removed backfill job",
+        ref="#747 (draft PR #656)",
+        scope=("brain/prompt_strings.toml", "brain/ingest/emotion_tagger.py"),
+    ),
+    Removed(
+        names=("brain/ingest/emotion_backfill.py",),
+        why="the emotion backfill module was deleted with the job (#747)",
+        ref="#747 (draft PR #656)",
+        kind="file",
+    ),
+    Removed(
+        names=("emotion_backfill",),
+        why="the app's status label for the removed emotion backfill job (#747)",
+        ref="#747 (draft PR #656)",
+        scope=("app/src",),
+    ),
     # --- the old max-pool aggregate leaves the writers' off branches (B1 PR 7), so Engine 7 can delete it ----------------
     Removed(
         names=("aggregate_state", "compute_body_state"),
@@ -813,6 +862,71 @@ REMOVED: tuple[Removed, ...] = (
         why="the stop check of the engine-lock wait: the bridge's start-up no longer rebuilds in-process, the rebuild process (`nell supervisor rebuild`) waits for the lock with no stop check and no limit (`_locked_rebuild(wait_for_lock=True)`), so the `stop_requested` parameters, the stopped-while-waiting error and the test stub's `stop_requested_seen` list went (`stop_requested_at`, the bridge's stop time, is a different name)",
         ref="Engine 6 S107 HS8 (#633, Planning B55)",
         kind="code",
+    ),
+    # --- body energy as a carried level (#650 step 2): two engine helpers made public ----------------------------------------
+    Removed(
+        names=("_fold_average", "_decay"),
+        why="the running-average fold and the weight ageing of the emotion engine became the public `fold_average` and `decay`, so body energy's long average folds with the engine's own functions instead of a copy; no private alias was left behind",
+        ref="#650 body energy, spec 1.8 (draft PR #655)",
+        kind="code",
+        scope=("brain/emotion/engine_utils.py",),
+    ),
+    # --- body energy as a carried level (#650 step 4): the old computed energy and its inputs ---------------------------------
+    Removed(
+        names=(
+            "_energy_from_flags",
+            "BODY_ENERGY_HIGH_COUNT",
+            "words_written",
+            "count_words_in_session",
+        ),
+        why="the old energy rules (baseline 8, the session-length and words-written drains, the 'more than six feelings high' drain, the rest-need drain and the peace restore) and the word count only they used; energy is the level felt time carries from heartbeat to heartbeat, every reader reads the saved level and passes it to `body_state_from_short` as `energy`",
+        ref="#650 body energy, spec 1.5 and builder note 3 (draft PR #655)",
+        kind="code",
+        scope=("brain", "scripts"),
+    ),
+    Removed(
+        names=("brain/body/words.py",),
+        why="the word counter of the old energy rules was deleted with them (#650)",
+        ref="#650 body energy, spec builder note 3 (draft PR #655)",
+        kind="file",
+    ),
+    Removed(
+        names=("BODY_ENERGY_HEARTBEAT_S",),
+        why="a second copy of the supervisor's heartbeat length that could drift from it; the energy catch-up counts closed time in the supervisor's own `heartbeat_interval_s`, handed in with the other inputs (`EnergyInputs.heartbeat_s`)",
+        ref="#650 body energy, spec 2.5 (draft PR #655)",
+        kind="code",
+        scope=("brain", "scripts"),
+    ),
+    # --- body exhaustion removed (#650 step 5) --------------------------------------------------------------------------------
+    Removed(
+        names=("_UNNAMED_EXHAUSTION_FLOOR", "exhaustion_excess", "body_exhaustion"),
+        why="the body exhaustion reading (`max(0, 7 - energy)`) was removed everywhere: energy alone is shown and drives the self-model's unnamed pressure (on at the floor 1.0); `BodyState.exhaustion`, the prompt text, the tool key and the app's bar and override went with it",
+        ref="#650 body energy, spec section 3 (draft PR #655)",
+        kind="code",
+        scope=("brain",),
+    ),
+    # --- pass 2 on its own short-lived thread (#650 bug round step 4, finding 5) -----------------------------------------------
+    Removed(
+        names=(
+            "needs_lull",
+            "exempt_slot_available",
+            "_pass2_run",
+            "_pass2_pause",
+            "_pass2_between_items",
+            "pass2_between_items",
+        ),
+        why="pass 2 is no longer a job of the central pass (#817's run on the central pass's next run, its not-idle exemption and its slot peek went with it): each reply that queued work starts one short-lived thread, `pass2_queue.drain_in_own_thread`, which waits for no reply in flight and for the background slot and never runs the heartbeat",
+        ref="#650 bug round step 4, finding 5 (draft PR #655); L2 item 32",
+        kind="code",
+        scope=("brain",),
+    ),
+    # --- recall queues a re-check only for a memory opened in full (#650 bug round step 6, S72 (b)) ---------------------------
+    Removed(
+        names=("snippet_enqueue_ids", "snippet_ids"),
+        why="recall no longer queues a re-check for a snippet-surfaced memory (a snippet is bumped fractionally, not opened in full; invariant I5): the snippet id list, its parameter on `_bump_active_entries` and its flush went; only `open_memory`'s full-open ids are queued (`SemanticSurfacing.snippet_ids` in semantic_recall.py is another thing)",
+        ref="#650 bug round step 6, S72 (b) (draft PR #655)",
+        kind="code",
+        scope=("brain/chat/prompt.py",),
     ),
 )
 

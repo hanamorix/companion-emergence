@@ -6,7 +6,7 @@ The Claude CLI can exit 0 and report the failure in the JSON payload:
 
 The non-zero-exit guard never sees those. `_cli_error_detail` was added for #92
 and wired into `chat()`, `_run_chat_stream()` and `_chat_with_mcp_tools()` — but
-`generate()` (the Haiku path: attunement detector, emotion backfill) was missed:
+`generate()` (the Haiku path: attunement detector, emotion tagger) was missed:
 the error string was handed back as the call's output and parsed as if it were
 the detector's classification JSON. (A second missed path, the image path's
 stream-json parser, was deleted with the image transport in #401.)

@@ -96,7 +96,7 @@ def test_body_block_position_between_brain_and_journal(
 
 
 def test_body_block_renders_with_no_emotions(store, soul_store, daemon_state, persona_dir):
-    """Block still renders with computed energy/temperature/exhaustion when body
+    """Block still renders with the saved energy level and the temperature when body
     emotions are all zero — the projection is the value, not the body emotions."""
     msg = build_system_message(
         persona_dir,
@@ -106,8 +106,9 @@ def test_body_block_renders_with_no_emotions(store, soul_store, daemon_state, pe
         store=store,
     )
     assert "── body ──" in msg
-    # Default energy 8 (no session, no words, no high emotional load)
-    assert "energy: 8" in msg
+    # Default energy 6.5 (nothing saved yet: the level accessor's default), shown to one decimal
+    assert "energy: 6.5/10, temperature: " in msg
+    assert "exhaust" not in msg.lower()
 
 
 def test_body_block_degrades_gracefully_on_compute_failure(

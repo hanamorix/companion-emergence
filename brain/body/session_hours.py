@@ -64,6 +64,19 @@ def _entry_timestamps(buffer: Path) -> list[datetime]:
     return stamps
 
 
+def split_into_runs(stamps: list[datetime]) -> list[list[datetime]]:
+    """Split ``stamps`` (in the order given) into runs: a gap of ``_SESSION_GAP_MINUTES`` or more between two neighbours
+    starts a new run. The one place the 30-minute rule is applied: the live session's start and the stats line's
+    sittings and stretches both call it. An empty list gives no runs."""
+    runs: list[list[datetime]] = []
+    for stamp in stamps:
+        if runs and (stamp - runs[-1][-1]).total_seconds() / 60.0 < _SESSION_GAP_MINUTES:
+            runs[-1].append(stamp)
+        else:
+            runs.append([stamp])
+    return runs
+
+
 def compute_active_session_hours(persona_dir: Path, *, now: datetime) -> float:
     """How long the *current continuous* chat session has been live, in hours.
 
@@ -100,14 +113,8 @@ def compute_active_session_hours(persona_dir: Path, *, now: datetime) -> float:
             if (now - last_ts).total_seconds() / 60.0 >= _IDLE_THRESHOLD_MINUTES:
                 continue
 
-            # Session start = head of the latest contiguous run. Walk back from
-            # the last turn; a gap >= 30 min is where the current sitting began.
-            session_start = last_ts
-            for i in range(len(stamps) - 1, 0, -1):
-                gap_minutes = (stamps[i] - stamps[i - 1]).total_seconds() / 60.0
-                if gap_minutes >= _SESSION_GAP_MINUTES:
-                    break
-                session_start = stamps[i - 1]
+            # Session start = head of the latest contiguous run.
+            session_start = split_into_runs(stamps)[-1][0]
 
             if earliest_start is None or session_start < earliest_start:
                 earliest_start = session_start

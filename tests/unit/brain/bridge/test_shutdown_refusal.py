@@ -10,7 +10,7 @@ import pytest
 
 from brain.bridge import cli_throttle
 
-_BACKGROUND_SITES = {"generate", "probe"}
+_BACKGROUND_SITES = {"generate", "probe", "session"}
 _CHAT_SITES = {"chat_text", "chat_stream_tools", "chat_stream_no_tools", "chat_mcp_tools"}
 
 
@@ -95,6 +95,8 @@ def test_background_sites_refuse_without_spawning():
             ClaudeCliProvider().generate("hi")
         with pytest.raises(cli_throttle.ShutdownDeferred):
             ClaudeCliProvider().probe("hi")
+        with pytest.raises(cli_throttle.ShutdownDeferred):
+            ClaudeCliProvider().open_session("instructions").generate("hi")
         assert not run.called and not popen.called
     with mock.patch("httpx.post") as post, mock.patch("httpx.stream") as stream:
         with pytest.raises(cli_throttle.ShutdownDeferred):

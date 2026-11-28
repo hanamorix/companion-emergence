@@ -115,6 +115,13 @@ def test_get_body_state_schema_has_optional_session_hours() -> None:
     assert props["session_hours"]["type"] == "number"
 
 
+def test_get_body_state_description_names_energy_and_no_exhaustion() -> None:
+    """#650 spec section 3: the tool's description lists the energy and no exhaustion."""
+    description = SCHEMAS["get_body_state"]["description"]
+    assert "energy (1-10)" in description
+    assert "exhaust" not in description.lower()
+
+
 def test_build_schemas_replaces_nell_with_companion_name() -> None:
     """build_schemas('Mira') must return schemas with 'Mira' instead of 'Nell'."""
     from brain.tools.schemas import build_schemas

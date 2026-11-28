@@ -1317,12 +1317,12 @@ def test_e5_an_emotions_write_during_the_reappraiser_call_is_kept(
     mem = _mem("Bob's address", "conversation", importance=3.0)  # loaded with no emotions
     store.create(mem, fold=False)
 
-    def reappraiser_while_backfill_writes(m):
+    def reappraiser_while_another_writer_lands(m):
         assert m._stored_emotions == {}  # the gate holds the stale row
-        store.update(m.id, emotions={"joy": 6.0}, fold=False)  # the emotion backfill lands meanwhile
+        store.update(m.id, emotions={"joy": 6.0}, fold=False)  # another writer puts emotions on the row meanwhile
         return Reappraisal(7.25)
 
-    res = _reappraise_run(tmp, store, mem, reappraiser=reappraiser_while_backfill_writes)
+    res = _reappraise_run(tmp, store, mem, reappraiser=reappraiser_while_another_writer_lands)
     assert res.reappraised == 1
     got = store.get(mem.id, bump=False)
     assert got._stored_emotions == {"joy": 6.0}  # not erased by a fade of the stale empty dict
@@ -1360,11 +1360,11 @@ def test_e5_the_fade_takes_emotions_from_the_reread_row_and_importance_from_the_
     mem = _mem("Bob's address", "conversation", importance=3.0)  # loaded with no emotions
     store.create(mem, fold=False)
 
-    def reappraiser_while_backfill_writes(m):
+    def reappraiser_while_another_writer_stores_emotions(m):
         store.update(m.id, emotions={"joy": 6.0}, fold=False)  # emotions land during the model call
         return Reappraisal(9.5)
 
-    _reappraise_run(tmp, store, mem, reappraiser=reappraiser_while_backfill_writes)
+    _reappraise_run(tmp, store, mem, reappraiser=reappraiser_while_another_writer_stores_emotions)
     got = store.get(mem.id, bump=False)
     assert got.importance == pytest.approx(9.5)
     assert got._stored_emotions["joy"] == pytest.approx(6.0 * (1 - 3.0 / 20))  # 5.1: fresh emotions, loaded importance

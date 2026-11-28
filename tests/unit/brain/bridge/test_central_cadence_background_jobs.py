@@ -75,12 +75,12 @@ def test_job_is_cleared_when_run_returns_paused(tmp_path: Path) -> None:
         seen_during_run.append(",".join(background_jobs.snapshot()))
         return JobOutcome.PAUSED
 
-    job = GatedJob("pass2", run=run, has_work=lambda: True)
+    job = GatedJob("session_snapshot_prune", run=run, has_work=lambda: True)
 
     decisions = _pass(tmp_path, [job])
 
-    assert seen_during_run == ["pass2"]
-    assert ("pass2", "paused") in [(d.job, d.action) for d in decisions]
+    assert seen_during_run == ["session_snapshot_prune"]
+    assert ("session_snapshot_prune", "paused") in [(d.job, d.action) for d in decisions]
     assert background_jobs.snapshot() == []
 
 
@@ -97,11 +97,11 @@ def test_only_the_currently_running_job_is_published_not_the_whole_due_set(tmp_p
         seen.append(background_jobs.snapshot())
 
     job_a = GatedJob("session_snapshot_prune", run=run_a, has_work=lambda: True)
-    job_b = GatedJob("emotion_backfill", run=run_b, has_work=lambda: True)
+    job_b = GatedJob("research_recovery", run=run_b, has_work=lambda: True)
 
     _pass(tmp_path, [job_b, job_a])  # order_jobs sorts into GATED_JOB_ORDER
 
-    assert seen == [["session_snapshot_prune"], ["emotion_backfill"]]
+    assert seen == [["session_snapshot_prune"], ["research_recovery"]]
     assert background_jobs.snapshot() == []
 
 

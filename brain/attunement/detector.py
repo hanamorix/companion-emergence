@@ -9,6 +9,7 @@ project gotchas list). No ANTHROPIC_API_KEY references here.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ from brain.attunement.schemas import (
     CurrentRead,
     DetectorOutput,
     Evidence,
+    LearnedPattern,
     PatternCandidate,
 )
 from brain.attunement.store import BufferTurn
@@ -61,16 +63,24 @@ def _build_user_message(
     reply_text: str,
     *,
     companion_name: str = "",
+    shown_patterns: Sequence[LearnedPattern] | None = None,
 ) -> str:
+    """The per-turn message. *shown_patterns* (the live call only, #830) adds a list of the learned patterns her prompt
+    could have shown, each with its id, so the ids the detector returns in addressed_pattern_ids are ones it was given."""
     if companion_name:
         reply_label = f"{companion_name.upper()}'S LATEST REPLY"
     else:
         reply_label = "LATEST REPLY"
+    patterns_block = ""
+    if shown_patterns:
+        lines = "\n".join(f"- {p.id}: {' '.join(p.description.split())}" for p in shown_patterns)
+        patterns_block = f"LEARNED PATTERNS:\n{lines}\n\n"
     return (
         "USER'S RECENT TURNS:\n"
         f"{_format_buffer(buffer_slice)}\n\n"
         f"{reply_label} (for context only, do not extract patterns from it):\n"
         f"{reply_text}\n\n"
+        f"{patterns_block}"
         "Return JSON only. No prose."
     )
 
@@ -221,8 +231,15 @@ def run_detector(
     user_name: str = "",
     user_pronouns: object = None,
     persona_dir: Path | None = None,
+    shown_patterns: Sequence[LearnedPattern] | None = None,
 ) -> DetectorOutput:
     """Run the Haiku attunement detector against a buffer slice + reply.
+
+    *shown_patterns* is the learned-pattern list offered to the model with its ids (#830). Only the live per-turn call
+    passes it, chosen by the same selection her prompt block uses and recomputed when the detector runs, so it can differ
+    from what she saw (a pattern stamped by an earlier run, or one that just matured); a pattern inside its address cooldown
+    is not offered, so naming it again does not refresh the cooldown. The start-up backfill passes none. With no list,
+    rule 6 is still in the system prompt and ids the model invents are ignored by `mark_addressed`.
 
     When *only_categories* is provided, appends a restriction instruction to
     the system prompt so the model only emits candidates for those categories.
@@ -249,7 +266,9 @@ def run_detector(
         user_name=user_name,
         user_pronouns=user_pronouns,
     )
-    user_message = _build_user_message(buffer_slice, reply_text, companion_name=companion_name)
+    user_message = _build_user_message(
+        buffer_slice, reply_text, companion_name=companion_name, shown_patterns=shown_patterns
+    )
 
     raw = _call_haiku(system_prompt, user_message, persona_dir=persona_dir)
     if not raw:

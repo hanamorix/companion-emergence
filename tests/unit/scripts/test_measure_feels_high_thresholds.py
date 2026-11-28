@@ -177,7 +177,6 @@ def test_the_script_runs_end_to_end_on_the_engine_rule_alone(tmp_path):
         "By part, per floor",
         "Near-zero firings after day 30",
         "Present feelings whose highest short average",
-        "body_strain mean:",
         "maker discharges:",
         "host: ",
     ):
@@ -224,6 +223,128 @@ def test_a_row_whose_only_emotion_is_non_finite_counts_as_having_emotions_and_lo
     assert code == 0, text[-2000:]
     assert "101 active rows, 101 with emotions" in text
     assert not [r for r in caplog.records if "dropping emotion" in r.getMessage()]
+
+
+RESEARCH_ROW = "research gate: feeling half (opposing curve)"
+
+
+def _research_row():
+    return mod.reader_conditions([])[RESEARCH_ROW]
+
+
+def _high(*names: str):
+    return set(names).__contains__
+
+
+def test_research_row_an_opposing_feeling_never_opens_it():
+    row = _research_row()
+    assert not row({"grief": 9.0}, _high("grief"))
+    assert not row({"shame": 9.0, "comfort_seeking": 9.0}, _high("shame", "comfort_seeking"))
+    assert not row({"rest_need": 9.0}, _high("rest_need"))
+
+
+def test_research_row_needs_both_high_and_strictly_above_the_threshold():
+    from brain.engines.research import opposing_threshold
+
+    row = _research_row()
+    opp = 2.0
+    t = opposing_threshold(opp)
+    assert row({"grief": opp, "love": t + 0.01}, _high("love"))
+    assert not row({"grief": opp, "love": t}, _high("love"))  # at the threshold
+    assert not row({"grief": opp, "love": t - 0.01}, _high("love"))
+    assert not row({"grief": opp, "love": t + 1.0}, _high())  # above T but not high
+
+
+def test_research_row_with_no_opposing_feeling_todays_test_alone_decides():
+    row = _research_row()
+    assert row({"love": 0.5}, _high("love"))
+    assert not row({"love": 9.0}, _high())
+
+
+def test_research_row_opp_is_the_max_over_opposing_names_present_not_their_sum_or_the_high_ones():
+    from brain.engines.research import opposing_threshold
+
+    row = _research_row()
+    # max(2, 2) = 2, T = 5.0; a sum (4) would give a higher T
+    assert opposing_threshold(2.0) < 5.2 < opposing_threshold(4.0)
+    assert row({"shame": 2.0, "grief": 2.0, "love": 5.2}, _high("love"))
+    # unequal values: max 7 gives T 6.5 (closed at 5.6); the mean of the two (4) would give T 5.55 (open)
+    assert opposing_threshold(7.0) > 5.6 > opposing_threshold(4.0)
+    assert not row({"grief": 1.0, "shame": 7.0, "love": 5.6}, _high("love"))
+    # an opposing feeling that is present but not high still sets opp
+    assert opposing_threshold(7.0) > 6.0
+    assert not row({"grief": 7.0, "love": 6.0}, _high("love"))
+
+
+def test_research_row_follows_the_engine_constants_it_copies_nothing(monkeypatch):
+    from brain import dev_constants
+
+    row = _research_row()
+    assert row({"grief": 0.0, "love": 5.0}, _high("love"))
+    monkeypatch.setattr(dev_constants, "RESEARCH_GATE_OPPOSING_CURVE", ((0.0, 9.0), (10.0, 9.0)))
+    assert not row({"grief": 0.0, "love": 5.0}, _high("love"))
+    monkeypatch.undo()
+    monkeypatch.setattr(dev_constants, "RESEARCH_GATE_OPPOSING_FEELINGS", frozenset({"love"}))
+    assert not row({"love": 9.0, "joy": 4.0}, _high("love", "joy"))  # love is now opposing: opp 9, T 7.4, joy 4 below
+
+
+def test_research_row_is_the_engines_feeling_half_function_nothing_is_copied(monkeypatch):
+    from brain.engines import research
+
+    seen: list[tuple[dict[str, float], object]] = []
+
+    def fake(values, feels_high):
+        seen.append((values, feels_high))
+        return fake.answer
+
+    monkeypatch.setattr(research, "feeling_half_passes", fake)
+    row = _research_row()
+    high = _high("love")
+    e = {"love": 9.0}  # the real rule opens on this
+    fake.answer = False
+    assert row(e, high) is False
+    e2 = {"grief": 9.0}  # the real rule is closed on this
+    fake.answer = True
+    high2 = _high("grief")
+    assert row(e2, high2) is True
+    assert seen[0] == ({"love": 9.0}, high)
+    assert seen[1] == ({"grief": 9.0}, high2)
+
+
+def _grief_db(path: Path) -> None:
+    """The same history with a constant grief of 5 (an opposing feeling) beside love swinging between 2 and 9."""
+    from brain.memory.store import Memory, MemoryStore
+
+    store = MemoryStore(path)
+    try:
+        start = datetime(2026, 1, 1, 12, tzinfo=UTC)
+        for day in range(100):
+            swing = 2.0 + 7.0 * ((day % 10) / 9.0)
+            row = Memory.create_new(
+                content=f"a made thing on day {day}",
+                memory_type="making",
+                domain="creative",
+                emotions={"love": swing, "grief": 5.0},
+            )
+            store.create(dataclasses.replace(row, created_at=start + timedelta(days=day)))
+    finally:
+        store.close()
+
+
+def test_the_research_row_end_to_end_is_stricter_than_any_feeling_high(tmp_path):
+    db = tmp_path / "memories.db"
+    _grief_db(db)
+
+    lines, code = mod.run(str(db), (0.0, 1.0))
+    text = "\n".join(lines)
+
+    assert code == 0, text[-2000:]
+    assert "research gate: any feeling high" not in text
+    after_30 = text.split("Firing counts, after day 30")[1].split("Firing counts, all ticks")[0]
+    research = next(line for line in after_30.splitlines() if line.startswith(f"| {RESEARCH_ROW} |"))
+    fired, total = (int(x) for x in research.split("|")[3].strip().split("/"))  # the floor 1 column
+    # grief, an opposing feeling, never opens the gate and raises the threshold for love: some ticks fire, not all.
+    assert 0 < fired < total, research
 
 
 def test_main_prints_the_report_and_exits_zero(tmp_path, capsys):

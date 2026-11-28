@@ -12,6 +12,11 @@ governs all of them. It fails CLOSED (reports "not idle") on any internal
 error and logs the failure at a rate-limited pace (S63) — background work is
 paused, never silently unblocked, while the check itself is malfunctioning.
 
+One job is exempt from the lull: pass 2 (#817) waits only for "no reply in flight" (``reply_gate_open``, which never reads
+the tunable). Its slot calls pass ``lull_required=False``; every other caller keeps the default and the lull. Pass 2 runs on
+a short-lived thread of its own per reply (``pass2_queue.drain_in_own_thread``): it waits for the reply to end
+(``wait_for_no_reply_in_flight``) and, when another job holds the slot, for its release (``wait_for_background_slot``).
+
 The slot-cap half of this module (``_max_concurrent_background`` /
 ``_inflight_background``) keeps its own FAIL-OPEN posture on internal error —
 it is not the idle check, and a malfunction there must not itself become a
@@ -66,6 +71,9 @@ _replies_started: int = 0
 _inflight_background = 0
 # S218: signalled by `note_reply_end` (built on `_lock`, so waiting and the counters share it).
 _reply_ended = threading.Condition(_lock)
+# Signalled by `release_background` and `request_shutdown` (same lock): a thread that wants the slot while another job holds
+# it waits on this instead of polling (`wait_for_background_slot`).
+_background_released = threading.Condition(_lock)
 # S223: callbacks registered through `ReplyWatch.on_reply_start`, run by `note_user_message` (after
 # its counters changed and OUTSIDE `_lock`). Guarded by `_lock`.
 _start_hooks: list[_StartHook] = []
@@ -103,8 +111,11 @@ _shutdown = threading.Event()
 
 
 def request_shutdown() -> None:
-    """Mark the process as stopping: no new background work starts from here on."""
+    """Mark the process as stopping: no new background work starts from here on. Sets the flag first, then wakes a thread
+    waiting for the slot (`wait_for_background_slot`) so it sees the flag; the reverse order could lose the wake-up."""
     _shutdown.set()
+    with _lock:
+        _background_released.notify_all()
 
 
 def clear_shutdown() -> None:
@@ -129,6 +140,7 @@ def reset() -> None:  # test helper
         _err_suppressed_count = 0
         _start_hooks.clear()
         _reply_ended.notify_all()
+        _background_released.notify_all()
     _shutdown.clear()
 
 
@@ -466,15 +478,33 @@ def should_yield(*, now: float | None = None) -> bool:
     return not is_chat_idle(now=now)
 
 
-def slot_available(*, now: float | None = None) -> bool:
+def reply_gate_open() -> bool:
+    """True iff the bridge is not stopping and no reply is in flight. This is the gate of the one job that does not wait for
+    the quiet-chat lull (pass 2, #817): it reads neither the lull nor the ``chat.idle_lull_seconds`` tunable, so
+    ``is_chat_idle`` stays that tunable's sole reader. Fails CLOSED on any internal error, like ``is_chat_idle``."""
+    try:
+        return not _shutdown.is_set() and not reply_in_flight()
+    except Exception:  # noqa: BLE001  (fail CLOSED, as is_chat_idle does)
+        log.error("cli_throttle.reply_gate_open failed; reporting closed (fail-closed)", exc_info=True)
+        return False
+
+
+def _gate_open(lull_required: bool, now: float | None) -> bool:
+    """The idle half of a background slot: the quiet-chat lull for every job except the one that asks for the
+    reply-only gate (``lull_required=False``)."""
+    return is_chat_idle(now=now) if lull_required else reply_gate_open()
+
+
+def slot_available(*, now: float | None = None, lull_required: bool = True) -> bool:
     """Read-only peek: True if a background slot could be acquired right
-    now — chat idle AND the concurrency cap not full. Does NOT touch the
+    now: chat idle AND the concurrency cap not full (``lull_required=False``:
+    no reply in flight instead of chat idle, #817). Does NOT touch the
     semaphore, so it is safe as a pre-flight gate before a tick commits
     budget/cooldown. The concurrency-cap read fails OPEN (True) on internal
     error, matching acquire_background — is_chat_idle itself already fails
     CLOSED internally, so a malfunction there already reports not-idle."""
     try:
-        if not is_chat_idle(now=now):
+        if not _gate_open(lull_required, now):
             return False
         with _lock:
             return _inflight_background < _max_concurrent_background()
@@ -483,16 +513,17 @@ def slot_available(*, now: float | None = None) -> bool:
         return True
 
 
-def acquire_background(*, now: float | None = None) -> bool:
+def acquire_background(*, now: float | None = None, lull_required: bool = True) -> bool:
     """True → caller may make its background CLI call (and MUST call
     release_background() after). False → defer to next tick.
 
-    Idle half: is_chat_idle() (the one registered lull, fail-closed).
+    Idle half: is_chat_idle() (the one registered lull, fail-closed); with
+    ``lull_required=False`` (pass 2 only, #817) reply_gate_open() instead.
     Concurrency half: the max_concurrent_background cap (fail-open on
-    internal error, unrelated to the idle check)."""
+    internal error, unrelated to the idle check), the same for both."""
     global _inflight_background
     try:
-        if not is_chat_idle(now=now):
+        if not _gate_open(lull_required, now):
             return False
         with _lock:
             if _inflight_background >= _max_concurrent_background():
@@ -508,14 +539,33 @@ def release_background() -> None:
     global _inflight_background
     with _lock:
         _inflight_background = max(0, _inflight_background - 1)
+        _background_released.notify_all()
+
+
+def wait_for_background_slot() -> bool:
+    """Return False at once when a background slot is free or a stop was requested (nothing to wait for), else block until
+    one is released (`release_background`) or the stop is requested (`request_shutdown`) and return True. No timeout and no
+    polling interval. The slot is not taken: the caller asks for it with `acquire_background` / `background_slot`
+    afterwards, and may lose it to another job (so it loops). A change to ``throttle.max_concurrent_background`` while a
+    thread waits is not announced: the thread sees it at the next release. For a background thread; never call it on the
+    reply path."""
+
+    def _free_or_stopping() -> bool:
+        return _shutdown.is_set() or _inflight_background < _max_concurrent_background()
+
+    with _background_released:
+        if _free_or_stopping():
+            return False
+        _background_released.wait_for(_free_or_stopping)
+        return True
 
 
 @contextlib.contextmanager
-def background_slot(*, now: float | None = None):
+def background_slot(*, now: float | None = None, lull_required: bool = True):
     """Context manager wrapping acquire/release. Yields True if the slot was
     acquired (caller should do its CLI work), False if it should defer.
     Always releases on exit when acquired."""
-    acquired = acquire_background(now=now)
+    acquired = acquire_background(now=now, lull_required=lull_required)
     if not acquired:
         yield False
         return

@@ -248,7 +248,7 @@ def test_through_the_real_engine_the_range_part_fires_and_a_reader_follows_it(tm
             {"love": 5.0, "desire": 3.5},
             feels_high=feels_high,
             session_hours=0.0,
-            words_written=0,
+            energy=6.5,
             days_since_contact=0.0,
             now=saved_at,
         ).temperature
@@ -347,7 +347,7 @@ def test_through_the_real_engine_a_feeling_at_the_top_of_its_range_under_the_flo
             {"love": 0.9},
             feels_high=feels_high,
             session_hours=0.0,
-            words_written=0,
+            energy=6.5,
             days_since_contact=0.0,
             now=saved_at,
         ).temperature

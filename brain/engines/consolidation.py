@@ -31,16 +31,18 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import numpy as np
 
 from brain import prompt_strings
 from brain.bridge.cli_throttle import ThrottleDeferred
+from brain.bridge.provider import judge_session
 from brain.dev_constants import MONOLOGUE_MERGE_TYPES
 from brain.emotion import engine
 from brain.emotion.vocabulary import canonical_name
 from brain.health.json_io import append_jsonl
+from brain.ingest.emotion_tagger import EmotionTagger, make_emotion_tagger, tag_if_feelingless
 from brain.memory import embeddings as embeddings_mod
 from brain.memory.embedding_matrix import build_embedding_matrix
 from brain.memory.embeddings import cosine_similarity
@@ -59,6 +61,7 @@ from brain.memory.store import Memory, MemoryStore, clamp_importance
 from brain.utils.failure_scope import ServiceCallFailed, settle_scope
 from brain.utils.file_lock import file_lock
 from brain.utils.llm_output import find_json_object_block
+from brain.utils.log_throttle import warn_throttled
 
 logger = logging.getLogger(__name__)
 
@@ -221,6 +224,37 @@ def _promote_all_classifier(_cand: Memory, _context: list[Memory]) -> Decision:
     return Decision("new")
 
 
+class _JudgeSessions:
+    """The sessions one gate run judges its items in: one per instruction text (the classifier's, the re-appraiser's).
+
+    Each is opened when the first item that needs it is judged, so a kind with no item in the run opens nothing, and all
+    are closed when the run ends (``run_consolidation`` closes them on every way out). Each item is still judged on its
+    own: ``judge_session`` clears the conversation before every item after the first, so no earlier item is in context
+    (S71, L2 batch question 6). A provider with no live process judges each item with one ``generate`` call."""
+
+    def __init__(self, provider) -> None:
+        self._provider = provider
+        self._sessions: dict[str, Any] = {}
+
+    def generate(self, system: str, prompt: str) -> str:
+        session = self._sessions.get(system)
+        if session is None:
+            session = self._sessions[system] = judge_session(self._provider, system)
+        return session.generate(prompt)
+
+    def close(self) -> None:
+        """Close every session, whether or not an earlier close raised; the first error is raised after the last."""
+        sessions, self._sessions = list(self._sessions.values()), {}
+        first: BaseException | None = None
+        for session in sessions:
+            try:
+                session.close()
+            except BaseException as exc:  # noqa: BLE001  every session gets its close; the first failure is re-raised below
+                first = first or exc
+        if first is not None:
+            raise first
+
+
 def run_consolidation(
     store: MemoryStore,
     *,
@@ -230,6 +264,7 @@ def run_consolidation(
     hebbian: HebbianMatrix | None = None,
     salience_floor: float | None = None,
     reappraiser: Reappraiser | None = None,
+    emotion_tagger: EmotionTagger | None = None,
 ) -> ConsolidationResult:
     """Drain the pending queue and consolidate, under a non-blocking gate lock.
 
@@ -245,10 +280,16 @@ def run_consolidation(
     the raw reply as evidence) instead of promoting it. ``result.failed`` /
     ``result.quarantined`` count them.
 
+    The Haiku classifier and re-appraiser judge in one live Claude session each for the whole run (opened at the first
+    item of that kind, cleared between items, closed when the run ends on any way out); see ``_JudgeSessions``.
+
     reappraiser: Change 3's injectable importance re-appraiser. None (default)
         builds the Haiku-backed default when `provider` is given, else
         degrades to the no-op fallback (importance unchanged) — mirrors the
         classifier's degrade-to-`_promote_all_classifier` pattern.
+    emotion_tagger: tags a memory that is written without feelings (`tag_if_feelingless`): a promoted candidate, a merge
+        target, a recalled row. None (default) builds the provider-backed tagger when `provider` is given; with neither,
+        no memory is tagged and no model call is made.
     """
     persona_dir = Path(persona_dir)
     lock_path = persona_dir / _GATE_LOCK_FILENAME
@@ -257,22 +298,28 @@ def run_consolidation(
         if not acquired:
             logger.debug("consolidation gate: lock contended — skipping this run")
             return ConsolidationResult(skipped=True)
-        if classifier is None:
-            if provider is not None:
-                classifier = _make_haiku_classifier(provider)
-            else:
-                logger.warning(
-                    "consolidation gate: no classifier and no provider — "
-                    "degrading to promote-all (Pass-1 dedup only)"
+        sessions = _JudgeSessions(provider)
+        try:
+            if classifier is None:
+                if provider is not None:
+                    classifier = _make_haiku_classifier(sessions)
+                else:
+                    logger.warning(
+                        "consolidation gate: no classifier and no provider — "
+                        "degrading to promote-all (Pass-1 dedup only)"
+                    )
+                    classifier = _promote_all_classifier
+            if reappraiser is None:
+                reappraiser = (
+                    _make_haiku_reappraiser(sessions, persona_dir)
+                    if provider is not None
+                    else _noop_reappraiser
                 )
-                classifier = _promote_all_classifier
-        if reappraiser is None:
-            reappraiser = (
-                _make_haiku_reappraiser(provider, persona_dir)
-                if provider is not None
-                else _noop_reappraiser
-            )
-        result = _run_locked(store, persona_dir, classifier, hebbian, salience_floor, reappraiser)
+            if emotion_tagger is None and provider is not None:
+                emotion_tagger = make_emotion_tagger(provider)
+            result = _run_locked(store, persona_dir, classifier, hebbian, salience_floor, reappraiser, emotion_tagger)
+        finally:
+            sessions.close()  # the step is over: no judge process outlives it, on any way out
     logger.info("consolidation gate run: %s", json.dumps(result.as_log()))
     return result
 
@@ -288,6 +335,7 @@ def _run_locked(
     hebbian: HebbianMatrix | None,
     salience_floor: float | None,
     reappraiser: Reappraiser | None = None,
+    emotion_tagger: EmotionTagger | None = None,
 ) -> ConsolidationResult:
     pending = PendingQueue(persona_dir)
     # Claimed, not drained: the batch stays in a processing file until each item is settled, so an exception or a kill
@@ -305,7 +353,7 @@ def _run_locked(
 
     result = ConsolidationResult(batch=len(candidate_entries))
     if reappraise_entries and _handle_reappraisals(
-        store, persona_dir, pending, claim, reappraise_entries, reappraiser or _noop_reappraiser, result
+        store, persona_dir, pending, claim, reappraise_entries, reappraiser or _noop_reappraiser, result, emotion_tagger
     ):
         claim.close()
         return result
@@ -382,7 +430,7 @@ def _run_locked(
                 # `UnusableClassifierReply`, re-raised above, and the candidate is quarantined.
                 raise ServiceCallFailed(f"classifier call failed: {type(call_exc).__name__}: {call_exc}") from call_exc
             decision = _clean_decision(decision)
-            _dispatch(store, pending, hebbian, persona_dir, cand, decision, result, embedded)
+            _dispatch(store, pending, hebbian, persona_dir, cand, decision, result, embedded, emotion_tagger)
             claim.settle(entry)
         except Exception as exc:  # noqa: BLE001 — settled per item; never ends the loop with items undone
             # The decision's target is named in the log so a link lost to a failed post-save step can be rebuilt.
@@ -544,7 +592,8 @@ def _embed_candidate(content: str) -> tuple[np.ndarray, str] | None:
     Looked up via the MODULE (not a bare imported name) so a test's
     monkeypatch on `embeddings_mod.build_embedding_provider` is honored —
     mirrors `MemoryStore.embed_row`'s / `dedupe.is_duplicate`'s identical
-    dynamic lookup.
+    dynamic lookup. In the bridge it never waits for the model's download:
+    while the model is not built it returns None at once (#833).
 
     Fail-soft: returns None on any provider/compute failure rather than
     raising, so one bad embed cannot lose the candidate or abort the drain
@@ -554,9 +603,12 @@ def _embed_candidate(content: str) -> tuple[np.ndarray, str] | None:
     the row NULL on a repeat failure for the idle backfill to pick up).
     """
     try:
-        provider = embeddings_mod.build_embedding_provider()
+        provider = embeddings_mod.get_ready_embedding_provider()
         vec = provider.embed(content).astype("float32")
         return vec, provider.model_id()
+    except embeddings_mod.EmbeddingNotReadyError:
+        logger.debug("consolidation gate: the embedding model is not built yet; lexical context for this candidate")
+        return None
     except Exception:  # noqa: BLE001 — degrade to lexical context + post-promote embed_row
         logger.warning(
             "consolidation gate: pre-judge candidate embed failed; falling back to "
@@ -836,8 +888,8 @@ def _parse_reappraisal(raw: str, current: float) -> Reappraisal:
     return Reappraisal(float(keyed.group(1)) if keyed else current)
 
 
-def _make_haiku_reappraiser(provider, persona_dir: Path | None = None) -> Reappraiser:
-    """Build the Haiku-backed default importance re-appraiser (Change 3).
+def _make_haiku_reappraiser(sessions: _JudgeSessions, persona_dir: Path | None = None) -> Reappraiser:
+    """Build the Haiku-backed default importance re-appraiser (Change 3), judging in the run's re-appraiser session.
 
     Judges importance fresh from the memory's content in the moment it is
     re-appraised, not from how often it has been recalled: a still-relevant
@@ -858,7 +910,7 @@ def _make_haiku_reappraiser(provider, persona_dir: Path | None = None) -> Reappr
     def _reappraise(memory: Memory) -> Reappraisal:
         try:
             offered = listed_display_forms(persona_dir, memory.content)
-            raw = provider.generate(_reappraiser_user_message(memory, offered), system=prompt)
+            raw = sessions.generate(prompt, _reappraiser_user_message(memory, offered))
             return _parse_reappraisal(raw, memory.importance)
         except ThrottleDeferred:
             raise  # "not now" (expired login, shutdown): the item is retried, not consumed unchanged (#473)
@@ -877,6 +929,7 @@ def _handle_reappraisals(
     entries: list[dict],
     reappraiser: Reappraiser,
     result: ConsolidationResult,
+    emotion_tagger: EmotionTagger | None = None,
 ) -> bool:
     """Process Change-3 existing-memory re-appraise items: load the target
     row, compute a new importance (and names) via the injectable `reappraiser`,
@@ -934,7 +987,7 @@ def _handle_reappraisals(
                 claim.settle(entry)
                 continue
             result.reappraised += 1
-            _write_back_faded_emotions(store, persona_dir, memory)
+            _write_back_faded_emotions(store, persona_dir, memory, emotion_tagger)
             _remove_not_names(persona_dir, memory, names, not_names)
             _admit_extracted_names(persona_dir, names, list_source="reappraiser", label="reappraiser")
             claim.settle(entry)
@@ -944,18 +997,54 @@ def _handle_reappraisals(
     return False
 
 
-def _write_back_faded_emotions(store: MemoryStore, persona_dir: Path, memory: Memory) -> None:
+def _tag_feelingless_soft(
+    store: MemoryStore, tagger: EmotionTagger | None, memory_id: str, site: str, memory: Memory | None = None
+) -> None:
+    """`tag_if_feelingless` as a gate step that never fails the item: any failure (the tagger's deferred call included) leaves the
+    row untagged and is logged, and the gate carries on and settles the item as it would have, so a row that is already written is
+    never judged, merged or faded again (a retried merge would merge a second time). The row is tried again at its next recall,
+    and a deferred call ends the pass at the judge's own next call.
+
+    ``memory`` is the row when the caller holds it (the promoted candidate, the recalled row); without it the row is read as the
+    gate's other maintenance reads are (no recall bump), inside the same fail-soft step, and a row gone since the write is left alone.
+    """
+    if tagger is None:
+        return
+    try:
+        row = memory if memory is not None else store.get(memory_id, bump=False)
+        if row is not None:
+            tag_if_feelingless(store, tagger, row)
+    except Exception as exc:  # noqa: BLE001 — a lost tag costs one tagging; the write it follows has committed
+        warn_throttled(
+            logger,
+            "consolidation.emotion_tag",
+            "consolidation gate: emotion tagging failed at the %s for memory %s (%s: %s); row left without feelings",
+            site,
+            memory_id,
+            type(exc).__name__,
+            exc,
+            exc_info=False,
+        )
+
+
+def _write_back_faded_emotions(
+    store: MemoryStore, persona_dir: Path, memory: Memory, emotion_tagger: EmotionTagger | None = None
+) -> None:
     """The temp-gate write-back, once the engine is live: the row's emotions become their faded values and its ``created_at``
     becomes now, in one store write (`refresh_faded_emotions`, no hook), which also puts the date the row had before the reset at
     the start of its text when it is not there yet. Every memory type and state, a row without emotions included (its
     ``created_at`` is still reset). Runs after the importance update committed.
 
-    The row is read again here, because ``memory`` was loaded before the re-appraiser's model call and the emotion backfill may
-    have written emotions onto the row since; the faded values come from that fresh row, with the importance the memory had
+    A row without emotions is tagged first (`tag_if_feelingless`), before the engine-live return, so a persona whose engine is not
+    live is tagged too, and the re-read below and the refresh carry the tags.
+
+    The row is read again here, because ``memory`` was loaded before the re-appraiser's model call and another write may have
+    put emotions onto the row since; the faded values come from that fresh row, with the importance the memory had
     BEFORE this re-appraisal (it faded under that one until now). A failure is logged and the row is left as it was: the item is
     neither requeued nor settled as failed, so the outer per-item handler never sees it. A row whose stored emotion the read leaves
     out is skipped the same way (logged, left as it was), because the write replaces the row's whole map.
     """
+    _tag_feelingless_soft(store, emotion_tagger, memory.id, "recall write-back", memory)
     try:
         live_engine = engine.engine_for(persona_dir)
         if not live_engine.is_live():
@@ -1026,6 +1115,7 @@ def _dispatch(
     decision: Decision,
     result: ConsolidationResult,
     embedded: tuple[np.ndarray, str] | None = None,
+    emotion_tagger: EmotionTagger | None = None,
 ) -> None:
     verdict = decision.verdict if decision.verdict in VERDICTS else "new"
 
@@ -1100,6 +1190,7 @@ def _dispatch(
             # - A rebuild or a catch-up counts the merged target row's current emotions once and does not restore this separate
             #   mood move (the merged memory has no row and the merge writes no change-log line): a lost event, one merge's worth.
             engine.engine_for(persona_dir).on_memory_committed(cand)
+        _tag_feelingless_soft(store, emotion_tagger, decision.target_id, "merge")
         result.merged += 1
         return
 
@@ -1124,6 +1215,9 @@ def _dispatch(
             store.write_embedding(cand.id, cand_vec, model_id)
         else:
             store.embed_row(cand.id, cand.content)
+    except embeddings_mod.EmbeddingNotReadyError:
+        # The bridge's background thread is still building the model (#833): no vector now, the idle backfill adds it.
+        logger.debug("consolidation._dispatch: embedding model not built yet for promoted id=%s", cand.id)
     except Exception:  # noqa: BLE001 — degrade to backfill, never abort the drain
         logger.warning(
             "consolidation._dispatch: embed persist failed for promoted id=%s — "
@@ -1133,6 +1227,8 @@ def _dispatch(
         )
     if verdict in ("correction", "continuation") and decision.target_id and hebbian is not None:
         hebbian.set_edge_weight(cand.id, decision.target_id, ASSOC_WEIGHT)
+    # Last, after the row, its embedding and its edge: a promoted row without feelings is tagged (the row holds what `cand` holds).
+    _tag_feelingless_soft(store, emotion_tagger, cand.id, "promote", cand)
 
     if verdict == "correction":
         result.corrections += 1
@@ -1151,8 +1247,8 @@ def _fold(existing: str, addition: str) -> str:
     return f"{existing.rstrip()}\n{addition.strip()}"
 
 
-def _make_haiku_classifier(provider) -> Classifier:
-    """Build a Haiku-backed Pass-2 classifier from a generation provider.
+def _make_haiku_classifier(sessions: _JudgeSessions) -> Classifier:
+    """Build a Haiku-backed Pass-2 classifier that judges in the run's classifier session.
 
     Decision QUALITY is advisory (C16, live-only) — the gate mechanism is what
     the gating criteria verify. A failed CALL propagates (the candidate is kept for a
@@ -1169,7 +1265,7 @@ def _make_haiku_classifier(provider) -> Classifier:
         user = _classifier_user_message(cand, context)
         # The CALL is outside any try: a call that fails (a deferral, a CLI error, a timeout) means the candidate was not
         # classified, so the exception goes to the gate, which keeps the candidate for a later run (#473).
-        raw = provider.generate(user, system=prompt)
+        raw = sessions.generate(prompt, user)
         reply = raw if isinstance(raw, str) else ""
         if not reply.strip():
             raise UnusableClassifierReply("empty reply", reply)

@@ -1,4 +1,4 @@
-"""brain.maker.budget — daily making cap (mirrors emotion_backfill budget)."""
+"""brain.maker.budget — daily making cap."""
 from __future__ import annotations
 
 from datetime import datetime

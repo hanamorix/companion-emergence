@@ -144,6 +144,37 @@ def _neutral_ctx(now_iso: str, chat_turns: int = 0) -> TickContext:
     )
 
 
+def test_tick_carries_the_energy_fields_unchanged_across_ticks_and_a_reload(tmp_path):
+    from brain.felt_time.state import persist
+
+    persist(
+        FeltTimeState(
+            last_tick_ts="2026-06-08T09:45:00+00:00",
+            energy_level=4.123456789,
+            energy_long_avg=5.5,
+            energy_long_weight=3.25,
+            energy_feelings={"joy": 2.5},
+        ),
+        tmp_path,
+    )
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-06-08T10:00:00+00:00"))
+    ft.tick(_neutral_ctx("2026-06-08T10:15:00+00:00"))
+    reloaded = FeltTime(persona_dir=tmp_path).get_state()
+    for state in (ft.get_state(), reloaded):
+        assert state.energy_level == 4.123456789
+        assert state.energy_long_avg == 5.5
+        assert state.energy_long_weight == 3.25
+        assert state.energy_feelings == {"joy": 2.5}
+
+
+def test_tick_keeps_missing_saved_feelings_missing(tmp_path):
+    ft = FeltTime(persona_dir=tmp_path)
+    ft.tick(_neutral_ctx("2026-06-08T10:00:00+00:00"))
+    assert FeltTime(persona_dir=tmp_path).get_state().energy_feelings is None
+    assert FeltTime(persona_dir=tmp_path).get_state().energy_level == 6.5
+
+
 def test_tick_populates_horizon_pressure(tmp_path):
     ft = FeltTime(persona_dir=tmp_path)
     ft.tick(_neutral_ctx("2026-06-08T10:00:00+00:00", chat_turns=3))

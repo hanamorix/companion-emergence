@@ -5,7 +5,7 @@ launch (the ~15-min window bug).
 
 Regression: before this fix, the vocabulary was only loaded inside the
 supervisor heartbeat/soul-review ticks, leaving the chat path flatlined
-to 26 baseline emotions until the first tick fired.
+to the baseline emotions until the first tick fired.
 """
 
 from __future__ import annotations

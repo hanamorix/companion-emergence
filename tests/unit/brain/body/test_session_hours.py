@@ -4,8 +4,18 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
-from brain.body.session_hours import compute_active_session_hours
+from brain.body.session_hours import compute_active_session_hours, split_into_runs
 from brain.ingest.buffer import ingest_turn
+
+
+def test_split_into_runs_splits_at_a_gap_of_thirty_minutes_or_more():
+    """The one 30-minute rule: 29 minutes stays in the run, exactly 30 starts a new one; empty input has no runs."""
+    t0 = datetime(2026, 1, 1, 9, 0, tzinfo=UTC)
+    stamps = [t0, t0 + timedelta(minutes=29), t0 + timedelta(minutes=58), t0 + timedelta(minutes=88)]
+    assert split_into_runs(stamps) == [stamps[:3], stamps[3:]]
+    assert split_into_runs([t0, t0 + timedelta(minutes=30)]) == [[t0], [t0 + timedelta(minutes=30)]]
+    assert split_into_runs([]) == []
+    assert split_into_runs([t0]) == [[t0]]
 
 
 def test_stale_buffer_returns_zero(tmp_path):

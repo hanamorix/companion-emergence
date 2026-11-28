@@ -1,11 +1,15 @@
 """Persistence + grounding gate for the attunement subsystem."""
 from __future__ import annotations
 
+import functools
 import logging
 import re
 import unicodedata
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Concatenate
 
 from brain import dev_constants
 from brain.attunement.schemas import (
@@ -16,6 +20,7 @@ from brain.attunement.schemas import (
 )
 from brain.health.json_io import Recovery, append_jsonl, read_json, read_jsonl, write_json
 from brain.state_compat import from_known_fields
+from brain.utils.file_lock import file_lock
 
 log = logging.getLogger(__name__)
 
@@ -125,8 +130,31 @@ def read_learned_patterns(persona_dir: Path) -> list[LearnedPattern]:
     return list(by_id.values())
 
 
+@contextmanager
+def learned_patterns_lock(persona_dir: Path) -> Iterator[None]:
+    """Hold the lock every read-then-append writer of ``learned_patterns.jsonl`` takes across its whole read..append
+    (`merge_into_learned`, `apply_contradiction`, `mark_addressed`, `check_crystallisations`): pass 2 runs on its own thread,
+    beside the start-up backfill, and an append between another writer's read and append would be superseded by it. The
+    shared ``file_lock`` on the file itself (the same lock a plain append takes, so the append inside uses ``lock="held"``);
+    not re-entrant. Never held across a model call (the detector runs before the writers are called)."""
+    with file_lock(_learned_patterns_path(persona_dir)):
+        yield
+
+
+def holds_learned_patterns_lock[**P, R](fn: Callable[Concatenate[Path, P], R]) -> Callable[Concatenate[Path, P], R]:
+    """Decorator for a writer whose first argument is the persona dir: the whole call runs under `learned_patterns_lock`."""
+
+    @functools.wraps(fn)
+    def wrapper(persona_dir: Path, *args: P.args, **kwargs: P.kwargs) -> R:
+        with learned_patterns_lock(persona_dir):
+            return fn(persona_dir, *args, **kwargs)
+
+    return wrapper
+
+
 def _append_pattern(persona_dir: Path, pattern: LearnedPattern) -> None:
-    append_jsonl(_learned_patterns_path(persona_dir), asdict(pattern))
+    """Append one pattern row. The caller holds `learned_patterns_lock` (every caller reads first, then appends)."""
+    append_jsonl(_learned_patterns_path(persona_dir), asdict(pattern), lock="held")
 
 
 def _maturity_for_count(count: int) -> str:
@@ -137,6 +165,7 @@ def _maturity_for_count(count: int) -> str:
     return "immature"
 
 
+@holds_learned_patterns_lock
 def merge_into_learned(
     persona_dir: Path,
     candidates: list[PatternCandidate],
@@ -212,6 +241,7 @@ def merge_into_learned(
         existing[pid] = updated
 
 
+@holds_learned_patterns_lock
 def apply_contradiction(
     persona_dir: Path, pattern_id_value: str, *, now_iso: str | None = None
 ) -> None:
@@ -260,6 +290,7 @@ def apply_contradiction(
     _append_pattern(persona_dir, updated)
 
 
+@holds_learned_patterns_lock
 def mark_addressed(
     persona_dir: Path, pattern_ids: list[str], *, now_iso: str | None = None
 ) -> None:

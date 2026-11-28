@@ -249,8 +249,12 @@ def test_group_c_default_readers_fall_back_on_an_io_fault(tmp_path: Path, caplog
     assert count_recent(pd) == {}
 
 
-def test_group_c_feed_monologue_and_count_words_survive_bad_lines(tmp_path: Path) -> None:
-    from brain.body.words import count_words_in_session
+@pytest.mark.no_base_failure(
+    reason="the test only lost its second half (the count_words_in_session check, deleted with brain/body/words.py); "
+    "the build_monologue_entries bad-line assertions are byte-for-byte the ones the base test already made, and that "
+    "feed code is untouched by this branch, so the renamed test passes on the base"
+)
+def test_group_c_feed_monologue_survives_bad_lines(tmp_path: Path) -> None:
     from brain.bridge.feed import build_monologue_entries
 
     pd = tmp_path / "persona"
@@ -261,12 +265,6 @@ def test_group_c_feed_monologue_and_count_words_survive_bad_lines(tmp_path: Path
     )
     got = build_monologue_entries(pd, limit=10)
     assert [e.body for e in got] == ["a b"]  # the withheld digest stays withheld
-    (pd / "active_conversations").mkdir()
-    (pd / "active_conversations" / "s.jsonl").write_bytes(
-        f'{{"speaker": "assistant", "ts": "{NOW.isoformat()}", "text": "one two three"}}\n'.encode()
-        + b"garbage\n"
-    )
-    assert count_words_in_session(persona_dir=pd, session_hours=24, now=NOW + timedelta(hours=1)) == 3
 
 
 # ---------------------------------------------------------------------------------------------

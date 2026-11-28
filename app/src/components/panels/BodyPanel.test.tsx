@@ -31,7 +31,6 @@ function makeBody(overrides: Partial<{ body_emotions: Record<string, number> }>)
   return {
     energy: 7,
     temperature: 5,
-    exhaustion: 0,
     session_hours: 0.5,
     days_since_contact: 0,
     body_emotions: overrides.body_emotions ?? BODY_EMOTIONS_QUIET,
@@ -59,6 +58,20 @@ describe("BodyPanel", () => {
     expect(screen.getByText("touch hunger")).toBeInTheDocument();
     expect(screen.getByText("rest need")).toBeInTheDocument();
     expect(screen.queryByText(/Body quiet\./)).not.toBeInTheDocument();
+  });
+
+  it("shows the energy level to one decimal, whole numbers included", () => {
+    const { rerender } = render(<BodyPanel state={fakeState({ ...makeBody({}), energy: 6.3 })} />);
+    expect(screen.getByText("6.3/10")).toBeInTheDocument();
+    rerender(<BodyPanel state={fakeState({ ...makeBody({}), energy: 7 })} />);
+    expect(screen.getByText("7.0/10")).toBeInTheDocument();
+  });
+
+  it("shows the energy and temperature bars and no exhaustion bar", () => {
+    render(<BodyPanel state={fakeState(makeBody({}))} />);
+    expect(screen.getByText("Energy")).toBeInTheDocument();
+    expect(screen.getByText("Temp")).toBeInTheDocument();
+    expect(screen.queryByText(/Exhaust/)).not.toBeInTheDocument();
   });
 
   it("shows 'Body offline.' when state.body is null (no signal yet)", () => {

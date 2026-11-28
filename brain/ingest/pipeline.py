@@ -60,6 +60,7 @@ from brain.ingest.ingest_utils import (
     load_user_pronouns,
     mark_chunked_extraction,
 )
+from brain.ingest.session_stats import append_session_stats
 from brain.ingest.soul_queue import (
     DEFAULT_SOUL_THRESHOLD,
     is_soul_candidate_queued,
@@ -560,6 +561,9 @@ def _close_session_locked(
             )
             return report
 
+        # Only a close that goes on to remove the buffer reaches here: the file is finished, so its stats row goes to the end of
+        # its archive. A failure is logged by the writer and the close still finishes (spec 5.4).
+        append_session_stats(persona_dir, session_id, archived)
         delete_session_buffer(persona_dir, session_id)
         delete_cursor(persona_dir, session_id)
         delete_backoff(persona_dir, session_id)

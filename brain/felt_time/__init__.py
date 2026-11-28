@@ -11,8 +11,10 @@ Spec: the 2026-05-17 felt-time design, never committed and lost (#797).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 
+from brain.body.energy import EnergyCarry, EnergyInputs, advance_energy
 from brain.felt_time.anchors import scan_since
 from brain.felt_time.lived_age import _MIGRATION_SEED_RATE, IntensityDrivers, advance
 from brain.felt_time.pressure import TickInput, apply_horizon_tick, apply_tick
@@ -36,14 +38,15 @@ class TickContext:
     reflex_firings_in_tick: int
     wall_clock_s_in_tick: float
     drivers: IntensityDrivers
+    # What the body energy step reads (`brain.body.energy_inputs`). None: no energy step this tick, the saved energy fields
+    # carry as they are (tests; the supervisor always gives it).
+    energy: EnergyInputs | None = None
 
 
 def _iso_to_seconds_delta(a: str | None, b: str) -> float:
     """Return wall-clock seconds from a → b. 0.0 when a is None."""
     if a is None:
         return 0.0
-    from datetime import datetime
-
     return (datetime.fromisoformat(b) - datetime.fromisoformat(a)).total_seconds()
 
 
@@ -56,8 +59,6 @@ def _compute_first_tick_ts(prev: FeltTimeState, now_iso: str) -> str:
       midpoint rate so the computed rate starts at ~_MIGRATION_SEED_RATE and
       self-corrects as new ticks accumulate.
     """
-    from datetime import datetime, timedelta
-
     if prev.first_tick_ts is not None:
         return prev.first_tick_ts
     if prev.last_tick_ts is None:
@@ -90,6 +91,15 @@ class FeltTime:
 
     def get_state(self) -> FeltTimeState:
         return self._state
+
+    def interval_start(self, now: datetime, wall_clock_s: float) -> datetime:
+        """When the interval this tick covers began: the saved `last_tick_ts`, or `wall_clock_s` before `now` when there is none.
+
+        Read before `tick` overwrites `last_tick_ts`; the supervisor asks it to gather the energy step's inputs.
+        """
+        if self._state.last_tick_ts is None:
+            return now - timedelta(seconds=wall_clock_s)
+        return datetime.fromisoformat(self._state.last_tick_ts)
 
     def tick(self, ctx: TickContext) -> None:
         new_anchors = scan_since(self.persona_dir, self._state.last_tick_ts)
@@ -149,6 +159,26 @@ class FeltTime:
             drivers=ctx.drivers,
         )
 
+        # Body energy (#650, spec 1.2): stepped here and saved in this tick's single write. The saved feelings are a NEW dict
+        # (the old state's is never mutated); when the engine gave nothing to read, the saved ones stay.
+        carry = EnergyCarry(
+            level=self._state.energy_level,
+            long_avg=self._state.energy_long_avg,
+            long_weight=self._state.energy_long_weight,
+        )
+        feelings = self._state.energy_feelings
+        if ctx.energy is not None:
+            result = advance_energy(
+                carry,
+                prev_feelings=self._state.energy_feelings,
+                inputs=ctx.energy,
+                now=datetime.fromisoformat(ctx.now_iso),
+            )
+            carry = result.carry
+            if result.feelings is not None:
+                feelings = result.feelings
+        feelings = None if feelings is None else dict(feelings)
+
         first_tick_ts = _compute_first_tick_ts(self._state, ctx.now_iso)
         self._state = FeltTimeState(
             lived_age_hours=lived,
@@ -160,6 +190,10 @@ class FeltTime:
             replayed=False,  # first real tick clears the recovery banner
             horizon_pressure=horizon_pressure,
             arc_anchors=arc_anchors,
+            energy_level=carry.level,
+            energy_long_avg=carry.long_avg,
+            energy_long_weight=carry.long_weight,
+            energy_feelings=feelings,
         )
         persist(self._state, self.persona_dir)
 

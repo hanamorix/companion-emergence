@@ -316,8 +316,7 @@ def dispatch(
             # already uses (active-conversation-buffer age), so the
             # brain's self-read matches what the panel shows. Bug
             # surfaced 2026-05-17: without this, get_body_state always
-            # returned session_hours=0.0 + fresh-persona defaults
-            # (energy 7, exhaustion 0) regardless of session age.
+            # returned session_hours=0.0 regardless of session age.
             from datetime import UTC, datetime
 
             from brain.body.session_hours import compute_active_session_hours

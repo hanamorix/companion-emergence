@@ -1,8 +1,9 @@
 """Every reader of how the kindled feels gives the answer the emotion engine gives.
 
 About a dozen readers each turn the engine's read into the numbers they use (the body block, the persona panels, the
-tools, the rest gate, the self-model tick, the maker, the soul review, the reflex and research engines, the felt-time
-drivers, the heartbeat summary). This file puts each reader beside the one answer the engine gives: the short averages of
+tools, the self-model tick, the maker, the soul review, the reflex and research engines, the heartbeat summary; the
+rest gate and the felt-time strain read the saved energy level and no feeling, so they are not here, see
+test_energy_readers_one_level.py). This file puts each reader beside the one answer the engine gives: the short averages of
 its ``read()``, here the ones an ``emotion_engine_stub`` holds.
 
 Two file-backed stores stand behind the readers, with emotions that CONTRADICT the stub (so a reader that went back to
@@ -178,19 +179,11 @@ def _get_body_state(c: SimpleNamespace) -> None:
         hebbian.close()
 
 
-def _drivers(c: SimpleNamespace) -> None:
-    supervisor._derive_intensity_drivers(c.persona_dir, 0, 900.0)
-
-
 def _selfmodel(c: SimpleNamespace) -> None:
     from brain.bridge import cli_throttle
 
     cli_throttle.reset()  # a fresh persona's tick is due; the throttle must not hold a chat spell from another test
     supervisor._run_self_model_tick(c.persona_dir, provider=FakeProvider(), event_bus=_Bus())
-
-
-def _rest(c: SimpleNamespace) -> None:
-    supervisor._run_initiate_review_tick(c.persona_dir, FakeProvider(), _Bus())
 
 
 def _maker(c: SimpleNamespace) -> None:
@@ -322,9 +315,7 @@ _SURFACES: dict[str, tuple[Callable, Callable, Callable]] = {
     "prompt_body": (_install_body_state, _prompt_body, _as_is),
     "get_emotional_state": (_install_nothing, _get_emotional_state, _as_is),
     "get_body_state": (_install_body_state_in_tool, _get_body_state, _as_is),
-    "drivers": (_install_body_state, _drivers, _as_is),
     "selfmodel": (_install_body_state, _selfmodel, _as_is),
-    "rest": (_install_body_state, _rest, _as_is),
     "maker": (_install_nothing, _maker, lambda ref: {"peak": max(ref.values())}),
     "review": (_install_nothing, _review, _top_three_summary),
     "reflex": (_install_reflex, _reflex, _as_is),
@@ -366,14 +357,14 @@ def _check_the_stub_shows_the_case(stub, called_at: datetime, surface: str, data
 
 @pytest.mark.no_base_failure(
     reason=(
-        "same-answer test, re-pointed at the engine read; its 24 ids are the safety net's (#581) and are unchanged, so "
+        "same-answer test, re-pointed at the engine read; its ids are the safety net's (#581) and are unchanged (the cells of the rest gate and the felt-time strain left with #650, they read the saved energy level), so "
         "the base check does not judge them. Each cell is shown able to fail by running the file against the base "
         "source, where the readers still take their old branches (recorded in the run's harness notes)"
     )
 )
 @pytest.mark.parametrize(("surface", "dataset"), CELLS)
 def test_surface_matches_the_store_pool(surface, dataset, tmp_path, monkeypatch, emotion_engine_stub):
-    # (The id keeps the safety net's name (#581) so the 24 cells stay the same ids; what they compare against is now
+    # (The id keeps the safety net's name (#581) so the cells keep their ids; what they compare against is now
     # the engine's short averages.)
     install, call, expected_from = _SURFACES[surface]
     table = _STUB_TABLES[dataset]

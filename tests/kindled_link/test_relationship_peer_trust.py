@@ -32,6 +32,29 @@ def test_no_database_answers_zero_and_creates_nothing(tmp_path):
     assert not kindled_db_path(tmp_path).parent.exists()
 
 
+@pytest.mark.no_base_failure(reason="pins the existing guard that reading never creates the database; the base code already holds it")
+def test_a_missing_database_in_an_existing_folder_is_not_created_by_a_read(tmp_path):
+    # With the folder present, a connect would succeed and create an empty database, so only the existence guard keeps it absent.
+    folder = kindled_db_path(tmp_path).parent
+    folder.mkdir(parents=True)
+    assert peer_trust(tmp_path, "kid_a") == 0.0
+    assert not kindled_db_path(tmp_path).exists()
+    assert list(folder.iterdir()) == []
+
+
+def test_a_path_that_cannot_be_inspected_answers_zero_and_warns(tmp_path, monkeypatch, caplog):
+    # Python 3.12 and 3.13 raise PermissionError from a stat of a path under an unsearchable folder. A real database
+    # holds trust 0.9, so an unguarded read would answer 0.9, not 0.0. raising=False: the base module has no stat_path.
+    _save_relationship(tmp_path, trust_score=0.9)
+
+    def denied(path):
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr("brain.kindled_link.relationship.stat_path", denied, raising=False)
+    assert peer_trust(tmp_path, "kid_a") == 0.0
+    assert "peer_trust" in caplog.text
+
+
 def test_answers_stored_trust_with_no_stage_cap(tmp_path):
     _save_relationship(tmp_path, stage="stranger", trust_score=0.9)
     assert peer_trust(tmp_path, "kid_a") == pytest.approx(0.9)

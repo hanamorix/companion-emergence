@@ -57,7 +57,7 @@ _EXPECTED_JOBS = {
     TIER_BACKGROUND_HOUSEKEEPING: ("model.background_housekeeping", "haiku"),
     TIER_COMPACTION: ("model.compaction", "haiku"),
     TIER_SELF_MODEL_ARTICULATE: ("model.self_model_articulate", "haiku"),
-    TIER_ATTUNEMENT_DETECTOR: ("model.attunement_detector", "claude-haiku-4-5"),
+    TIER_ATTUNEMENT_DETECTOR: ("model.attunement_detector", "haiku"),
 }
 
 
@@ -122,8 +122,6 @@ def test_every_job_registration_carries_a_description_saying_what_the_job_is() -
     opus_lines = [ln for ln in source.splitlines() if ln.startswith("OPUS_CHOICE")]
     assert len(opus_lines) == 1 and "#" in source[source.index(opus_lines[0]) - 400 : source.index(opus_lines[0])]
     assert OPUS_CHOICE == "claude-opus-5"
-    # the detector's rationale stays a code comment beside its registration (it is not description text)
-    assert "newest 4.5 snapshot" in source
 
 
 # ---------------------------------------------------------------------------
@@ -235,13 +233,9 @@ def test_local_tiers_are_repointable_in_this_module_only(monkeypatch) -> None:
     assert model_for_tier(TIER_BACKGROUND_CLASSIFIER) == "haiku"
 
 
-def test_the_detector_stays_on_haiku_4_5_by_its_dateless_id_not_the_haiku_alias() -> None:
-    """Owner ruling 2026-10-21: the dateless id (the CLI accepts it and it follows the newest 4.5 snapshot) replaces the
-    dated snapshot id; the `haiku` alias would move the detector off 4.5 when a newer Haiku ships."""
-    from brain.bridge.model_tier import is_valid_model
-
-    assert model_for_tier(TIER_ATTUNEMENT_DETECTOR) == "claude-haiku-4-5"
-    assert is_valid_model("claude-haiku-4-5")
+def test_the_detector_runs_the_haiku_alias_like_the_other_haiku_jobs() -> None:
+    """#831 (owner ruling 2026-11-27): the detector's default is the `haiku` alias, the same as every other Haiku job."""
+    assert model_for_tier(TIER_ATTUNEMENT_DETECTOR) == "haiku" == model_for_tier(TIER_BACKGROUND_CLASSIFIER)
 
 
 # ---------------------------------------------------------------------------
@@ -283,10 +277,16 @@ def test_choice_for_is_the_exact_reverse_and_none_for_a_custom_id() -> None:
 
 def test_per_job_equality_of_the_words() -> None:
     """`sonnet` equals the default of chat and background-generative but not of the Haiku jobs; `haiku` equals the default of
-    the four Haiku jobs, not of chat (so `set-tier <haiku job> haiku` writes nothing new and `... sonnet` writes the id)."""
+    the five Haiku jobs, not of chat (so `set-tier <haiku job> haiku` writes nothing new and `... sonnet` writes the id)."""
     chat, gen = shipped_default(TIER_INTERACTIVE_CHAT), shipped_default(TIER_BACKGROUND_GENERATIVE)
     assert resolve_choice("sonnet") == chat == gen
-    for tier in (TIER_BACKGROUND_CLASSIFIER, TIER_BACKGROUND_HOUSEKEEPING, TIER_COMPACTION, TIER_SELF_MODEL_ARTICULATE):
+    for tier in (
+        TIER_BACKGROUND_CLASSIFIER,
+        TIER_BACKGROUND_HOUSEKEEPING,
+        TIER_COMPACTION,
+        TIER_SELF_MODEL_ARTICULATE,
+        TIER_ATTUNEMENT_DETECTOR,
+    ):
         assert resolve_choice("sonnet") != shipped_default(tier)
         assert resolve_choice("haiku") == shipped_default(tier)
     assert resolve_choice("haiku") != chat

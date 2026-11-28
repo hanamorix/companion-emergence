@@ -1445,6 +1445,14 @@ def _seed_closable(persona: Path, sid: str, rows: list[dict]) -> list[dict]:
     return read_session(persona, sid)
 
 
+def _archive_without_stats(persona: Path, sid: str) -> list[dict]:
+    """The archive of a finished conversation file: it must end with exactly one stats row (#650 step 6); returns the rows before it."""
+    rows = read_archive(persona, sid)
+    assert rows and rows[-1].get("type") == "session_stats", "a finished file ends with its stats row"
+    assert not any(r.get("type") == "session_stats" for r in rows[:-1]), "one stats row, last"
+    return rows[:-1]
+
+
 def _close_noop(persona: Path, sid: str, store: MemoryStore, hebbian: HebbianMatrix):
     return close_session(persona, sid, store=store, hebbian=hebbian, provider=_CannedProvider([]))
 
@@ -1466,7 +1474,7 @@ def test_close_archives_every_buffer_row_before_removing_it(
     report = _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian)
 
     assert report.reached_end
-    assert read_archive(tmp_path, _ARCHIVE_SID) == rows
+    assert _archive_without_stats(tmp_path, _ARCHIVE_SID) == rows
     assert not any(p.exists() for p in _sidecars(tmp_path, _ARCHIVE_SID).values())
 
 
@@ -1481,7 +1489,7 @@ def test_close_keeps_an_earlier_archived_batch_first(
 
     assert _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian).reached_end
 
-    assert read_archive(tmp_path, _ARCHIVE_SID) == earlier + rows
+    assert _archive_without_stats(tmp_path, _ARCHIVE_SID) == earlier + rows
     assert not _sidecars(tmp_path, _ARCHIVE_SID)["buffer"].exists()
 
 
@@ -1508,7 +1516,7 @@ def test_close_after_a_real_compaction_archives_every_row_once(
 
     assert _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian).reached_end
 
-    archive = read_archive(tmp_path, _ARCHIVE_SID)
+    archive = _archive_without_stats(tmp_path, _ARCHIVE_SID)
     assert archive[: len(after_compaction)] == after_compaction  # compaction's batch first, intact
     assert archive[len(after_compaction) :] == left_in_buffer  # the close's batch after it
     assert [r["text"] for r in archive if r["speaker"] != "summary"] == [r["text"] for r in original]  # each turn once, in order
@@ -1532,7 +1540,9 @@ def test_close_has_archived_everything_when_it_removes_the_buffer(
 
     _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian)
 
-    assert seen_at_delete == [rows]
+    # the stats row is already written too: the file is finished before its buffer goes
+    assert len(seen_at_delete) == 1 and seen_at_delete[0][:-1] == rows
+    assert seen_at_delete[0][-1]["type"] == "session_stats"
 
 
 def test_close_keeps_buffer_cursor_and_backoff_when_the_archive_write_fails(
@@ -1589,12 +1599,12 @@ def test_a_crash_between_the_archive_and_the_removal_loses_nothing_and_archives_
 
     with pytest.raises(OSError, match="killed at the removal"):
         _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian)
-    assert read_archive(tmp_path, _ARCHIVE_SID) == rows
+    assert _archive_without_stats(tmp_path, _ARCHIVE_SID) == rows
     assert _sidecars(tmp_path, _ARCHIVE_SID)["buffer"].exists()
 
     assert _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian).reached_end
     assert not _sidecars(tmp_path, _ARCHIVE_SID)["buffer"].exists()
-    assert read_archive(tmp_path, _ARCHIVE_SID) == rows  # once, not twice
+    assert _archive_without_stats(tmp_path, _ARCHIVE_SID) == rows  # once, not twice; and one stats row, not two
 
 
 def test_a_crash_between_the_archive_append_and_its_marker_loses_no_row(
@@ -1661,6 +1671,9 @@ def test_a_writer_that_takes_no_append_lock_keeps_the_buffer_and_the_retry_archi
     assert first.reached_end is False
     assert read_session(tmp_path, _ARCHIVE_SID) == [*rows, added]
     assert paths["cursor"].exists() and paths["backoff"].exists()
+    assert not any(r.get("type") == "session_stats" for r in read_archive(tmp_path, _ARCHIVE_SID)), (
+        "a close that keeps its buffer writes no stats row (#650 spec 5.1)"
+    )
 
     second = _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian)
 
@@ -1723,6 +1736,46 @@ def test_the_close_holds_the_append_lock_from_the_late_rows_check_to_the_removal
     assert [r["text"] for r in read_session(tmp_path, _ARCHIVE_SID)] == ["after the close"]
 
 
+def test_close_ends_the_archive_with_a_stats_row_of_the_whole_file(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
+) -> None:
+    """A15: a close that removes its buffer appends one stats row last; it covers the earlier archive and the buffer together."""
+    start = datetime(2026, 10, 1, 9, 0, tzinfo=UTC)
+    earlier = _archive_rows(_ARCHIVE_SID, 3, start=start - timedelta(hours=3))  # 10 s apart: a sitting of 20 s
+    append_archive(tmp_path, _ARCHIVE_SID, earlier)
+    _seed_closable(tmp_path, _ARCHIVE_SID, _archive_rows(_ARCHIVE_SID, 4, start=start))  # a sitting of 30 s
+
+    assert _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian).reached_end
+
+    row = read_archive(tmp_path, _ARCHIVE_SID)[-1]
+    assert row["type"] == "session_stats" and list(row)[0] == "type"
+    assert "speaker" not in row and "ts" not in row and set(row) == {"type", "avg_sitting_minutes", "busiest"}
+    assert row["avg_sitting_minutes"] == 0.4  # two sittings of 20 s and 30 s: mean 25 s, to one decimal of a minute
+
+
+def test_a_stats_write_failure_does_not_stop_the_close(
+    tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """5.4: the stats row failing is logged with the session and the close still archives, removes and finishes."""
+    from brain.ingest import session_stats
+
+    rows = _seed_closable(
+        tmp_path, _ARCHIVE_SID, _archive_rows(_ARCHIVE_SID, 4, start=datetime(2026, 10, 1, 9, 0, tzinfo=UTC))
+    )
+
+    def _broken(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(session_stats, "append_archive", _broken)
+    with caplog.at_level(logging.ERROR, logger="brain.ingest.session_stats"):
+        report = _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian)
+
+    assert report.reached_end
+    assert not _sidecars(tmp_path, _ARCHIVE_SID)["buffer"].exists()
+    assert read_archive(tmp_path, _ARCHIVE_SID) == rows
+    assert any(_ARCHIVE_SID in rec.getMessage() for rec in caplog.records)
+
+
 def test_a_torn_line_is_dropped_with_the_file_and_every_parseable_row_is_archived(
     tmp_path: Path, store: MemoryStore, hebbian: HebbianMatrix
 ) -> None:
@@ -1736,7 +1789,7 @@ def test_a_torn_line_is_dropped_with_the_file_and_every_parseable_row_is_archive
 
     assert _close_noop(tmp_path, _ARCHIVE_SID, store, hebbian).reached_end
 
-    assert read_archive(tmp_path, _ARCHIVE_SID) == rows
+    assert _archive_without_stats(tmp_path, _ARCHIVE_SID) == rows
     assert not buffer_path.exists()
 
 

@@ -65,10 +65,11 @@ def test_heartbeat_and_felt_time_passes_real_counts(
     real_felt_time_tick = sup_mod._run_felt_time_tick
 
     def _spy_felt_time_tick(persona_dir, *, wall_clock_s_since_last, heartbeats_since_last,
-                            chat_turns_since_last, reflex_firings_since_last):
+                            chat_turns_since_last, reflex_firings_since_last, heartbeat_interval_s):
         felt_time_calls.append({
             "chat_turns": chat_turns_since_last,
             "reflex_firings": reflex_firings_since_last,
+            "heartbeat_interval_s": heartbeat_interval_s,
         })
         return real_felt_time_tick(
             persona_dir,
@@ -76,6 +77,7 @@ def test_heartbeat_and_felt_time_passes_real_counts(
             heartbeats_since_last=heartbeats_since_last,
             chat_turns_since_last=chat_turns_since_last,
             reflex_firings_since_last=reflex_firings_since_last,
+            heartbeat_interval_s=heartbeat_interval_s,
         )
 
     monkeypatch.setattr(sup_mod, "_run_felt_time_tick", _spy_felt_time_tick)
@@ -84,10 +86,11 @@ def test_heartbeat_and_felt_time_passes_real_counts(
     event_bus = MagicMock()
     last_heartbeat_at = _time.monotonic() - 60.0  # 60s ago
 
-    sup_mod._heartbeat_and_felt_time(persona_dir, provider, event_bus, last_heartbeat_at)
+    sup_mod._heartbeat_and_felt_time(persona_dir, provider, event_bus, last_heartbeat_at, 450.0)
 
     assert len(felt_time_calls) == 1, "Expected exactly one _run_felt_time_tick call"
     call = felt_time_calls[0]
+    assert call["heartbeat_interval_s"] == 450.0, "the loop's own heartbeat interval must reach the felt-time tick"
     assert call["chat_turns"] == 2, (
         f"Expected 2 chat turns (the seeded buffer), got {call['chat_turns']}"
     )
@@ -153,6 +156,9 @@ def test_supervisor_invokes_felt_time_tick_on_heartbeat_cadence(
         def __init__(self, *, persona_dir: Path) -> None:
             tick_calls.append(("init", persona_dir))
 
+        def interval_start(self, now, wall_clock_s: float):
+            return now
+
         def tick(self, ctx: object) -> None:
             tick_calls.append(("tick", ctx))
 
@@ -214,6 +220,9 @@ def test_supervisor_felt_time_tick_fault_isolated(
     class _ExplodingFeltTime:
         def __init__(self, *, persona_dir: Path) -> None:
             pass
+
+        def interval_start(self, now, wall_clock_s: float):
+            return now
 
         def tick(self, ctx: object) -> None:
             raise RuntimeError("felt-time tick exploded")
@@ -311,6 +320,7 @@ def test_run_felt_time_tick_appends_chat_log(tmp_path: Path, monkeypatch: pytest
     from brain.felt_time.chat_log import CHAT_TURNS_LOG_FILENAME
 
     monkeypatch.setattr("brain.bridge.supervisor.FeltTime", MagicMock())
+    monkeypatch.setattr("brain.body.energy_inputs.gather_energy_inputs", MagicMock())
 
     _run_felt_time_tick(
         tmp_path,
@@ -318,6 +328,7 @@ def test_run_felt_time_tick_appends_chat_log(tmp_path: Path, monkeypatch: pytest
         heartbeats_since_last=1,
         chat_turns_since_last=4,
         reflex_firings_since_last=0,
+        heartbeat_interval_s=900.0,
     )
 
     log_path = tmp_path / CHAT_TURNS_LOG_FILENAME
@@ -325,6 +336,151 @@ def test_run_felt_time_tick_appends_chat_log(tmp_path: Path, monkeypatch: pytest
     import json as _json
     row = _json.loads(log_path.read_text().strip())
     assert row["turns"] == 4
+
+
+def test_run_felt_time_tick_steps_body_energy_from_the_interval_and_saves_it(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    """The through-path (#650 spec 1.2, 2.4): a message in the interval and a saved feeling reach the persisted level."""
+    import json as _json
+    from datetime import UTC, datetime, timedelta
+
+    from brain.bridge.supervisor import _run_felt_time_tick
+    from brain.emotion.engine import Reading
+    from brain.ingest.buffer import ingest_turn
+
+    emotion_engine_stub.readings = {"joy": Reading(short=3.0, long=3.0, difference=0.0, shift=0)}
+    ingest_turn(
+        tmp_path,
+        {
+            "session_id": "sess_a",
+            "speaker": "assistant",
+            "text": "a few words in a reply",
+            "ts": (datetime.now(UTC) - timedelta(seconds=100)).isoformat(),
+        },
+    )
+    _run_felt_time_tick(
+        tmp_path,
+        wall_clock_s_since_last=900.0,
+        heartbeats_since_last=1,
+        chat_turns_since_last=1,
+        reflex_firings_since_last=0,
+        heartbeat_interval_s=900.0,
+    )
+    saved = _json.loads((tmp_path / "felt_time_state.json").read_text())
+    # Her only message: length factor 1, speaker weight 1, X = 0 (no saved feelings): the base cost at 6.5.
+    assert saved["energy_level"] == pytest.approx(6.5 - 0.375 * (5.0 / 6.5), abs=1e-9)
+    assert saved["energy_feelings"] == {"joy": 3.0}
+    assert saved["energy_long_weight"] == 1.0
+
+
+def test_run_felt_time_tick_hands_the_supervisors_heartbeat_interval_to_the_energy_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One value, not two copies: the interval the loop runs on is the one the energy catch-up counts closed time in."""
+    from brain.body import energy_inputs
+    from brain.bridge.supervisor import _run_felt_time_tick
+
+    seen: dict[str, float] = {}
+    real_gather = energy_inputs.gather_energy_inputs
+
+    def spy(persona_dir, *, interval_start, now, heartbeat_s):
+        seen["heartbeat_s"] = heartbeat_s
+        return real_gather(persona_dir, interval_start=interval_start, now=now, heartbeat_s=heartbeat_s)
+
+    monkeypatch.setattr(energy_inputs, "gather_energy_inputs", spy)
+    monkeypatch.setattr("brain.emotion.engine.engine_for", lambda persona_dir: _NoFeelingsEngine())
+    _run_felt_time_tick(
+        tmp_path,
+        wall_clock_s_since_last=900.0,
+        heartbeats_since_last=1,
+        chat_turns_since_last=0,
+        reflex_firings_since_last=0,
+        heartbeat_interval_s=450.0,
+    )
+    assert seen == {"heartbeat_s": 450.0}
+
+
+class _NoFeelingsEngine:
+    """An engine that reads nothing (recovery pending): the energy step then has no mood and no feeling movement."""
+
+    def read(self) -> dict:
+        return {}
+
+    def feels_high(self, name: str) -> bool:
+        return False
+
+    def note_active(self, now) -> None:  # noqa: ANN001 - the energy step applies queued changes first (nothing is queued here)
+        return None
+
+
+class _QueuedChangeEngine:
+    """An engine holding one queued feeling change: `read()` shows it only after `note_active` applied it (as the real one)."""
+
+    def __init__(self) -> None:
+        from brain.emotion.engine import Reading
+
+        self.applied = False
+        self.calls: list[str] = []
+        self._reading = Reading(short=4.0, long=4.0, difference=0.0, shift=0)
+
+    def note_active(self, now) -> None:  # noqa: ANN001
+        self.calls.append("note_active")
+        self.applied = True
+
+    def read(self) -> dict:
+        self.calls.append("read")
+        return {"joy": self._reading} if self.applied else {}
+
+    def feels_high(self, name: str) -> bool:
+        return False
+
+
+def _run_tick_with_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engine: object) -> dict:
+    import json as _json
+
+    from brain.bridge.supervisor import _run_felt_time_tick
+
+    monkeypatch.setattr("brain.emotion.engine.engine_for", lambda persona_dir: engine)
+    _run_felt_time_tick(
+        tmp_path,
+        wall_clock_s_since_last=900.0,
+        heartbeats_since_last=1,
+        chat_turns_since_last=0,
+        reflex_firings_since_last=0,
+        heartbeat_interval_s=900.0,
+    )
+    return _json.loads((tmp_path / "felt_time_state.json").read_text())
+
+
+def test_the_energy_step_applies_the_engines_queued_changes_before_it_reads_the_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#650 finding 5 (L2 item 10): pass 2's change is only queued until applied; the step applies it, then reads it."""
+    from brain.bridge import cli_throttle
+
+    cli_throttle.reset()
+    engine = _QueuedChangeEngine()
+    saved = _run_tick_with_engine(tmp_path, monkeypatch, engine)
+    assert engine.calls[:2] == ["note_active", "read"]
+    assert saved["energy_feelings"] == {"joy": 4.0}, "the queued change reached the step's saved feelings"
+
+
+@pytest.mark.no_base_failure(reason="the base never applied queued changes in the energy step, so it passes there; this pins the reply-in-flight rule of the new apply (the control is the test above)")
+def test_the_energy_step_does_not_apply_queued_changes_while_a_reply_is_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from brain.bridge import cli_throttle
+
+    cli_throttle.reset()
+    cli_throttle.note_user_message()
+    try:
+        engine = _QueuedChangeEngine()
+        _run_tick_with_engine(tmp_path, monkeypatch, engine)
+    finally:
+        cli_throttle.note_reply_end()
+        cli_throttle.reset()
+    assert "note_active" not in engine.calls and engine.calls[0] == "read"
 
 
 def test_derive_intensity_drivers_chat_activity_uses_rolling_baseline(tmp_path: Path) -> None:
@@ -473,28 +629,41 @@ def test_live_drivers_are_finite_in_unit_range_and_emotional_intensity_is_unplug
         assert math.isfinite(value) and 0.0 <= value <= 1.0
 
 
-def test_live_body_strain_follows_the_engines_predicate_not_the_store_or_a_level(
+@pytest.mark.parametrize(
+    ("level", "strain"),
+    [(1.0, 0.9), (6.5, 0.35), (10.0, 0.0), (6.326923076923077, 1.0 - 0.6326923076923077), (2.25, 0.775)],
+)
+def test_live_body_strain_is_one_minus_the_saved_level_over_ten(
+    tmp_path: Path, emotion_engine_stub, level: float, strain: float
+) -> None:
+    from brain.felt_time.state import FeltTimeState, persist
+
+    persist(FeltTimeState(energy_level=level), tmp_path)
+    assert _live_drivers(tmp_path, emotion_engine_stub, {}).body_strain == pytest.approx(strain)
+
+
+def test_live_body_strain_follows_the_saved_level_not_the_feelings_or_the_store(
     tmp_path: Path, emotion_engine_stub
 ) -> None:
+    from brain.felt_time.state import FeltTimeState, persist
     from brain.memory.store import MemoryStore
 
+    persist(FeltTimeState(energy_level=8.0), tmp_path)
     store = MemoryStore(tmp_path / "memories.db")
     for i in range(3):
-        _make_emotion_memory(store, channel="rest_need", value=9.0, days_ago=0.1 + i)  # stored: strain from rest_need
+        _make_emotion_memory(store, channel="rest_need", value=9.0, days_ago=0.1 + i)
     store.close()
     names = ("rest_need", "love", "joy", "awe", "grief", "calm", "desire", "arousal")
     quiet = _live_drivers(tmp_path, emotion_engine_stub, {})
-    # Every value far above the old levels, but the engine calls nothing high: strain does not move.
-    not_high = _live_drivers(tmp_path, emotion_engine_stub, dict.fromkeys(names, 9.0))
-    assert not_high.body_strain == quiet.body_strain
-    # Values far below the old levels, but the engine calls rest_need high: energy drops, so strain rises.
-    tired = _live_drivers(tmp_path, emotion_engine_stub, {"rest_need": 0.5}, high={"rest_need"})
-    assert tired.body_strain > quiet.body_strain
+    loud = _live_drivers(tmp_path, emotion_engine_stub, dict.fromkeys(names, 9.0), high=set(names))
+    assert quiet.body_strain == pytest.approx(0.2) == pytest.approx(loud.body_strain)
 
 
-def test_live_drivers_survive_a_read_that_raises(tmp_path: Path, emotion_engine_stub) -> None:
-    """The felt-time drivers keep their fail-soft except: a raising read leaves body strain and emotional
-    intensity at their 0.0 defaults and the other two drivers still come back."""
+def test_live_body_strain_without_a_saved_level_is_the_baseline_and_the_engine_is_not_read(
+    tmp_path: Path, emotion_engine_stub
+) -> None:
+    """No `felt_time_state.json`: the accessor's 6.5 baseline gives strain 0.35. A raising engine read changes nothing,
+    because strain no longer reads the feelings."""
 
     def boom():
         raise RuntimeError("engine fault")
@@ -503,4 +672,4 @@ def test_live_drivers_survive_a_read_that_raises(tmp_path: Path, emotion_engine_
     from brain.bridge.supervisor import _derive_intensity_drivers
 
     drivers = _derive_intensity_drivers(tmp_path, chat_turns_in_tick=0, wall_clock_s_in_tick=900.0)
-    assert drivers.body_strain == 0.0 and drivers.emotional_intensity == 0.0
+    assert drivers.body_strain == pytest.approx(0.35) and drivers.emotional_intensity == 0.0

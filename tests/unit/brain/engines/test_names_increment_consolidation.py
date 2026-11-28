@@ -21,6 +21,7 @@ from brain.engines import consolidation as cons
 from brain.engines.consolidation import (
     Decision,
     Reappraisal,
+    _JudgeSessions,
     _make_haiku_classifier,
     _make_haiku_reappraiser,
     _parse_reappraisal,
@@ -123,7 +124,7 @@ def test_n18_the_registered_user_templates():
 def _judge_message(cand_text: str, context_texts: list[str]) -> tuple[str, list[Memory]]:
     provider = FakeProvider(json.dumps({"verdict": "new", "names": []}))
     context = [_mem(t) for t in context_texts]
-    _make_haiku_classifier(provider)(_mem(cand_text, "dream"), context)
+    _make_haiku_classifier(_JudgeSessions(provider))(_mem(cand_text, "dream"), context)
     user, system = provider.calls[0]
     assert system == cons._CLASSIFIER_PROMPT
     return user, context
@@ -243,7 +244,7 @@ def test_n20_a_failing_list_read_gives_an_empty_list_and_the_call_still_happens(
     mem = store.create(_mem("then Wren came"))
     monkeypatch.setattr(kn, "load_known_names", lambda _p: (_ for _ in ()).throw(OSError("x")))
     provider = FakeProvider(_reply())
-    out = _make_haiku_reappraiser(provider, tmp)(store.get(mem, bump=False))
+    out = _make_haiku_reappraiser(_JudgeSessions(provider), tmp)(store.get(mem, bump=False))
     assert provider.calls[0][0].startswith("KNOWN NAMES: []\n") and out.importance == 6.0
 
 

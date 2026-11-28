@@ -163,8 +163,9 @@ def test_http_chat_queues_the_drain_as_a_background_task_and_runs_it_after_the_r
         _record_into(emotion_engine_stub, order)
         response = client.post("/chat", json={"session_id": sid, "message": "hi"})
     assert response.status_code == 200
-    assert queued == [server._drain_emotion_engine]
-    assert order == ["queued", "drain"]  # the drain is only queued by the handler; it runs once the response has gone out
+    # The drain, then pass 2's own thread start (tests/bridge/test_pass2_thread_start.py).
+    assert queued == [server._drain_emotion_engine, server._start_pass2_drain_after_reply]
+    assert order == ["queued", "queued", "drain"]  # the drain is only queued by the handler; it runs once the response has gone out
     assert len(_note_active_calls(emotion_engine_stub)) == 1
 
 

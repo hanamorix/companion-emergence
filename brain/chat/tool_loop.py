@@ -19,6 +19,7 @@ from itertools import count
 from pathlib import Path
 from typing import Any
 
+from brain.attunement.ambient import select_surfaceable_patterns
 from brain.attunement.budget import consume_call as _attunement_consume_call
 from brain.attunement.budget import get_remaining as _attunement_budget_remaining
 from brain.attunement.budget import lock as _attunement_budget_lock
@@ -28,6 +29,7 @@ from brain.attunement.store import (
     BufferTurn,
     mark_addressed,
     merge_into_learned,
+    read_learned_patterns,
     write_current_read,
 )
 from brain.bridge.chat import ChatMessage, ChatResponse
@@ -174,6 +176,9 @@ def _run_attunement_pass2(
         with _attunement_budget_lock(persona_dir):
             if _attunement_budget_remaining(persona_dir, now=datetime.now(UTC)) <= 0:
                 return  # budget exhausted; defer silently
+            # #830: offer the detector the patterns her prompt could show, by the same selection, read now (not stored on the
+            # queued record). It can differ from what she saw: accepted.
+            shown_patterns = select_surfaceable_patterns(read_learned_patterns(persona_dir))
             output = run_detector(
                 buffer_slice=buffer_slice,
                 reply_text=reply_text,
@@ -181,6 +186,7 @@ def _run_attunement_pass2(
                 user_name=user_name,
                 user_pronouns=user_pronouns,
                 persona_dir=persona_dir,
+                shown_patterns=shown_patterns,
             )
             _attunement_consume_call(persona_dir, now=datetime.now(UTC))
         write_current_read(persona_dir, output.current_read)

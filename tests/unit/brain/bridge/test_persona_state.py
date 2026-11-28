@@ -12,7 +12,7 @@ from brain.bridge.persona_state import build_persona_state
 def test_build_persona_state_fresh_persona_returns_safe_shape(tmp_path: Path) -> None:
     """Fresh persona dir (no DBs, no daemon_state) → 200-safe shape, never
     raises. Empty subsystems contribute empty/null values; body returns its
-    default (energy=8, days_since_contact=999) which is the correct
+    default (energy=6.5, days_since_contact=999) which is the correct
     fail-soft signal for 'no contact yet.'"""
     persona_dir = tmp_path / "fresh"
     persona_dir.mkdir()
@@ -21,7 +21,7 @@ def test_build_persona_state_fresh_persona_returns_safe_shape(tmp_path: Path) ->
     assert state["emotions"] == {}
     # body is computed even on empty stores — defaults shape it correctly
     assert state["body"] is not None
-    assert state["body"]["energy"] == 8  # baseline
+    assert state["body"]["energy"] == 6.5  # baseline (no saved level: the accessor's default)
     assert state["body"]["days_since_contact"] == 999.0  # "never contacted"
     assert state["interior"] == {
         "dream": None,
@@ -77,13 +77,13 @@ def test_build_persona_state_body_block_when_memories_exist(tmp_path: Path) -> N
     for required in (
         "energy",
         "temperature",
-        "exhaustion",
         "session_hours",
         "days_since_contact",
         "body_emotions",
     ):
         assert required in body
-    assert isinstance(body["energy"], int)
+    assert "exhaustion" not in body
+    assert isinstance(body["energy"], float)
     assert isinstance(body["body_emotions"], dict)
 
 
@@ -626,11 +626,11 @@ def test_build_body_omits_absent_body_emotions_and_never_shows_nan(tmp_path: Pat
     body = _build_body(tmp_path, now=datetime(2026, 11, 4, 12, 0, tzinfo=UTC))
     assert body is not None
     assert body["body_emotions"] == {"arousal": 6.0}
-    for key in ("energy", "temperature", "exhaustion", "session_hours", "days_since_contact"):
+    for key in ("energy", "temperature", "session_hours", "days_since_contact"):
         assert not math.isnan(body[key])
 
 
-def _body_numbers(tmp_path: Path, stub, readings: dict[str, float], high: set[str]) -> tuple[int, int]:
+def _body_numbers(tmp_path: Path, stub, readings: dict[str, float], high: set[str]) -> tuple[float, int]:
     from brain.bridge.persona_state import _build_body
 
     stub.high = set(high)
@@ -640,14 +640,25 @@ def _body_numbers(tmp_path: Path, stub, readings: dict[str, float], high: set[st
     return body["energy"], body["temperature"]
 
 
-def test_build_body_energy_and_temperature_follow_the_engines_predicate_not_a_level(
+def test_build_body_temperature_follows_the_engines_predicate_not_a_level_and_energy_follows_neither(
     tmp_path: Path, emotion_engine_stub
 ) -> None:
     energy, temperature = _body_numbers(tmp_path, emotion_engine_stub, {}, set())
     top = {"rest_need": 10.0, "desire": 10.0, "love": 10.0, "touch_hunger": 10.0}
     assert _body_numbers(tmp_path, emotion_engine_stub, top, set()) == (energy, temperature)
     low = {"rest_need": 0.5, "desire": 0.5, "love": 0.5, "touch_hunger": 0.5}
-    assert _body_numbers(tmp_path, emotion_engine_stub, low, set(low)) == (energy - 1, temperature + 1)
+    # desire and love warm (+2), touch_hunger cools (-1); rest_need high no longer lowers the energy.
+    assert _body_numbers(tmp_path, emotion_engine_stub, low, set(low)) == (energy, temperature + 1)
+
+
+def test_build_body_energy_is_the_saved_level_to_one_decimal(tmp_path: Path, emotion_engine_stub) -> None:
+    from brain.bridge.persona_state import _build_body
+    from brain.felt_time.state import FeltTimeState, persist
+
+    persist(FeltTimeState(energy_level=6.326923076923077), tmp_path)
+    body = _build_body(tmp_path, now=datetime(2026, 11, 4, 12, 0, tzinfo=UTC))
+    assert body is not None
+    assert body["energy"] == 6.3
 
 
 # ── the feeling names the frontend's expressions read instead of their own levels (HR1 item 4) ───

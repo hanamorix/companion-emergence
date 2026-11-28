@@ -104,8 +104,8 @@ gate (`reranker.normalize_against_anchors`) compares against. See
 Name-recall fix R2 (spec §2, S18/S25/S38): the same module also owns the
 COSINE floor the no-rerank path gates on (`get_cosine_bootstrap_floor`, the
 same F-beta fit over the same bundled pairs scored by the embedder, computed
-once per process at process start via `run_cosine_bootstrap`, retried at the next
-lull by the central cadence job, never on the reply path, S85; and
+once per process at process start via `run_cosine_bootstrap`, retried on each new
+chat message and at the next lull after chat activity (`floor_startup`), never on the reply path, S85; and
 `derive_and_persist_cosine_floor`, the daily fit from `cosine`-scale rows
 only into `cosine_floor_calibration`). Both derivations share `_fit_or_hold`;
 the two scales are never mixed.
@@ -615,9 +615,11 @@ def _cosine_bootstrap_pairs(embedder: Any) -> list[tuple[float, str]]:
 # Retry rule after a failed bootstrap (S85 revised): NO time constants. A
 # failed attempt records the caller's chat-activity marker (an opaque token that
 # changes whenever the user chats: `cli_throttle.chat_activity_marker()` in the
-# bridge). The bootstrap is due again only once that marker has CHANGED, i.e.
-# chat happened since the failure and the central cadence job then reaches the
-# next lull: at most one retry per lull, never one per turn or per pass.
+# bridge). The lull job and a caller that finds the embedding model not built
+# (#833) start a retry only once that marker has CHANGED, i.e. chat happened
+# since the failure. A failed bootstrap is also retried on EVERY incoming chat
+# message while it stays failed (`floor_startup.on_incoming_message`, which does
+# not look at this marker). Only one attempt runs at a time.
 _UNSET = object()
 # ("cosine" | "rerank", model id) -> the activity marker at the last failure.
 _bootstrap_failed_at: dict[tuple[str, str], object] = {}
@@ -682,8 +684,8 @@ def cosine_bootstrap_due(embedder_model_id: str, *, activity_marker: object = No
 def run_cosine_bootstrap(
     embedder_model_id: str, *, activity_marker: object = None
 ) -> dict[str, Any] | None:
-    """Compute the cosine bootstrap floor (process start, or the next-lull
-    retry by the cadence job; S85). Success caches it for the process; failure
+    """Compute the cosine bootstrap floor (process start, or a retry started by
+    a new message, the lull job or a caller; S85, #833). Success caches it for the process; failure
     records `activity_marker` so it is not retried until chat has happened
     again. Never raises."""
     try:
@@ -703,7 +705,8 @@ def get_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None:
     in place of `reranker_model_id`.
 
     OFF THE REPLY PATH ONLY (S85): the only caller is `run_cosine_bootstrap`
-    (process-start thread, or the central-cadence retry job);
+    (the process-start thread or a retry thread, `floor_startup`; in the bridge the model is
+    already built by then, `floor_startup.ensure_embedder_built`, #833);
     `MemoryStore.get_cosine_floor` reads the cache through
     `peek_cosine_bootstrap_floor` and never calls this.
 
@@ -714,8 +717,8 @@ def get_cosine_bootstrap_floor(embedder_model_id: str) -> dict[str, Any] | None:
 
     FAIL-SOFT: any failure (provider build/embed error, id mismatch,
     degenerate pairs) is logged and returns `None` (never cached;
-    `run_cosine_bootstrap` records the failure and the cadence job retries at
-    the next lull); until a floor exists the no-rerank path renders keyword results only (spec §2). Never an
+    `run_cosine_bootstrap` records the failure and it is retried as the rule
+    above says); until a floor exists the no-rerank path renders keyword results only (spec §2). Never an
     ungated cosine ranking.
     """
     cached = _cosine_bootstrap_floor_cache.get(embedder_model_id)

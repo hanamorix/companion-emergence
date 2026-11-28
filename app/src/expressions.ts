@@ -147,10 +147,10 @@ const SCARED_FAMILY = new Set(["fear", "guilt", "shame"]);
 const SHY_FAMILY = new Set(["vulnerability"]);
 const EXHAUSTED_FAMILY = new Set(["rest_need"]);
 const AWE_FAMILY = new Set(["awe", "emergence", "hope"]);
-const CONTENT_FAMILY = new Set(["contentment", "peace"]);
+const CONTENT_FAMILY = new Set(["contentment", "peace", "calm", "groundedness"]);
 const INTENT_FAMILY = new Set(["creative_hunger"]); // also in HAPPY — INTENT wins via order
 const DEFIANT_FAMILY = new Set(["defiance"]);
-const ACHING_FAMILY = new Set(["body_grief", "freedom_ache"]);
+const ACHING_FAMILY = new Set(["freedom_ache"]);
 
 /**
  * Body-emotion thresholds — when these fire, override whatever the
@@ -159,7 +159,6 @@ const ACHING_FAMILY = new Set(["body_grief", "freedom_ache"]);
  * list (`feels_high`); when there is no list, nothing counts as high.
  */
 const CLIMAX_OVERRIDE = 7;
-const EXHAUSTION_OVERRIDE = 7;
 const DAYS_SINCE_CONTACT_ACHING = 5;
 
 export interface ExpressionInput {
@@ -180,7 +179,6 @@ export function pickExpressionCategory(input: ExpressionInput): ExpressionCatego
   const arousalOverride =
     body !== null && (feelsHigh?.includes("arousal") ?? false) && (feelsHigh?.includes("desire") ?? false);
   if (arousalOverride) return "arousal";
-  if ((body?.exhaustion ?? 0) >= EXHAUSTION_OVERRIDE) return "exhausted";
 
   // 2. Long absence reads as bodily yearning
   if ((body?.days_since_contact ?? 0) >= DAYS_SINCE_CONTACT_ACHING) return "aching";

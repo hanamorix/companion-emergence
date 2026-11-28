@@ -112,9 +112,9 @@ def test_get_body_state_returns_real_shape(tmp_path: Path) -> None:
     result = get_body_state(**ctx)
 
     assert result["loaded"] is True
-    assert result["energy"] == 8  # baseline: empty store, no session drain
+    assert result["energy"] == 6.5  # baseline: nothing saved, the level accessor's default
     assert isinstance(result["temperature"], int)
-    assert isinstance(result["exhaustion"], int)
+    assert "exhaustion" not in result
     assert result["session_hours"] == 0.0
     # an empty read: no body emotion is read, so none is a key
     assert result["body_emotions"] == {}

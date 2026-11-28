@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from brain.engines.consolidation import _make_haiku_classifier
+from brain.engines.consolidation import _JudgeSessions, _make_haiku_classifier
 from brain.memory.store import Memory
 
 
@@ -39,7 +39,7 @@ def _cand() -> Memory:
 def test_classifier_reads_a_verdict_with_braces_in_the_surrounding_prose(reply):
     # Fails on 584ec8a1: the greedy `\{.*\}` spans the stray braces, json.loads fails, UnusableClassifierReply -> the
     # candidate is quarantined for good although the model gave a valid verdict.
-    decision = _make_haiku_classifier(_Reply(reply))(_cand(), [])
+    decision = _make_haiku_classifier(_JudgeSessions(_Reply(reply)))(_cand(), [])
     assert decision.verdict == "new"
 
 
@@ -50,7 +50,7 @@ def test_classifier_treats_a_reply_nested_past_the_recursion_limit_as_unusable()
 
     reply = '{"verdict": "new", "x": ' + "[" * 200_000 + "]" * 200_000 + "}"
     with pytest.raises(UnusableClassifierReply):
-        _make_haiku_classifier(_Reply(reply))(_cand(), [])
+        _make_haiku_classifier(_JudgeSessions(_Reply(reply)))(_cand(), [])
 
 
 def test_find_json_object_block_prefers_the_given_key_and_catches_recursion():

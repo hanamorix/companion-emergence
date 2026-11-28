@@ -42,6 +42,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from dataclasses import replace as dc_replace
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -74,7 +75,6 @@ from brain.bridge.model_tier import (
     build_tier_provider,
 )
 from brain.bridge.provider import LLMProvider
-from brain.chat import pass2_queue
 from brain.chat.session import (
     has_prunable_empty_sessions,
     prune_empty_sessions,
@@ -109,19 +109,13 @@ from brain.health.vocab_repair import (
     should_run_vocab_repair as _vocab_repair_should_run,
 )
 from brain.ingest import extraction_backfill
-from brain.ingest.emotion_backfill import (
-    has_emotion_backfill_work as _emotion_backfill_has_work,
-)
-from brain.ingest.emotion_backfill import (
-    run_emotion_backfill as _emotion_backfill_run,
-)
 from brain.ingest.pipeline import (
     finalize_stale_sessions,
     snapshot_stale_sessions,
 )
 from brain.initiate.review import _rest_state_from_energy, run_initiate_review_tick
 from brain.initiate.user_pattern import compute_user_presence
-from brain.memory import cost_series, floor_startup, recall_diagnostics, reranker
+from brain.memory import cost_series, embeddings, floor_startup, recall_diagnostics, reranker
 from brain.memory.embedding_backfill import (
     delete_legacy_embeddings_db as _delete_legacy_embeddings_db,
 )
@@ -445,7 +439,7 @@ def run_folded(
     # Step 1 bumps decay_half_life_days from the bad 1.0 → 14.0 (sync,
     # provider-free, so it always lands). Step 2 re-derives descriptions via
     # Haiku (fail-soft — placeholders kept if provider unavailable/fails).
-    # Runs adjacent to emotion backfill; independent of it (separate try/except).
+    # Independent of the other startup steps (separate try/except).
     try:
         _run_vocab_repair_tick(persona_dir)
     except Exception as exc:  # noqa: BLE001
@@ -544,23 +538,27 @@ def run_folded(
             and time.monotonic() - last_heartbeat_at >= heartbeat_interval_s
         ):
             _heartbeat_attempt_result = _heartbeat_and_felt_time(
-                persona_dir, provider, event_bus, last_heartbeat_at
+                persona_dir, provider, event_bus, last_heartbeat_at, heartbeat_interval_s
             )
             # Stage-6 red-team MAJOR, fixed (ram-spike-fix INC-7, S21):
-            # `_heartbeat_and_felt_time` now returns None WITHOUT doing
-            # anything when a chat reply is in flight (the new start
+            # `_heartbeat_and_felt_time` returns None WITHOUT doing
+            # anything when a chat reply is in flight (the start
             # check) — advancing `last_heartbeat_at` unconditionally in
             # that case would restart this whole 15-min countdown on a
             # tick that did no work, so a chat session busy enough to
             # almost always have a reply in flight near the 15-min mark
             # could defer the heartbeat far past its own interval,
-            # indefinitely. Only advance on an ACTUAL attempt (non-None
-            # return) — a skipped tick leaves `last_heartbeat_at`
+            # indefinitely. Only advance when the heartbeat RAN (any
+            # non-None return): a skipped tick leaves `last_heartbeat_at`
             # untouched, so the very next supervisor loop pass (seconds
             # away, not 15 minutes) re-checks immediately instead of
-            # waiting out a full fresh interval.
+            # waiting out a full fresh interval. A pass whose felt-time
+            # step raised (#832) also ran the heartbeat, so it advances
+            # too and waits its normal interval; it has no drivers, so the
+            # cached ones stay.
             if _heartbeat_attempt_result is not None:
-                _last_intensity_drivers = _heartbeat_attempt_result
+                if _heartbeat_attempt_result is not _HeartbeatRan.FELT_TIME_FAILED:
+                    _last_intensity_drivers = _heartbeat_attempt_result
                 last_heartbeat_at = time.monotonic()
 
     def _between_items() -> bool:
@@ -906,8 +904,7 @@ def run_folded(
             # wait, and never while a chat reply is being generated (the reply path drains after it is sent). `note_active` catches
             # and logs its own failures and never raises. Accepted edge (E5.16, section 6): a day that ends closes at the next
             # drain, so the rollover can lag until the next supervisor pass or the next reply.
-            if not cli_throttle.reply_in_flight():
-                emotion_engine.engine_for(persona_dir).note_active(datetime.now(UTC))
+            _apply_queued_emotion_changes(persona_dir)
 
             # Wait for the next tick or for stop_event, whichever comes first.
             stop_event.wait(timeout=tick_interval_s)
@@ -993,10 +990,11 @@ def _build_gated_jobs(
     """The job table of the central cadence function (INC-9, S16/S55/S70).
 
     One ``GatedJob`` per gated job; a job whose ``*_interval_s`` is None (the
-    test/dev disable knob) is left out. The emotion recovery rebuild (#584), pass 2, session snapshot/prune,
-    emotion backfill, research recovery (#591), embedding backfill and the extraction backfill (#523)
+    test/dev disable knob) is left out. The emotion recovery rebuild (#584), session snapshot/prune,
+    research recovery (#591), embedding backfill and the extraction backfill (#523)
     have no interval: each runs at every idle pass while it has work (S53/S66;
-    the extraction backfill takes one chunk per pass). Deploy recalibration is due
+    the extraction backfill takes one chunk per pass). Pass 2 is not a job here: it runs on a
+    short-lived thread of its own per reply (``pass2_queue.drain_in_own_thread``). Deploy recalibration is due
     while the stored floor is stale (S70/S73). The cosine and rerank floor
     bootstraps (name-recall fix S85 revised, S91, S92) are the next-lull RETRY
     path here: due while neither a calibrated row nor the process-cached
@@ -1016,8 +1014,7 @@ def _build_gated_jobs(
     ctx: dict[str, MemoryStore | None] = tick_ctx if tick_ctx is not None else {"store": None}
     # INC-10 (S14/S41/S65): the between-items hook every pausable job's own
     # loop asks. Callers that don't wire one (older tests, direct unit
-    # calls) get the bare idle check with no heartbeat hook — same
-    # behavior pass2's should_pause had before this increment.
+    # calls) get the bare idle check with no heartbeat hook.
     _between_items: Callable[[], bool] = (
         between_items if between_items is not None else (lambda: not cli_throttle.is_chat_idle())
     )
@@ -1047,37 +1044,6 @@ def _build_gated_jobs(
             "emotion_recovery_rebuild",
             run=_emotion_recovery_run,
             has_work=lambda: emotion_engine.engine_for(persona_dir).needs_recovery(),
-        )
-    )
-
-    # 1. pass 2 — S53: every idle pass while the saved queue is non-empty.
-    def _pass2_run() -> JobOutcome:
-        with cli_throttle.background_slot() as slot:
-            if not slot:
-                return JobOutcome.SKIPPED
-            # S14 (per item): a message arriving mid-drain stops it at the next
-            # item boundary; what's left stays saved for the next lull (S64).
-            # INC-10: should_pause is the between-items hook (heartbeat + idle),
-            # not a bare idle check, so a heartbeat due mid-drain still runs
-            # between items rather than waiting for the whole drain (S41/S65).
-            drained = pass2_queue.drain_all_locked(persona_dir, should_pause=_between_items)
-        logger.info("pass-2 job: drained=%d", drained)
-        # 0 drained with work queued = another process holds pass2_drain.lock
-        # (S77): nothing ran, so report a skip (pass 2 has no cadence either way).
-        if drained == 0:
-            return JobOutcome.SKIPPED
-        # INC-10 (C8): drained something but the saved queue (S64, the queue
-        # file itself IS pass 2's saved progress) still has items — the
-        # between-items hook stopped the drain for chat, not an empty queue.
-        if pass2_queue.queue_length(persona_dir) > 0:
-            return JobOutcome.PAUSED
-        return JobOutcome.COMPLETED
-
-    jobs.append(
-        GatedJob(
-            "pass2",
-            run=_pass2_run,
-            has_work=lambda: pass2_queue.queue_length(persona_dir) > 0,
         )
     )
 
@@ -1157,39 +1123,7 @@ def _build_gated_jobs(
         GatedJob("session_snapshot_prune", run=_snapshot_prune_run, has_work=_snapshot_prune_has_work)
     )
 
-    # 3. emotion backfill — S53/S66 (was a startup one-shot only).
-    def _emotion_backfill_job_has_work() -> bool:
-        with _tick_store() as store:
-            return _emotion_backfill_has_work(persona_dir, store=store)
-
-    def _emotion_backfill_job() -> JobOutcome:
-        # The per-tick shared store (#132): one memories.db connection per tick.
-        emotion_paused_out: list[bool] = []
-        with _tick_store() as store:
-            _emotion_backfill_run(
-                persona_dir,
-                provider=build_tier_provider(persona_dir, TIER_BACKGROUND_CLASSIFIER),
-                store=store,
-                should_pause=_between_items,
-                paused_out=emotion_paused_out,
-            )
-        # INC-10 (C8): PAUSED only when the between-items hook itself stopped
-        # the pass (emotion_paused_out, set at that exact return site) — NOT
-        # merely whenever status=="running", which ALSO covers the unrelated
-        # zero-tagged-guard case (a systematic tagger failure leaves status
-        # "running" too, but that is not a chat-idle pause and must not stop
-        # the S55 sequence for the jobs after this one).
-        return JobOutcome.PAUSED if emotion_paused_out else JobOutcome.COMPLETED
-
-    jobs.append(
-        GatedJob(
-            "emotion_backfill",
-            run=_emotion_backfill_job,
-            has_work=_emotion_backfill_job_has_work,
-        )
-    )
-
-    # 3b. research recovery — #591: the research memories lost to an unread reply layout, recovered once from the stored
+    # 3. research recovery — #591: the research memories lost to an unread reply layout, recovered once from the stored
     # notes, one interest per pass (brain/engines/research_recovery.py). No model call of its own: the consolidation gate
     # classifies what it enqueues, so it waits until the gate has dealt with the previous pass.
     def _research_recovery_job() -> JobOutcome:
@@ -1211,6 +1145,11 @@ def _build_gated_jobs(
             return _embedding_backfill_has_work_probe(store)
 
     def _embedding_backfill_job() -> JobOutcome:
+        if embeddings.embedding_provider_not_ready():
+            # #833: the model is still being built on the background thread; this thread never waits for the download.
+            # The pass is skipped (not advanced) and the build is asked for again under the usual retry rule.
+            floor_startup.request_embedding_build()
+            return JobOutcome.SKIPPED
         with cli_throttle.background_slot() as slot, _tick_store() as store:
             if not slot:
                 return JobOutcome.SKIPPED
@@ -1235,11 +1174,11 @@ def _build_gated_jobs(
     )
 
     # 4b. floor bootstraps — name-recall fix S85 revised / S91 / S92 (spec §2).
-    # The COSINE bootstrap is computed at process start; the RERANK bootstrap on
+    # The COSINE bootstrap (and the embedding model's build, #833) is computed at process start; the RERANK bootstrap on
     # first need, in the background (`floor_startup.request_rerank_bootstrap`);
     # a failed one is retried in the background on each incoming message. These
     # two jobs are the lull-time RETRY path: a floor is due only while it is
-    # missing (no calibrated row, not cached), it was needed or its last attempt
+    # missing (no calibrated row, not cached; the cosine one is also due while the embedding model is not built), it was needed or its last attempt
     # failed (the rerank floor is never due just because the process started),
     # chat has happened since the failed attempt (`cli_throttle.
     # chat_activity_marker`; no time constants), and no bootstrap of that floor
@@ -1262,10 +1201,15 @@ def _build_gated_jobs(
                 return JobOutcome.SKIPPED
         return JobOutcome.COMPLETED
 
+    def _cosine_floor_job() -> JobOutcome:
+        # #833: the lull retry builds the embedding model (a 2.2 GB download) when it is not built, so it only starts the
+        # background thread that does and returns: this thread never waits for it. One at a time (the cosine claim).
+        return JobOutcome.COMPLETED if floor_startup.start_cosine_retry(persona_dir) is not None else JobOutcome.SKIPPED
+
     jobs.append(
         GatedJob(
             "cosine_floor_bootstrap",
-            run=lambda: _floor_bootstrap_job("cosine", floor_startup.run_cosine_floor),
+            run=_cosine_floor_job,
             has_work=lambda: _floor_bootstrap_due("cosine", floor_startup.cosine_floor_due),
         )
     )
@@ -1802,18 +1746,39 @@ def _maybe_run_kindled_link_tick(persona_dir, *, provider, now=None):
         logger.exception("supervisor kindled-link tick raised")
 
 
+def _apply_queued_emotion_changes(persona_dir: Path) -> None:
+    """Apply the emotion engine's queued changes and close any finished day (`note_active`), unless a chat reply is in flight
+    (the reply path drains after it is sent). Used at the end of every supervisor pass and by the energy step (#650, L2
+    item 10: pass 2's feeling changes are only queued until this runs, so the step applies them before it reads the engine).
+    `note_active` catches and logs its own failures and never raises."""
+    if not cli_throttle.reply_in_flight():
+        emotion_engine.engine_for(persona_dir).note_active(datetime.now(UTC))
+
+
+class _HeartbeatRan(Enum):
+    """Result of a heartbeat pass whose felt-time step raised (#832): the heartbeat tick already ran, so the pass counts
+    as run (the caller waits the normal interval), but there are no intensity drivers to cache."""
+
+    FELT_TIME_FAILED = "felt_time_failed"
+
+
 def _heartbeat_and_felt_time(
     persona_dir: Path,
     provider: LLMProvider,
     event_bus: EventBus,
     last_heartbeat_at: float,
-) -> IntensityDrivers | None:
+    heartbeat_interval_s: float,
+) -> IntensityDrivers | _HeartbeatRan | None:
     """Run a heartbeat tick then a felt-time tick, wiring real counters.
+
+    `heartbeat_interval_s` is the loop's own heartbeat interval; the body energy step counts closed time in it.
 
     Extracted so tests can call this directly and spy on _run_felt_time_tick
     without driving the full run_folded loop. Fault-isolated: heartbeat
-    errors are caught and reflex_n defaults to 0; felt-time errors are
-    caught and None is returned. The caller updates last_heartbeat_at.
+    errors are caught and reflex_n defaults to 0; a felt-time error is
+    logged and `_HeartbeatRan.FELT_TIME_FAILED` is returned (the heartbeat
+    ran, #832). None means nothing ran (a reply is in flight). The caller
+    updates last_heartbeat_at for any non-None result.
 
     Start check (S21, C9(b)): does not start a pass — heartbeat OR
     felt-time — while a chat reply is being generated, checked once here;
@@ -1861,10 +1826,11 @@ def _heartbeat_and_felt_time(
             heartbeats_since_last=1,
             chat_turns_since_last=chat_n,
             reflex_firings_since_last=reflex_n,
+            heartbeat_interval_s=heartbeat_interval_s,
         )
     except Exception:
         logger.exception("supervisor felt-time tick raised")
-        return None
+        return _HeartbeatRan.FELT_TIME_FAILED
 
 
 def _run_felt_time_tick(
@@ -1873,8 +1839,11 @@ def _run_felt_time_tick(
     heartbeats_since_last: int,
     chat_turns_since_last: int,
     reflex_firings_since_last: int,
+    heartbeat_interval_s: float,
 ) -> IntensityDrivers:
     """Fold one supervisor heartbeat cycle into felt-time state.
+
+    `heartbeat_interval_s` is the supervisor's heartbeat interval; the body energy step counts closed time in it.
 
     drivers values are derived from existing body + emotion accessors;
     cold-start cases (no body state, no emotion vector) collapse all
@@ -1887,15 +1856,30 @@ def _run_felt_time_tick(
     cannot cascade into bridge shutdown or take down the heartbeat loop.
     """
     drivers = _derive_intensity_drivers(persona_dir, chat_turns_since_last, wall_clock_s_since_last)
+    from brain.body.energy_inputs import gather_energy_inputs
+
+    # The engine only queues pass 2's feeling changes (and showings, self-model deltas); they reach `read()` once applied, so
+    # apply them before the energy step reads it (not while a reply is in flight, as at the end of a pass).
+    _apply_queued_emotion_changes(persona_dir)
     ft = FeltTime(persona_dir=persona_dir)
+    now = datetime.now(UTC)
+    # The body energy step's inputs (#650, spec 2.4), gathered here and stepped inside `tick`. The interval starts at the
+    # saved `last_tick_ts`, which `tick` overwrites, so it is read first.
+    energy = gather_energy_inputs(
+        persona_dir,
+        interval_start=ft.interval_start(now, wall_clock_s_since_last),
+        now=now,
+        heartbeat_s=heartbeat_interval_s,
+    )
     ft.tick(
         TickContext(
-            now_iso=datetime.now(UTC).isoformat(),
+            now_iso=now.isoformat(),
             heartbeats_in_tick=heartbeats_since_last,
             chat_turns_in_tick=chat_turns_since_last,
             reflex_firings_in_tick=reflex_firings_since_last,
             wall_clock_s_in_tick=wall_clock_s_since_last,
             drivers=drivers,
+            energy=energy,
         )
     )
     from brain.felt_time.chat_log import append_chat_tick
@@ -1971,8 +1955,8 @@ def _derive_intensity_drivers(
     Each driver clipped to [0, 1]; missing inputs collapse to 0.0
     so lived-age advances at baseline rate rather than crashing.
 
-    Body strain is derived from exhaustion + energy via the body state built
-    from the emotion engine's short averages.
+    Body strain is `1 - level / 10`, held to [0, 1], from the energy level felt
+    time saved before this heartbeat's step (`read_energy_level`).
 
     Emotional intensity is not computed: it stays 0.0 (flagged for the
     felt-time rework, #386; the old measure is kept, uncalled, in
@@ -1982,40 +1966,15 @@ def _derive_intensity_drivers(
     tick window. Phase 9.2 follow-up will tighten to a rolling baseline
     once `weather_shift.update_baseline` per-channel baselines are proven stable.
     """
-    # Best-effort body strain from exhaustion / energy.
-    body_strain = 0.0
-    emotional_intensity = 0.0
-    try:
-        from brain.body.state import body_state_from_short
-        from brain.body.words import count_words_in_session
-        from brain.emotion import engine
-        from brain.utils.memory import days_since_human
+    # Body strain from the saved energy level (read before this heartbeat's step: `ft.tick` runs after this).
+    # `read_energy_level` never raises and gives the 6.5 baseline when the file or the field is missing.
+    from brain.felt_time.state import read_energy_level
 
-        live_engine = engine.engine_for(persona_dir)
-        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
-        # pending or retrying, read() returns nothing and body strain is computed from baseline energy.
-        short = engine.short_values(live_engine.read())
-        _now = datetime.now(UTC)
-        days = days_since_human(now=_now, persona_dir=persona_dir)
-        words = count_words_in_session(persona_dir=persona_dir, session_hours=0.0, now=_now)
-        body = body_state_from_short(
-            short,
-            feels_high=live_engine.feels_high,
-            session_hours=0.0,
-            words_written=words,
-            days_since_contact=days,
-            now=_now,
-        )
-        # exhaustion is int 0-9 (spec: max(0, 7-energy)); energy int 1-10.
-        # Normalize each to [0, 1] then take the max (strain = worst axis).
-        raw_exhaustion = float(body.exhaustion) / 9.0
-        raw_energy_lack = 1.0 - float(body.energy) / 10.0
-        body_strain = max(0.0, min(1.0, max(raw_exhaustion, raw_energy_lack)))
-        # emotional_intensity is never computed here and stays at its initial 0.0. The old measure (a sigma
-        # deviation over the 200-row max-pool, `_dormant_emotional_intensity`) has no engine counterpart; it is
-        # unplugged until the felt-time rework decides what replaces it (#386).
-    except Exception:
-        logger.debug("supervisor felt-time: body strain read failed; using 0.0", exc_info=True)
+    body_strain = max(0.0, min(1.0, 1.0 - read_energy_level(persona_dir) / 10.0))
+    # emotional_intensity is never computed here and stays at its initial 0.0. The old measure (a sigma
+    # deviation over the 200-row max-pool, `_dormant_emotional_intensity`) has no engine counterpart; it is
+    # unplugged until the felt-time rework decides what replaces it (#386).
+    emotional_intensity = 0.0
 
     # Chat activity: rolling 7-day mean from chat_turns.log.jsonl.
     # Falls back to fixed 6 turns/h when log is absent or below cold-start threshold.
@@ -2495,8 +2454,8 @@ def _self_model_reflect(
     outcome ("deferred" vs "clean").
     """
     from brain.body.state import body_state_from_short
-    from brain.body.words import count_words_in_session
     from brain.emotion import engine
+    from brain.felt_time.state import read_energy_level
     from brain.utils.memory import days_since_human
     from brain.utils.time import iso_utc
 
@@ -2507,18 +2466,15 @@ def _self_model_reflect(
         return _self_model_apply_reset(persona_dir, state, reads)
     short_values = engine.short_values(reads.read)
     days = days_since_human(now=now, persona_dir=persona_dir)
-    words = count_words_in_session(persona_dir=persona_dir, session_hours=0.0, now=now)
     body = body_state_from_short(
         short_values,
         feels_high=engine.engine_for(persona_dir).feels_high,
         session_hours=0.0,
-        words_written=words,
+        energy=read_energy_level(persona_dir),
         days_since_contact=days,
         now=now,
     )
-    unnamed = compute_unnamed_pressure(
-        short_values, body_energy=body.energy, body_exhaustion=body.exhaustion
-    )
+    unnamed = compute_unnamed_pressure(short_values, body_energy=body.energy)
     new_gap = gap_from_read(reads.read, unnamed_pressure=unnamed)
     new_gap.reset_seen = iso_utc(reads.after) if reads.after is not None else None
 
@@ -3478,27 +3434,10 @@ def _run_initiate_review_tick(
     # Fail-open: a body-read error must never permanently silence her.
     is_rest_state = False
     try:
-        from brain.body.state import body_state_from_short
-        from brain.body.words import count_words_in_session
-        from brain.emotion import engine
-        from brain.utils.memory import days_since_human
+        from brain.felt_time.state import read_energy_level
 
-        _live_engine = engine.engine_for(persona_dir)
-        _now = datetime.now(UTC)
-        # Readers show absent while a recovery rebuild is pending. Accepted edge: while a recovery rebuild is
-        # pending or retrying, read() returns nothing and the gate sees baseline energy (not resting).
-        _short = engine.short_values(_live_engine.read())
-        _days = days_since_human(now=_now, persona_dir=persona_dir)
-        _words = count_words_in_session(persona_dir=persona_dir, session_hours=0.0, now=_now)
-        _body = body_state_from_short(
-            _short,
-            feels_high=_live_engine.feels_high,
-            session_hours=0.0,
-            words_written=_words,
-            days_since_contact=_days,
-            now=_now,
-        )
-        is_rest_state = _rest_state_from_energy(_body.energy)
+        # The gate reads the saved energy level, unrounded (spec 4).
+        is_rest_state = _rest_state_from_energy(read_energy_level(persona_dir))
     except Exception:
         logger.debug(
             "body-energy rest gate read failed; not resting (fail-open)",

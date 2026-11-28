@@ -77,8 +77,8 @@ _VOICE_EDIT_TONE_RENDERED_SEGMENTS = prompt_strings.register_segments(
 )
 
 
-def _rest_state_from_energy(energy: int | None) -> bool:
-    """Return True if the body is in a rest state (energy too low to reach out).
+def _rest_state_from_energy(energy: float | None) -> bool:
+    """Return True if the body is in a rest state (energy too low to reach out), comparing the unrounded level.
 
     Fail-open: None energy (unreadable body state) → False so a body-read
     failure never permanently silences recall-resonance outbound.

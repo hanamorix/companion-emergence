@@ -1476,6 +1476,9 @@ class MemoryStore:
         build_embedding_matrix(self.db_path)`) so it is immediately
         recall-visible in this process without waiting for a lazy rebuild.
 
+        In the bridge it never waits for the model's download: while the model
+        is not built it raises `EmbeddingNotReadyError` at once (#833).
+
         Raises on any failure computing/persisting the embedding itself
         (provider/model error, sqlite error) — deliberately NOT fail-soft
         there. The caller decides how to handle a failed embed; e.g.
@@ -1503,7 +1506,7 @@ class MemoryStore:
         """
         from brain.memory import embeddings as embeddings_mod
 
-        provider = embeddings_mod.build_embedding_provider()
+        provider = embeddings_mod.get_ready_embedding_provider()
         vec = provider.embed(content).astype("float32")
         self.write_embedding(memory_id, vec, provider.model_id())
 
@@ -1564,9 +1567,15 @@ class MemoryStore:
         an error clearing/evicting is logged, never raised — a content
         mutation must not fail because embedding bookkeeping failed.
         """
+        from brain.memory import embeddings as embeddings_mod
+
         try:
             self.embed_row(memory_id, content)
             return
+        except embeddings_mod.EmbeddingNotReadyError:
+            # The bridge's background thread is still building the model (#833): clear the stale vector below, the
+            # idle backfill embeds the new text once the model is built.
+            logger.debug("MemoryStore._reembed_or_clear: embedding model not built yet for id=%s", memory_id)
         except Exception:  # noqa: BLE001 — degrade to clear, never raise
             logger.warning(
                 "MemoryStore._reembed_or_clear: embed failed for id=%s — "
@@ -3923,24 +3932,9 @@ class MemoryStore:
         rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_memory(row) for row in rows]
 
-    def has_active_without_emotions(self) -> bool:
-        """True when some active memory has an empty stored emotion vector.
-
-        The emotion backfill's work probe: it streams only the ``emotions_json`` column and stops at the first empty vector,
-        instead of loading every active row (with its embedding) the way `list_active` does.
-        """
-        cur = self._conn.execute("SELECT emotions_json FROM memories WHERE active = 1")
-        try:
-            for (emotions_json,) in cur:
-                if not json.loads(emotions_json):
-                    return True
-            return False
-        finally:
-            cur.close()
-
     @staticmethod
     def has_stored_emotions(memory: Memory) -> bool:
-        """True when the memory carries any stored emotion (the emotion backfill's emptiness check on a loaded row).
+        """True when the memory carries any stored emotion (the emotion tagger's emptiness check on a loaded row).
 
         A check of whether the row was ever given feelings, not a read of their values: the values go through `memory_feelings`.
         """

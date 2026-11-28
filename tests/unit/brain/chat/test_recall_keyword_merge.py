@@ -191,9 +191,9 @@ def test_hit_found_by_both_paths_appears_once_at_its_semantic_position_with_one_
     assert _is_snippet(rows[5][1]), "and at its semantic tier (snippet), not promoted by the keyword path"
     # one bump: the semantic snippet's top-rank amount (0.8), not doubled
     assert _rc(store, both.id) - before[both.id] == pytest.approx(0.8)
-    # enqueued for reappraisal exactly once
+    # a snippet is not opened in full, so it is not queued for a re-check (S72, invariant I5)
     queued = [r["memory_id"] for r in PendingQueue(tmp_path).drain() if r.get("_route") == "reappraise_importance"]
-    assert queued.count(both.id) == 1
+    assert queued.count(both.id) == 0
 
 
 def test_recall_count_bump_follows_the_render_for_keyword_hits(tmp_path: Path) -> None:
