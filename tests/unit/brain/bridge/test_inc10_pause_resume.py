@@ -110,65 +110,9 @@ def test_c31_clear_progress_removes_the_file(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# C8 — pass 2 (S32 row 1): should_pause already existed pre-INC-10 at the
-# pass2_queue level; this proves the JOB-LEVEL JobOutcome mapping INC-10
-# added (_pass2_run in supervisor.py) correctly distinguishes a real pause
-# (items remain) from a full drain.
+# Pass 2 is no longer a gated job: its pause and resume between items is proved on its own thread in
+# tests/unit/brain/chat/test_pass2_own_thread.py.
 # ---------------------------------------------------------------------------
-
-
-def test_c8_pass2_job_reports_paused_with_items_remaining_then_resumes(tmp_path: Path) -> None:
-    from brain.bridge.central_cadence import JobOutcome
-    from brain.bridge.events import EventBus
-    from brain.bridge.provider import FakeProvider
-    from brain.bridge.supervisor import _build_gated_jobs
-    from brain.chat import pass2_queue
-
-    persona_dir = _persona(tmp_path)
-    ran: list[str] = []
-    for _i in range(3):
-        rid = pass2_queue.new_record_id()
-
-        def _fx(_rid=rid):
-            ran.append(_rid)
-
-        pass2_queue.register_test_side_effect(rid, _fx)
-        pass2_queue.enqueue({"id": rid, "kind": "test_probe"}, persona_dir=persona_dir)
-
-    pause_flag = {"on": True}
-    pauser = lambda: pause_flag["on"]  # noqa: E731 — toggled between calls below
-    jobs = _build_gated_jobs(
-        persona_dir=persona_dir,
-        provider=FakeProvider(),
-        event_bus=EventBus(),
-        is_session_busy=None,
-        finalize_after_hours=24.0,
-        finalize_interval_s=None,
-        initiate_review_interval_s=None,
-        maintenance_interval_s=None,
-        self_model_interval_s=None,
-        compaction_interval_s=None,
-        calibration_interval_s=None,
-        interest_sweep_interval_s=None,
-        judge_selftune_interval_s=None,
-        clustering_interval_s=None,
-        intensity_drivers=lambda: None,
-        tick_stats={"closed_sessions": 0, "pruned_empty_sessions": 0},
-        between_items=pauser,
-    )
-    pass2_job = next(j for j in jobs if j.name == "pass2")
-    outcome = pass2_job.run()
-    assert outcome is JobOutcome.PAUSED, "items remain queued -> must report PAUSED, not COMPLETED"
-    assert len(ran) == 1, "exactly one item drained before the pause"
-    assert pass2_queue.queue_length(persona_dir) == 2
-
-    # Resume: idle now (no more pauses) -> drains the rest, item 1 never re-runs.
-    pause_flag["on"] = False
-    outcome2 = pass2_job.run()
-    assert outcome2 is JobOutcome.COMPLETED
-    assert len(ran) == 3
-    assert pass2_queue.queue_length(persona_dir) == 0
-    assert len(set(ran)) == 3, "no item drained twice"
 
 
 # ---------------------------------------------------------------------------

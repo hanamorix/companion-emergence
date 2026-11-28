@@ -13,7 +13,9 @@ error and logs the failure at a rate-limited pace (S63) — background work is
 paused, never silently unblocked, while the check itself is malfunctioning.
 
 One job is exempt from the lull: pass 2 (#817) waits only for "no reply in flight" (``reply_gate_open``, which never reads
-the tunable). Its slot calls pass ``lull_required=False``; every other caller keeps the default and the lull.
+the tunable). Its slot calls pass ``lull_required=False``; every other caller keeps the default and the lull. Pass 2 runs on
+a short-lived thread of its own per reply (``pass2_queue.drain_in_own_thread``): it waits for the reply to end
+(``wait_for_no_reply_in_flight``) and, when another job holds the slot, for its release (``wait_for_background_slot``).
 
 The slot-cap half of this module (``_max_concurrent_background`` /
 ``_inflight_background``) keeps its own FAIL-OPEN posture on internal error —
@@ -69,6 +71,9 @@ _replies_started: int = 0
 _inflight_background = 0
 # S218: signalled by `note_reply_end` (built on `_lock`, so waiting and the counters share it).
 _reply_ended = threading.Condition(_lock)
+# Signalled by `release_background` and `request_shutdown` (same lock): a thread that wants the slot while another job holds
+# it waits on this instead of polling (`wait_for_background_slot`).
+_background_released = threading.Condition(_lock)
 # S223: callbacks registered through `ReplyWatch.on_reply_start`, run by `note_user_message` (after
 # its counters changed and OUTSIDE `_lock`). Guarded by `_lock`.
 _start_hooks: list[_StartHook] = []
@@ -106,8 +111,11 @@ _shutdown = threading.Event()
 
 
 def request_shutdown() -> None:
-    """Mark the process as stopping: no new background work starts from here on."""
+    """Mark the process as stopping: no new background work starts from here on. Sets the flag first, then wakes a thread
+    waiting for the slot (`wait_for_background_slot`) so it sees the flag; the reverse order could lose the wake-up."""
     _shutdown.set()
+    with _lock:
+        _background_released.notify_all()
 
 
 def clear_shutdown() -> None:
@@ -132,6 +140,7 @@ def reset() -> None:  # test helper
         _err_suppressed_count = 0
         _start_hooks.clear()
         _reply_ended.notify_all()
+        _background_released.notify_all()
     _shutdown.clear()
 
 
@@ -530,6 +539,25 @@ def release_background() -> None:
     global _inflight_background
     with _lock:
         _inflight_background = max(0, _inflight_background - 1)
+        _background_released.notify_all()
+
+
+def wait_for_background_slot() -> bool:
+    """Return False at once when a background slot is free or a stop was requested (nothing to wait for), else block until
+    one is released (`release_background`) or the stop is requested (`request_shutdown`) and return True. No timeout and no
+    polling interval. The slot is not taken: the caller asks for it with `acquire_background` / `background_slot`
+    afterwards, and may lose it to another job (so it loops). A change to ``throttle.max_concurrent_background`` while a
+    thread waits is not announced: the thread sees it at the next release. For a background thread; never call it on the
+    reply path."""
+
+    def _free_or_stopping() -> bool:
+        return _shutdown.is_set() or _inflight_background < _max_concurrent_background()
+
+    with _background_released:
+        if _free_or_stopping():
+            return False
+        _background_released.wait_for(_free_or_stopping)
+        return True
 
 
 @contextlib.contextmanager

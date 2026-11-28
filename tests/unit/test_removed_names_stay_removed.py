@@ -905,6 +905,21 @@ REMOVED: tuple[Removed, ...] = (
         kind="code",
         scope=("brain",),
     ),
+    # --- pass 2 on its own short-lived thread (#650 bug round step 4, finding 5) -----------------------------------------------
+    Removed(
+        names=(
+            "needs_lull",
+            "exempt_slot_available",
+            "_pass2_run",
+            "_pass2_pause",
+            "_pass2_between_items",
+            "pass2_between_items",
+        ),
+        why="pass 2 is no longer a job of the central pass (#817's run on the central pass's next run, its not-idle exemption and its slot peek went with it): each reply that queued work starts one short-lived thread, `pass2_queue.drain_in_own_thread`, which waits for no reply in flight and for the background slot and never runs the heartbeat",
+        ref="#650 bug round step 4, finding 5 (draft PR #655); L2 item 32",
+        kind="code",
+        scope=("brain",),
+    ),
 )
 
 

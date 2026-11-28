@@ -18,7 +18,7 @@ from pathlib import Path
 from brain import dev_constants, prompt_strings
 from brain.bridge.model_tier import TIER_BACKGROUND_CLASSIFIER, build_tier_provider
 from brain.bridge.provider import LLMProvider
-from brain.engines._interests import Interest, InterestSet, spawn_interest
+from brain.engines._interests import Interest, InterestSet, interests_lock, spawn_interest
 from brain.engines.heartbeat import HeartbeatConfig
 from brain.engines.research_notes import append_session_notes, read_notes_tail
 from brain.engines.research_session import extract_felt_lines, parse_session_output
@@ -412,20 +412,27 @@ class ResearchEngine:
 
             # Update interest — status flips to dormant on 'close'; 'spawn'
             # keeps this thread going while seeding tangents below.
-            new_status = "dormant" if session.verdict == "close" else winner.status
-            updated = dataclasses.replace(winner, last_researched_at=now, status=new_status)
-            interests = interests.upsert(updated)
-            for topic in session.spawn_topics:
-                interests, _ = spawn_interest(
-                    interests,
-                    topic=topic,
-                    keywords=(),
-                    why=f"tangent from {winner.topic}",
-                    origin="side_quest",
-                    now=now,
-                    pull_threshold=self.pull_threshold,
-                )
-            interests.save(self.interests_path)
+            # Applied to a fresh read under the lock: the model call above can take a while, and pass 2's spawn or the
+            # heartbeat's bump may have saved the interests meanwhile (the winner's own pull_score included).
+            with interests_lock(self.interests_path):
+                interests = InterestSet.load(self.interests_path, default_path=self.default_interests_path)
+                current = next((i for i in interests.interests if i.id == winner.id), None)
+                if current is not None:
+                    new_status = "dormant" if session.verdict == "close" else current.status
+                    interests = interests.upsert(
+                        dataclasses.replace(current, last_researched_at=now, status=new_status)
+                    )
+                for topic in session.spawn_topics:
+                    interests, _ = spawn_interest(
+                        interests,
+                        topic=topic,
+                        keywords=(),
+                        why=f"tangent from {winner.topic}",
+                        origin="side_quest",
+                        now=now,
+                        pull_threshold=self.pull_threshold,
+                    )
+                interests.save(self.interests_path)
 
             # Append log
             fire = ResearchFire(
@@ -595,7 +602,12 @@ class ResearchEngine:
                 )
                 for t in str_topics
             ]
-            InterestSet(interests=tuple(new_interests)).save(self.interests_path)
+            # The model call is over: seed only if the list is still empty (pass 2's spawn may have added one meanwhile).
+            with interests_lock(self.interests_path):
+                current = InterestSet.load(self.interests_path, default_path=self.default_interests_path)
+                if current.interests:
+                    return False
+                InterestSet(interests=tuple(new_interests)).save(self.interests_path)
             logger.info(
                 "research bootstrap: seeded %d interests from voice.md", len(new_interests)
             )

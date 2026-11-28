@@ -49,12 +49,14 @@ drain_all_locked(persona_dir, *, should_pause=None, on_progress=None,
     peek -> dispatch -> pop-and-persist, until the queue is empty or
     ``should_pause``/``time_budget_s`` says stop (checked AFTER every item,
     including the first — never before/during one). Returns the count run.
-    Two callers in this codebase: the bridge supervisor's central cadence
-    function (the pass-2 gated job, ram-spike-fix INC-9 — first in the S55
-    order, run at every central pass while the queue is non-empty and no reply is in flight, #817,
-    with ``should_pause`` = "a stop was requested or a reply is in flight") and ``nell chat --no-bridge``'s
-    exit drain (cli.py, S78/S80 — no ``should_pause`` at all, a bounded
-    ``time_budget_s`` instead).
+    Two callers in this codebase: pass 2's own short-lived thread
+    (``drain_in_own_thread``, below; one per reply that queued work, with
+    ``should_pause`` = "a stop was requested or a reply is in flight") and
+    ``nell chat --no-bridge``'s exit drain (cli.py, S78/S80 — no
+    ``should_pause`` at all, a bounded ``time_budget_s`` instead).
+drain_in_own_thread(persona_dir) -> None
+    The thread body: wait for no reply in flight, take the background slot
+    (waiting for its release when another job holds it), drain, end.
 drain_pending(persona_dir, max_items=None) -> int
     Synchronous drain (test helper / on-demand): thin wrapper that calls
     ``drain_all_locked`` with a ``should_pause`` that stops after
@@ -301,6 +303,57 @@ def drain_all_locked(
             if time_budget_s is not None and (time.monotonic() - start) > time_budget_s:
                 break
         return done
+
+
+def drain_in_own_thread(persona_dir: Path) -> None:
+    """The body of pass 2's own short-lived thread (one per reply that queued work; the bridge starts it, see
+    ``server._start_pass2_drain_after_reply``). Runs on that thread, never the supervisor's.
+
+    Waits for no reply in flight (the app's existing wait), takes the background slot (when another job holds it, waits for
+    its release on a notification, no polling), drains the queue with the same step as ever, and ends. Between items it
+    checks only a reply or a stop (``reply_gate_open``), never the heartbeat. A reply that stops the drain with work left
+    makes it wait again; it ends when the queue is empty, a stop was requested, another process holds the drain lock
+    (``drain_all_locked`` returned 0), the reply gate cannot answer (fails closed: no spinning on it), or an item raised
+    a refusal (``ThrottleDeferred``: expired login, stopping): that item stays at the head of the saved queue and waits for
+    the next reply's thread or the next start (there is no retry trigger by design).
+
+    Edge (L2 item 32): an item queued in the instant before an earlier thread lets go of the drain lock gets a ``drained == 0``
+    from its own thread. The earlier thread looks at the queue length again after its drain returns, so it takes that item;
+    what remains is another process's enqueue after that look, picked up by the next reply's thread or the next start.
+
+    Failures: any other exception is logged and ends the thread; the queue stays saved (an item is popped only after it ran).
+    """
+    from brain.bridge import background_jobs, cli_throttle
+
+    persona_dir = Path(persona_dir)
+    refused_with_free_slot = False
+    try:
+        while not cli_throttle.shutdown_requested():
+            # Replies admitted before a stop run to completion, so a thread parked here ends when that reply ends.
+            cli_throttle.wait_for_no_reply_in_flight()
+            with cli_throttle.background_slot(lull_required=False) as slot:
+                if slot:
+                    with background_jobs.running("pass2"):
+                        drained = drain_all_locked(
+                            persona_dir, should_pause=lambda: not cli_throttle.reply_gate_open()
+                        )
+                    log.info("pass-2 thread: drained=%d", drained)
+                    if drained == 0 or _queue_len_locked(persona_dir) == 0:
+                        return
+                    refused_with_free_slot = False
+                    continue
+            if cli_throttle.reply_in_flight():
+                continue  # a reply started between the wait and the slot: wait for it
+            if cli_throttle.wait_for_background_slot():
+                refused_with_free_slot = False
+            elif refused_with_free_slot:
+                return  # refused twice in a row with a free slot and no reply: the gate fails closed; do not spin
+            else:
+                refused_with_free_slot = True  # the slot was released just after the refusal: try once more
+    except cli_throttle.ThrottleDeferred as exc:
+        log.info("pass-2 thread ended: %s; the queue stays saved", exc)
+    except Exception:  # noqa: BLE001 - the thread must not die loudly; the queue stays saved
+        log.exception("pass-2 thread failed; the queue stays saved")
 
 
 def drain_pending(persona_dir: Path, max_items: int | None = None) -> int:

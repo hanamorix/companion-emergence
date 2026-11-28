@@ -410,6 +410,77 @@ class _NoFeelingsEngine:
     def feels_high(self, name: str) -> bool:
         return False
 
+    def note_active(self, now) -> None:  # noqa: ANN001 - the energy step applies queued changes first (nothing is queued here)
+        return None
+
+
+class _QueuedChangeEngine:
+    """An engine holding one queued feeling change: `read()` shows it only after `note_active` applied it (as the real one)."""
+
+    def __init__(self) -> None:
+        from brain.emotion.engine import Reading
+
+        self.applied = False
+        self.calls: list[str] = []
+        self._reading = Reading(short=4.0, long=4.0, difference=0.0, shift=0)
+
+    def note_active(self, now) -> None:  # noqa: ANN001
+        self.calls.append("note_active")
+        self.applied = True
+
+    def read(self) -> dict:
+        self.calls.append("read")
+        return {"joy": self._reading} if self.applied else {}
+
+    def feels_high(self, name: str) -> bool:
+        return False
+
+
+def _run_tick_with_engine(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engine: object) -> dict:
+    import json as _json
+
+    from brain.bridge.supervisor import _run_felt_time_tick
+
+    monkeypatch.setattr("brain.emotion.engine.engine_for", lambda persona_dir: engine)
+    _run_felt_time_tick(
+        tmp_path,
+        wall_clock_s_since_last=900.0,
+        heartbeats_since_last=1,
+        chat_turns_since_last=0,
+        reflex_firings_since_last=0,
+        heartbeat_interval_s=900.0,
+    )
+    return _json.loads((tmp_path / "felt_time_state.json").read_text())
+
+
+def test_the_energy_step_applies_the_engines_queued_changes_before_it_reads_the_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """#650 finding 5 (L2 item 10): pass 2's change is only queued until applied; the step applies it, then reads it."""
+    from brain.bridge import cli_throttle
+
+    cli_throttle.reset()
+    engine = _QueuedChangeEngine()
+    saved = _run_tick_with_engine(tmp_path, monkeypatch, engine)
+    assert engine.calls[:2] == ["note_active", "read"]
+    assert saved["energy_feelings"] == {"joy": 4.0}, "the queued change reached the step's saved feelings"
+
+
+def test_the_energy_step_does_not_apply_queued_changes_while_a_reply_is_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from brain.bridge import cli_throttle
+
+    cli_throttle.reset()
+    cli_throttle.note_user_message()
+    try:
+        engine = _QueuedChangeEngine()
+        _run_tick_with_engine(tmp_path, monkeypatch, engine)
+    finally:
+        cli_throttle.note_reply_end()
+        cli_throttle.reset()
+    assert "note_active" not in engine.calls and engine.calls[0] == "read"
+
 
 def test_derive_intensity_drivers_chat_activity_uses_rolling_baseline(tmp_path: Path) -> None:
     """When chat_turns.log.jsonl has enough data, rolling mean is used as baseline.

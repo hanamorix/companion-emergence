@@ -80,6 +80,7 @@ from brain.bridge.shutdown import (
 )
 from brain.bridge.shutdown import REASON_UNKNOWN as _STOP_REASON_UNKNOWN
 from brain.bridge.shutdown_progress import tracked_to_thread
+from brain.chat import pass2_queue
 from brain.chat.session import (
     all_sessions,
     create_session,
@@ -181,6 +182,32 @@ async def _drain_emotion_engine(persona_dir: Path) -> None:
         )
     except cli_throttle.ShutdownDeferred:
         logger.info("emotion drain not run: the bridge is stopping; the queue is left for the next drain")
+
+
+def _start_pass2_drain(s: BridgeAppState) -> None:
+    """Start pass 2's own short-lived thread when the saved queue has work (blocking: one file-locked read).
+
+    Only a bridge with its background threads on starts it (`pass2_drain_enabled`: never the test-hook bridge or a bridge built
+    with background threads off). A counted task through `start_tracked_thread`, which starts nothing once the stop has begun."""
+    if not s.pass2_drain_enabled or pass2_queue.queue_length(s.persona_dir) == 0:
+        return
+    shutdown_progress.start_tracked_thread(
+        "pass-2 drain",
+        lambda: pass2_queue.drain_in_own_thread(s.persona_dir),
+        name="pass2-drain",
+        daemon=True,
+    )
+
+
+async def _start_pass2_drain_after_reply(s: BridgeAppState) -> None:
+    """After a reply was sent: start pass 2's thread if that reply (or an earlier one) left work queued, off the event loop.
+
+    Like `_drain_emotion_engine`, only the success path calls it (a turn that failed after queuing work waits for the next
+    reply or the next start), and a refusal after the stop began is not an error (the queue stays saved)."""
+    try:
+        await tracked_to_thread("pass-2 start", _start_pass2_drain, s)
+    except cli_throttle.ShutdownDeferred:
+        logger.info("pass-2 thread not started: the bridge is stopping; the queue is left for the next start")
 
 
 def _now() -> str:
@@ -1183,6 +1210,8 @@ class BridgeAppState:
     # #456 (Q6): the supervisor's state ("running" / "restarted" / "failed" ...), shown on /health and /persona/state.
     supervisor_status: Any | None = None
     migration_thread: Any | None = None  # compaction-backlog-migration (None when background threads are off)
+    # True only on a bridge with background threads on (not the test-hook bridge): replies may start pass 2's own thread.
+    pass2_drain_enabled: bool = False
     auth_token: str | None = None
     shutdown_controller: BridgeShutdownController | None = None
     # #523: the one in-flight launch decision of GET /sessions/active (``_shared_sessions_active_task``); None when idle.
@@ -1594,6 +1623,12 @@ def build_app(
             app.state.bridge.supervisor_thread = sup_thread
             if hooks is not None:
                 hooks["start_tasks"](persona_dir)
+            else:
+                # Pass 2 runs on its own short-lived thread per reply; replies may start it from here on. One start now
+                # takes a leftover of an earlier run (or of `nell chat --no-bridge`), which would otherwise wait for the
+                # next reply.
+                app.state.bridge.pass2_drain_enabled = True
+                _start_pass2_drain(app.state.bridge)
 
         # Idle-shutdown watcher (only if requested)
         idle_task = None
@@ -3078,6 +3113,8 @@ def build_app(
             )
             # The emotion engine's drain runs after the response is sent (spec 3.1 S4), and only on this success path.
             background_tasks.add_task(_drain_emotion_engine, s.persona_dir)
+            # Pass 2's own thread for any work this reply queued (it waits for no reply in flight itself).
+            background_tasks.add_task(_start_pass2_drain_after_reply, s)
             return {
                 "session_id": sid,
                 "reply": result.content,
@@ -3333,6 +3370,7 @@ def build_app(
         # lock is released so the next turn does not wait behind a catch-up, and only on the success path.
         if drain_after_close:
             await _drain_emotion_engine(s.persona_dir)
+            await _start_pass2_drain_after_reply(s)
 
     # ── WS /events — server-push only broadcast ────────────────────────────
     @app.websocket("/events")

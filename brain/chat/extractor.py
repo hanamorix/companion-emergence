@@ -454,7 +454,7 @@ def _apply_interest_candidate(candidate: InterestCandidate, persona_dir: Path) -
     `<persona_dir>/interest_spawn_state.json` keyed by UTC date; a stale or
     corrupt state file resets to a fresh day rather than failing.
     """
-    from brain.engines._interests import InterestSet, spawn_interest
+    from brain.engines._interests import InterestSet, interests_lock, spawn_interest
 
     now = datetime.now(UTC)
     state_path = persona_dir / _INTEREST_SPAWN_STATE
@@ -468,17 +468,21 @@ def _apply_interest_candidate(candidate: InterestCandidate, persona_dir: Path) -
 
     interests_path = persona_dir / "interests.json"
     default_path = Path(__file__).parent.parent / "engines" / "default_interests.json"
-    interests = InterestSet.load(interests_path, default_path=default_path)
-    interests, created = spawn_interest(
-        interests,
-        topic=candidate.topic,
-        keywords=tuple(candidate.keywords),
-        why=candidate.why,
-        origin="conversation",
-        now=now,
-    )
+    # Pass 2 runs on its own thread, beside the heartbeat's interest bump and the research and sweep steps: the read..save is
+    # one locked step so a change another writer saved meanwhile is not lost.
+    with interests_lock(interests_path):
+        interests = InterestSet.load(interests_path, default_path=default_path)
+        interests, created = spawn_interest(
+            interests,
+            topic=candidate.topic,
+            keywords=tuple(candidate.keywords),
+            why=candidate.why,
+            origin="conversation",
+            now=now,
+        )
+        if created:
+            interests.save(interests_path)
     if created:
-        interests.save(interests_path)
         state["count"] = int(state.get("count", 0)) + 1
         write_json(state_path, state, indent=None, fsync=False)
 

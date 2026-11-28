@@ -8,12 +8,15 @@ inside research.py.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from brain.health.json_io import Recovery, read_json, read_json_result, write_json
+from brain.utils.file_lock import file_lock
 from brain.utils.time import iso_utc, parse_iso_utc
 
 if TYPE_CHECKING:
@@ -23,6 +26,16 @@ logger = logging.getLogger(__name__)
 
 _VALID_SCOPES = ("internal", "external", "either")
 Scope = Literal["internal", "external", "either"]
+
+
+@contextmanager
+def interests_lock(path: Path) -> Iterator[None]:
+    """Hold the lock every writer of ``interests.json`` takes around its read..save (pass 2's spawn, the heartbeat's keyword
+    bump, the voice seed, and the final apply of the research step and the weekly sweep). It is the shared ``file_lock``
+    sidecar ``interests.json.lock``, not re-entrant, and never held across a model call: a writer that calls a model between
+    its first read and its save re-reads under this lock and applies its own change to that fresh copy."""
+    with file_lock(path):
+        yield
 
 
 @dataclass(frozen=True)

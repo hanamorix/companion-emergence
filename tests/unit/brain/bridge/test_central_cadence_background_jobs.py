@@ -75,12 +75,12 @@ def test_job_is_cleared_when_run_returns_paused(tmp_path: Path) -> None:
         seen_during_run.append(",".join(background_jobs.snapshot()))
         return JobOutcome.PAUSED
 
-    job = GatedJob("pass2", run=run, has_work=lambda: True)
+    job = GatedJob("session_snapshot_prune", run=run, has_work=lambda: True)
 
     decisions = _pass(tmp_path, [job])
 
-    assert seen_during_run == ["pass2"]
-    assert ("pass2", "paused") in [(d.job, d.action) for d in decisions]
+    assert seen_during_run == ["session_snapshot_prune"]
+    assert ("session_snapshot_prune", "paused") in [(d.job, d.action) for d in decisions]
     assert background_jobs.snapshot() == []
 
 

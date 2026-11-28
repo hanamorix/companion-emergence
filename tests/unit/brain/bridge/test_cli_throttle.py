@@ -184,6 +184,67 @@ def test_slot_without_lull_still_counts_against_the_one_background_slot():
 
 
 # ---------------------------------------------------------------------------
+# #650 finding 5: waiting for the one background slot on a release notification (pass 2's own thread)
+# ---------------------------------------------------------------------------
+
+
+def test_wait_for_background_slot_returns_false_at_once_when_a_slot_is_free():
+    cli_throttle.reset()
+    assert cli_throttle.wait_for_background_slot() is False
+
+
+def test_wait_for_background_slot_blocks_until_the_release_and_returns_true():
+    import threading
+
+    cli_throttle.reset()
+    assert cli_throttle.acquire_background(lull_required=False) is True
+    result: list[bool] = []
+    t = threading.Thread(target=lambda: result.append(cli_throttle.wait_for_background_slot()), daemon=True)
+    t.start()
+    t.join(0.2)  # a deliberate probe: still blocked
+    assert t.is_alive() and result == []
+    cli_throttle.release_background()
+    t.join()
+    assert result == [True]
+    cli_throttle.reset()
+
+
+def test_wait_for_background_slot_returns_when_a_stop_is_requested():
+    import threading
+
+    cli_throttle.reset()
+    assert cli_throttle.acquire_background(lull_required=False) is True
+    result: list[bool] = []
+    t = threading.Thread(target=lambda: result.append(cli_throttle.wait_for_background_slot()), daemon=True)
+    t.start()
+    t.join(0.2)  # a deliberate probe: still blocked
+    assert t.is_alive()
+    cli_throttle.request_shutdown()
+    t.join()
+    assert result == [True]
+    cli_throttle.reset()
+
+
+def test_wait_for_background_slot_with_two_slots_waits_only_when_both_are_held(monkeypatch):
+    import threading
+
+    cli_throttle.reset()
+    monkeypatch.setattr(cli_throttle, "_max_concurrent_background", lambda: 2)
+    assert cli_throttle.acquire_background(lull_required=False) is True
+    assert cli_throttle.wait_for_background_slot() is False  # one of two is free
+    assert cli_throttle.acquire_background(lull_required=False) is True
+    result: list[bool] = []
+    t = threading.Thread(target=lambda: result.append(cli_throttle.wait_for_background_slot()), daemon=True)
+    t.start()
+    t.join(0.2)  # a deliberate probe: both held, still blocked
+    assert t.is_alive()
+    cli_throttle.release_background()
+    t.join()
+    assert result == [True]
+    cli_throttle.reset()
+
+
+# ---------------------------------------------------------------------------
 # ram-spike-fix INC-6: is_chat_idle / the single lull / fail-closed (C4, C24, C35)
 # ---------------------------------------------------------------------------
 #

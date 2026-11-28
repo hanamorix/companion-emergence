@@ -75,7 +75,6 @@ from brain.bridge.model_tier import (
     build_tier_provider,
 )
 from brain.bridge.provider import LLMProvider
-from brain.chat import pass2_queue
 from brain.chat.session import (
     has_prunable_empty_sessions,
     prune_empty_sessions,
@@ -580,15 +579,6 @@ def run_folded(
             logger.exception("supervisor between-items heartbeat hook raised")
         return stop_event.is_set() or not cli_throttle.is_chat_idle()
 
-    def _pass2_between_items() -> bool:
-        """The same hook for pass 2's drain (#817): the heartbeat runs between items, and the drain pauses when a stop
-        is requested or a reply is in flight, not for the quiet-chat lull (pass 2 does not wait for it)."""
-        try:
-            _maybe_run_heartbeat()
-        except Exception:
-            logger.exception("supervisor pass-2 between-items heartbeat hook raised")
-        return stop_event.is_set() or not cli_throttle.reply_gate_open()
-
     # The gated jobs, in the S55 order (see brain/bridge/central_cadence.py).
     tick_stats = {"closed_sessions": 0, "pruned_empty_sessions": 0}
     # The per-tick shared MemoryStore (#132: one memories.db open per tick,
@@ -625,7 +615,6 @@ def run_folded(
         tick_ctx=tick_ctx,
         bridge_started_at=bridge_started_at,
         between_items=_between_items,
-        pass2_between_items=_pass2_between_items,
         should_stop=_stopping,
     )
 
@@ -915,8 +904,7 @@ def run_folded(
             # wait, and never while a chat reply is being generated (the reply path drains after it is sent). `note_active` catches
             # and logs its own failures and never raises. Accepted edge (E5.16, section 6): a day that ends closes at the next
             # drain, so the rollover can lag until the next supervisor pass or the next reply.
-            if not cli_throttle.reply_in_flight():
-                emotion_engine.engine_for(persona_dir).note_active(datetime.now(UTC))
+            _apply_queued_emotion_changes(persona_dir)
 
             # Wait for the next tick or for stop_event, whichever comes first.
             stop_event.wait(timeout=tick_interval_s)
@@ -997,17 +985,16 @@ def _build_gated_jobs(
     tick_ctx: dict[str, MemoryStore | None] | None = None,
     bridge_started_at: datetime | None = None,
     between_items: Callable[[], bool] | None = None,
-    pass2_between_items: Callable[[], bool] | None = None,
     should_stop: Callable[[], bool] | None = None,
 ) -> list[GatedJob]:
     """The job table of the central cadence function (INC-9, S16/S55/S70).
 
     One ``GatedJob`` per gated job; a job whose ``*_interval_s`` is None (the
-    test/dev disable knob) is left out. The emotion recovery rebuild (#584), pass 2, session snapshot/prune,
+    test/dev disable knob) is left out. The emotion recovery rebuild (#584), session snapshot/prune,
     research recovery (#591), embedding backfill and the extraction backfill (#523)
     have no interval: each runs at every idle pass while it has work (S53/S66;
-    the extraction backfill takes one chunk per pass); pass 2 alone does not wait for the
-    lull, only for no reply in flight (#817). Deploy recalibration is due
+    the extraction backfill takes one chunk per pass). Pass 2 is not a job here: it runs on a
+    short-lived thread of its own per reply (``pass2_queue.drain_in_own_thread``). Deploy recalibration is due
     while the stored floor is stale (S70/S73). The cosine and rerank floor
     bootstraps (name-recall fix S85 revised, S91, S92) are the next-lull RETRY
     path here: due while neither a calibrated row nor the process-cached
@@ -1027,18 +1014,9 @@ def _build_gated_jobs(
     ctx: dict[str, MemoryStore | None] = tick_ctx if tick_ctx is not None else {"store": None}
     # INC-10 (S14/S41/S65): the between-items hook every pausable job's own
     # loop asks. Callers that don't wire one (older tests, direct unit
-    # calls) get the bare idle check with no heartbeat hook — same
-    # behavior pass2's should_pause had before this increment.
+    # calls) get the bare idle check with no heartbeat hook.
     _between_items: Callable[[], bool] = (
         between_items if between_items is not None else (lambda: not cli_throttle.is_chat_idle())
-    )
-    # Pass 2's own pause test (#817): the supervisor wires `_pass2_between_items` (reply in flight, not the lull). A
-    # caller that wires only `between_items` (a test double) gets that one for pass 2 too; one that wires neither gets
-    # the bare reply-gate check.
-    _pass2_pause: Callable[[], bool] = (
-        pass2_between_items
-        if pass2_between_items is not None
-        else (between_items if between_items is not None else (lambda: not cli_throttle.reply_gate_open()))
     )
 
     @contextmanager
@@ -1066,42 +1044,6 @@ def _build_gated_jobs(
             "emotion_recovery_rebuild",
             run=_emotion_recovery_run,
             has_work=lambda: emotion_engine.engine_for(persona_dir).needs_recovery(),
-        )
-    )
-
-    # 1. pass 2 (S53, #817): every central pass while the saved queue is non-empty and no reply is in flight. It does
-    # not wait for the quiet-chat lull (needs_lull=False below; the slot is still the shared background slot). It may
-    # run before the emotion recovery rebuild's first attempt in a lull window: that is the engine state it already ran
-    # against after a failed rebuild, and the engine guards its own drain (`EmotionEngine._run_apply`).
-    def _pass2_run() -> JobOutcome:
-        with cli_throttle.background_slot(lull_required=False) as slot:
-            if not slot:
-                return JobOutcome.SKIPPED
-            # S14 (per item): a reply starting mid-drain stops it at the next
-            # item boundary; what's left stays saved for the next pass (S64).
-            # INC-10: should_pause is the between-items hook (heartbeat + reply gate),
-            # not a bare check, so a heartbeat due mid-drain still runs
-            # between items rather than waiting for the whole drain (S41/S65).
-            drained = pass2_queue.drain_all_locked(persona_dir, should_pause=_pass2_pause)
-        logger.info("pass-2 job: drained=%d", drained)
-        # 0 drained with work queued = another process holds pass2_drain.lock
-        # (S77): nothing ran, so report a skip (pass 2 has no cadence either way).
-        if drained == 0:
-            return JobOutcome.SKIPPED
-        # INC-10 (C8): drained something but the saved queue (S64, the queue
-        # file itself IS pass 2's saved progress) still has items — the
-        # between-items hook stopped the drain (a reply started, or a stop was
-        # requested), not an empty queue.
-        if pass2_queue.queue_length(persona_dir) > 0:
-            return JobOutcome.PAUSED
-        return JobOutcome.COMPLETED
-
-    jobs.append(
-        GatedJob(
-            "pass2",
-            run=_pass2_run,
-            has_work=lambda: pass2_queue.queue_length(persona_dir) > 0,
-            needs_lull=False,
         )
     )
 
@@ -1794,6 +1736,15 @@ def _maybe_run_kindled_link_tick(persona_dir, *, provider, now=None):
         logger.exception("supervisor kindled-link tick raised")
 
 
+def _apply_queued_emotion_changes(persona_dir: Path) -> None:
+    """Apply the emotion engine's queued changes and close any finished day (`note_active`), unless a chat reply is in flight
+    (the reply path drains after it is sent). Used at the end of every supervisor pass and by the energy step (#650, L2
+    item 10: pass 2's feeling changes are only queued until this runs, so the step applies them before it reads the engine).
+    `note_active` catches and logs its own failures and never raises."""
+    if not cli_throttle.reply_in_flight():
+        emotion_engine.engine_for(persona_dir).note_active(datetime.now(UTC))
+
+
 class _HeartbeatRan(Enum):
     """Result of a heartbeat pass whose felt-time step raised (#832): the heartbeat tick already ran, so the pass counts
     as run (the caller waits the normal interval), but there are no intensity drivers to cache."""
@@ -1897,6 +1848,9 @@ def _run_felt_time_tick(
     drivers = _derive_intensity_drivers(persona_dir, chat_turns_since_last, wall_clock_s_since_last)
     from brain.body.energy_inputs import gather_energy_inputs
 
+    # The engine only queues pass 2's feeling changes (and showings, self-model deltas); they reach `read()` once applied, so
+    # apply them before the energy step reads it (not while a reply is in flight, as at the end of a pass).
+    _apply_queued_emotion_changes(persona_dir)
     ft = FeltTime(persona_dir=persona_dir)
     now = datetime.now(UTC)
     # The body energy step's inputs (#650, spec 2.4), gathered here and stepped inside `tick`. The interval starts at the

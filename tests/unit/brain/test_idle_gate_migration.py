@@ -104,8 +104,8 @@ def test_self_model_articulate_defers_when_not_idle(monkeypatch, tmp_path: Path)
 def test_pass2_queue_defers_while_a_reply_is_in_flight_not_for_the_lull(monkeypatch, tmp_path: Path) -> None:
     """C4 evidence, #817: pass 2 defers (does not run) while a reply is in flight, and does NOT wait for the lull.
 
-    Exercises the REAL production gate `cli_throttle.acquire_background(lull_required=False)`, the slot the pass-2 job
-    (supervisor `_build_gated_jobs`) takes before ever invoking `drain_all_locked`, rather than re-deriving the gating
+    Exercises the REAL production gate `cli_throttle.acquire_background(lull_required=False)`, the slot pass 2's own thread
+    (`pass2_queue.drain_in_own_thread`) takes before ever invoking `drain_all_locked`, rather than re-deriving the gating
     decision inside the test itself. Every other background job keeps the lull (`acquire_background()` default: the
     shared-wrapper test above)."""
     from brain.bridge import cli_throttle
@@ -124,7 +124,7 @@ def test_pass2_queue_defers_while_a_reply_is_in_flight_not_for_the_lull(monkeypa
 
     cli_throttle.note_user_message()  # a reply is in flight
     try:
-        # The real pre-flight gate denies a background slot, so the pass-2 job never even calls drain_all_locked.
+        # The real pre-flight gate denies a background slot, so the pass-2 thread never even calls drain_all_locked.
         assert cli_throttle.acquire_background(lull_required=False) is False
         assert ran["n"] == 0
         assert pass2_queue._queue_size(tmp_path) == 1  # left queued, not dropped

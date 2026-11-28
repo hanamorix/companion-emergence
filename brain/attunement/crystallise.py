@@ -11,7 +11,11 @@ from pathlib import Path
 
 from brain import dev_constants
 from brain.attunement.schemas import LearnedPattern
-from brain.attunement.store import _append_pattern, read_learned_patterns
+from brain.attunement.store import (
+    _append_pattern,
+    holds_learned_patterns_lock,
+    read_learned_patterns,
+)
 
 
 @dataclass(frozen=True)
@@ -22,6 +26,7 @@ class CrystallisationEvent:
     ts: str
 
 
+@holds_learned_patterns_lock
 def check_crystallisations(
     persona_dir: Path, *, now_iso: str
 ) -> list[CrystallisationEvent]:

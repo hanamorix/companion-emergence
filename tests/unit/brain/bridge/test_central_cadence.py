@@ -29,7 +29,6 @@ from brain.bridge import central_cadence, cli_throttle, persisted_cadence, super
 from brain.bridge.central_cadence import GATED_JOB_ORDER, GatedJob, JobOutcome
 from brain.bridge.events import EventBus
 from brain.bridge.provider import FakeProvider
-from brain.chat import pass2_queue
 from brain.engines import interest_sweep
 from brain.self_model import cadence as sm_cadence
 from tests.thread_support import finish_threads
@@ -49,7 +48,6 @@ INTERVAL_JOBS: dict[str, tuple[str, float]] = {
 }
 NO_INTERVAL_JOBS = (
     "emotion_recovery_rebuild",
-    "pass2",
     "session_snapshot_prune",
     "research_recovery",
     "embedding_backfill",
@@ -125,12 +123,12 @@ def _real_jobs(persona_dir: Path, **overrides) -> list[GatedJob]:
 
 
 @contextmanager
-def _granting_slot(*, now=None, lull_required=True):  # noqa: ARG001
+def _granting_slot(*, now=None):  # noqa: ARG001
     yield True
 
 
 @contextmanager
-def _denying_slot(*, now=None, lull_required=True):  # noqa: ARG001
+def _denying_slot(*, now=None):  # noqa: ARG001
     yield False
 
 
@@ -170,18 +168,6 @@ def stubs(monkeypatch):
     monkeypatch.setattr(supervisor.emotion_engine, "recovery_job_run", rec("emotion_recovery_rebuild", True))
     monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _granting_slot)
     monkeypatch.setattr(supervisor, "build_tier_provider", lambda *a, **k: FakeProvider())
-    monkeypatch.setattr(pass2_queue, "queue_length", lambda _pd: 1 if work["pass2"] else 0)
-
-    def _pass2_drain(*_a, **_k):
-        # INC-10: _pass2_run now checks queue_length() AFTER draining to tell
-        # a real pause (items remain) from a full drain — simulate the queue
-        # actually emptying (one item, fully drained) so this stub's job
-        # reports COMPLETED like every other stubbed job here, not PAUSED.
-        order.append("pass2")
-        work["pass2"] = False
-        return 1
-
-    monkeypatch.setattr(pass2_queue, "drain_all_locked", _pass2_drain)
     monkeypatch.setattr(
         supervisor, "_snapshot_has_work", lambda _pd: work["session_snapshot_prune"]
     )
@@ -269,20 +255,12 @@ def stubs(monkeypatch):
     return SimpleNamespace(order=order, work=work)
 
 
-def _pass(persona_dir, jobs, *, idle=True, slot=True, now=NOW, between_jobs=None, reply_gate=None, exempt_slot=None):
-    """``reply_gate`` / ``exempt_slot`` are the checks of a ``needs_lull=False`` job (pass 2); unset, they follow
-    ``idle`` / ``slot`` so a test that does not name them treats every job alike."""
-    is_idle = idle if callable(idle) else (lambda: idle)
-    peek = slot if callable(slot) else (lambda: slot)
+def _pass(persona_dir, jobs, *, idle=True, slot=True, now=NOW, between_jobs=None):
     return central_cadence.run_central_pass(
         persona_dir,
         jobs,
-        is_idle=is_idle,
-        slot_available=peek,
-        reply_gate=(is_idle if reply_gate is None else (reply_gate if callable(reply_gate) else (lambda: reply_gate))),
-        exempt_slot_available=(
-            peek if exempt_slot is None else (exempt_slot if callable(exempt_slot) else (lambda: exempt_slot))
-        ),
+        is_idle=(idle if callable(idle) else (lambda: idle)),
+        slot_available=(slot if callable(slot) else (lambda: slot)),
         now_wall=lambda: now,
         between_jobs=between_jobs,
     )
@@ -297,12 +275,13 @@ def _fake_jobs(names, log, *, due=True):
 # ---------------------------------------------------------------------------
 
 
-def test_job_table_is_the_22_gated_jobs_in_the_s55_order(tmp_path):
+def test_job_table_is_the_21_gated_jobs_in_the_s55_order(tmp_path):
     names = [j.name for j in _real_jobs(_persona(tmp_path))]
     assert names == list(GATED_JOB_ORDER)
     # #523: the extraction backfill joined after the recall diagnostics flush; #591: the research recovery after the session
-    # snapshot/prune; Engine 6 (#584): the emotion recovery rebuild runs first; #747: the emotion backfill job is gone
-    assert len(names) == 22
+    # snapshot/prune; Engine 6 (#584): the emotion recovery rebuild runs first; #747: the emotion backfill job is gone;
+    # #650 finding 5: pass 2 is not a job (its own short-lived thread per reply)
+    assert len(names) == 21
     assert names[0] == "emotion_recovery_rebuild"
     # S85 (revised): the two floor-bootstrap RETRY jobs follow embedding backfill;
     # name-recall fix S100: the stuck-width re-measure follows them, and S164's
@@ -583,7 +562,7 @@ def test_c6_skip_leaves_every_cadence_file_byte_identical_and_still_due(tmp_path
 
 
 def test_c6_inner_slot_denial_is_a_skip_not_a_run(tmp_path, stubs, monkeypatch):
-    """Jobs holding their own authoritative slot (pass 2, embedding backfill,
+    """Jobs holding their own authoritative slot (embedding backfill,
     the extraction backfill, maintenance, interest sweep, self-tune) that lose
     the race after the central peek report SKIPPED: no work, no cadence advance."""
     persona_dir = _persona(tmp_path)
@@ -593,7 +572,6 @@ def test_c6_inner_slot_denial_is_a_skip_not_a_run(tmp_path, stubs, monkeypatch):
     decisions = _pass(persona_dir, _real_jobs(persona_dir))
     skipped = {d.job for d in decisions if d.action == "skipped"}
     assert skipped == {
-        "pass2",
         "embedding_backfill",
         "cosine_floor_bootstrap",
         "rerank_floor_bootstrap",
@@ -818,217 +796,21 @@ def test_c22_due_but_no_lull_leaves_the_cadence_file_unchanged(tmp_path, stubs):
 
 
 # ---------------------------------------------------------------------------
-# C23 (INC-9 parts) — pass 2 is the first gated job, no interval, drains at
-# every idle pass while non-empty, yields per item
+# Pass 2 is not a gated job (#650 finding 5): it runs on a short-lived thread of its own per reply
+# (tests/unit/brain/chat/test_pass2_own_thread.py), so the central pass neither lists nor runs it.
 # ---------------------------------------------------------------------------
 
 
-def _pass2_only(persona_dir):
-    return [j for j in _real_jobs(persona_dir) if j.name == "pass2"]
+def test_pass2_is_not_a_gated_job_and_nothing_is_exempt_from_the_lull(tmp_path):
+    import dataclasses
+    import inspect
 
-
-def _enqueue_probe(persona_dir, log, label, side=None):
-    rid = pass2_queue.new_record_id()
-
-    def _fx():
-        log.append(label)
-        if side is not None:
-            side()
-
-    pass2_queue.register_test_side_effect(rid, _fx)
-    pass2_queue.enqueue({"id": rid, "kind": "test_probe"}, persona_dir=persona_dir)
-
-
-def test_c23_pass2_drains_at_every_idle_pass_while_non_empty(tmp_path, monkeypatch):
-    persona_dir = _persona(tmp_path)
-    monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _granting_slot)
-    log: list[str] = []
-    jobs = _pass2_only(persona_dir)
-
-    _pass(persona_dir, jobs)  # empty queue: no work, nothing runs
-    assert log == []
-
-    _enqueue_probe(persona_dir, log, "a")
-    _enqueue_probe(persona_dir, log, "b")
-    _pass(persona_dir, jobs, idle=False)  # not idle: drains nothing
-    assert log == [] and pass2_queue.queue_length(persona_dir) == 2
-
-    _pass(persona_dir, jobs)
-    assert log == ["a", "b"] and pass2_queue.queue_length(persona_dir) == 0
-    _enqueue_probe(persona_dir, log, "c")
-    _pass(persona_dir, jobs)  # the very next idle pass drains again (no interval)
-    assert log == ["a", "b", "c"]
-    assert not (persona_dir / "cadence").exists() or not list(
-        (persona_dir / "cadence").glob("*pass2*")
-    ), "pass 2 has no persisted interval (S53)"
-
-
-def test_c23_pass2_job_stops_at_the_next_item_when_chat_resumes(tmp_path, monkeypatch):
-    """S14 (per item), #817: the job drains with should_pause = "a reply is in flight" (a message that starts a reply)."""
-    persona_dir = _persona(tmp_path)
-    monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _granting_slot)
-    log: list[str] = []
-    cli_throttle.reset()
-    _enqueue_probe(persona_dir, log, "a", side=lambda: cli_throttle.note_user_message())
-    _enqueue_probe(persona_dir, log, "b")
-    try:
-        _pass(persona_dir, _pass2_only(persona_dir))
-        assert log == ["a"], "a message during item a must stop the drain before item b"
-        assert pass2_queue.queue_length(persona_dir) == 1
-    finally:
-        cli_throttle.note_reply_end()
-
-
-# ---------------------------------------------------------------------------
-# #817 (spec 9, A26): pass 2 waits for no reply in flight, not for the lull
-# ---------------------------------------------------------------------------
-
-
-def _decisions(result):
-    return [(d.job, d.action) for d in result]
-
-
-def test_817_only_pass2_is_exempt_from_the_lull(tmp_path):
-    jobs = _real_jobs(_persona(tmp_path))
-    assert [j.name for j in jobs if not j.needs_lull] == ["pass2"]
-
-
-def test_817_pass2_runs_inside_the_lull_and_every_later_job_still_waits(tmp_path, stubs):
-    """A26: a turn is queued, no reply in flight, chat not quiet for the lull: with the REAL gates the pass runs pass 2
-    (the not-idle recovery job ahead of it is skipped for the lull) and nothing after it."""
-    persona_dir = _persona(tmp_path)
-    cli_throttle.reset()
-    cli_throttle.note_user_message()
-    cli_throttle.note_reply_end()  # the reply just ended: inside the lull
-    try:
-        result = central_cadence.run_central_pass(
-            persona_dir,
-            _real_jobs(persona_dir),
-            slot_available=lambda: True,
-            exempt_slot_available=lambda: True,
-            now_wall=lambda: NOW,
-        )
-    finally:
-        cli_throttle.reset()
-    assert stubs.order == ["pass2"]
-    assert ("emotion_recovery_rebuild", "skip-no-lull") in _decisions(result)
-    assert ("pass2", "run") in _decisions(result)
-    assert _decisions(result)[-1] == ("session_snapshot_prune", "skip-no-lull")
-
-
-def test_817_pass2_does_not_start_while_a_reply_is_in_flight(tmp_path, stubs):
-    persona_dir = _persona(tmp_path)
-    cli_throttle.reset()
-    cli_throttle.note_user_message()  # a reply is in flight
-    try:
-        result = central_cadence.run_central_pass(
-            persona_dir,
-            _real_jobs(persona_dir),
-            slot_available=lambda: True,
-            exempt_slot_available=lambda: True,
-            now_wall=lambda: NOW,
-        )
-    finally:
-        cli_throttle.note_reply_end()
-        cli_throttle.reset()
-    assert stubs.order == []
-    assert ("pass2", "skip-no-lull") in _decisions(result)
-
-
-def test_817_not_idle_job_before_the_exempt_job_does_not_hide_it_but_one_after_it_ends_the_pass(tmp_path):
-    log: list[str] = []
-    jobs = [
-        GatedJob("emotion_recovery_rebuild", run=lambda: log.append("rec"), has_work=lambda: True),
-        GatedJob("pass2", run=lambda: log.append("pass2"), has_work=lambda: True, needs_lull=False),
-        GatedJob("session_snapshot_prune", run=lambda: log.append("snap"), has_work=lambda: True),
-        GatedJob("research_recovery", run=lambda: log.append("research"), has_work=lambda: True),
-    ]
-    result = _pass(tmp_path, jobs, idle=False, reply_gate=True)
-    assert log == ["pass2"]
-    assert _decisions(result) == [
-        ("emotion_recovery_rebuild", "skip-no-lull"),
-        ("pass2", "run"),
-        ("pass2", "completed"),
-        ("session_snapshot_prune", "skip-no-lull"),
-    ]
-
-
-def test_817_with_no_exempt_job_in_the_table_the_first_not_idle_job_ends_the_pass(tmp_path):
-    log: list[str] = []
-    jobs = [
-        GatedJob("emotion_recovery_rebuild", run=lambda: log.append("rec"), has_work=lambda: True),
-        GatedJob("pass2", run=lambda: log.append("pass2"), has_work=lambda: True),
-    ]
-    result = _pass(tmp_path, jobs, idle=False, reply_gate=True)
-    assert log == []
-    assert _decisions(result) == [("emotion_recovery_rebuild", "skip-no-lull")]
-
-
-def test_817_exempt_job_with_a_reply_in_flight_skips_and_ends_the_pass(tmp_path):
-    log: list[str] = []
-    jobs = [
-        GatedJob("emotion_recovery_rebuild", run=lambda: log.append("rec"), has_work=lambda: True),
-        GatedJob("pass2", run=lambda: log.append("pass2"), has_work=lambda: True, needs_lull=False),
-        GatedJob("session_snapshot_prune", run=lambda: log.append("snap"), has_work=lambda: True),
-    ]
-    result = _pass(tmp_path, jobs, idle=False, reply_gate=False)
-    assert log == []
-    assert _decisions(result) == [
-        ("emotion_recovery_rebuild", "skip-no-lull"),
-        ("pass2", "skip-no-lull"),
-    ]
-
-
-def test_817_exempt_job_peeks_its_own_slot(tmp_path):
-    log: list[str] = []
-    jobs = [GatedJob("pass2", run=lambda: log.append("pass2"), has_work=lambda: True, needs_lull=False)]
-    result = _pass(tmp_path, jobs, idle=False, reply_gate=True, slot=True, exempt_slot=False)
-    assert log == [] and _decisions(result) == [("pass2", "skip-slot")]
-
-
-def test_817_pass2_job_takes_the_background_slot_without_the_lull(tmp_path, monkeypatch):
-    persona_dir = _persona(tmp_path)
-    seen: list[dict] = []
-
-    @contextmanager
-    def _recording_slot(**kwargs):
-        seen.append(kwargs)
-        yield True
-
-    monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _recording_slot)
-    log: list[str] = []
-    cli_throttle.reset()
-    _enqueue_probe(persona_dir, log, "a")
-    _pass(persona_dir, _pass2_only(persona_dir))
-    assert log == ["a"]
-    assert seen == [{"lull_required": False}]
-
-
-def test_817_pass2_drain_is_not_paused_by_the_lull_only_by_a_reply(tmp_path, monkeypatch):
-    """A reply that starts and ends inside item a leaves the lull open and no reply in flight: item b still drains."""
-    persona_dir = _persona(tmp_path)
-    log: list[str] = []
-    cli_throttle.reset()
-
-    def _a_whole_reply():
-        cli_throttle.note_user_message()
-        cli_throttle.note_reply_end()
-
-    _enqueue_probe(persona_dir, log, "a", side=_a_whole_reply)
-    _enqueue_probe(persona_dir, log, "b")
-    try:
-        result = central_cadence.run_central_pass(
-            persona_dir,
-            _pass2_only(persona_dir),
-            slot_available=lambda: True,
-            exempt_slot_available=lambda: True,
-            now_wall=lambda: NOW,
-        )
-    finally:
-        cli_throttle.reset()
-    assert log == ["a", "b"]
-    assert pass2_queue.queue_length(persona_dir) == 0
-    assert ("pass2", "completed") in _decisions(result)
+    assert "pass2" not in GATED_JOB_ORDER
+    assert "pass2" not in {j.name for j in _real_jobs(_persona(tmp_path))}
+    assert "needs_lull" not in {f.name for f in dataclasses.fields(GatedJob)}
+    params = inspect.signature(central_cadence.run_central_pass).parameters
+    assert "reply_gate" not in params and "exempt_slot_available" not in params
+    assert "pass2_between_items" not in inspect.signature(supervisor._build_gated_jobs).parameters
 
 
 # ---------------------------------------------------------------------------
@@ -1056,7 +838,7 @@ def test_c15b_heartbeat_due_mid_job_runs_after_the_job_and_before_the_next(tmp_p
             hb["due"] = False
 
     jobs = [
-        GatedJob("pass2", run=job_a, has_work=lambda: True),
+        GatedJob("emotion_recovery_rebuild", run=job_a, has_work=lambda: True),
         GatedJob("session_snapshot_prune", run=job_b, has_work=lambda: True),
     ]
     _pass(tmp_path, jobs, between_jobs=between)
@@ -1308,14 +1090,6 @@ def test_c39_no_interval_job_runs_every_idle_pass_while_it_has_work(tmp_path, st
     assert stubs.order == [], "no work → does not run"
     stubs.work[name] = True
     _pass(persona_dir, jobs)
-    # INC-10: pass2's stub drain consumes its one simulated item (work[name]
-    # flips False, mirroring queue_length() actually reflecting the drain —
-    # see the `stubs` fixture's `_pass2_drain`), so a second pass needs a
-    # freshly "enqueued" item the same way production would have one queued
-    # again by the next idle lull. Every other no-interval job's has_work
-    # probe is untouched by its run stub, so re-arming here is a no-op for
-    # them (this line is required for pass2, harmless for the rest).
-    stubs.work[name] = True
     _pass(persona_dir, jobs)
     assert stubs.order == [name, name], "has work → runs at every idle pass"
     assert not (persona_dir / "cadence").exists(), "no cadence file (S53/S66)"
@@ -1512,15 +1286,6 @@ def test_each_interval_cadence_file_is_read_once_per_pass(tmp_path, stubs, monke
     monkeypatch.setattr(persisted_cadence, "load_or_init_cadence", counting)
     _pass(persona_dir, _real_jobs(persona_dir))
     assert sorted(calls) == sorted(f for f, _i in INTERVAL_JOBS.values())
-
-
-def test_pass2_reports_skipped_when_another_process_holds_the_drain_lock(
-    tmp_path, stubs, monkeypatch
-):
-    persona_dir = _persona(tmp_path)
-    monkeypatch.setattr(pass2_queue, "drain_all_locked", lambda *a, **k: 0)
-    decisions = _pass(persona_dir, [j for j in _real_jobs(persona_dir) if j.name == "pass2"])
-    assert ("pass2", "skipped") in [(d.job, d.action) for d in decisions]
 
 
 # ---------------------------------------------------------------------------

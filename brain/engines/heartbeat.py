@@ -813,38 +813,40 @@ class HeartbeatEngine:
         if self.interests_path is None:
             return 0
 
-        from brain.engines._interests import InterestSet
+        from brain.engines._interests import InterestSet, interests_lock
         from brain.utils.memory import list_conversation_memories
 
-        interests = InterestSet.load(self.interests_path, default_path=self.default_interests_path)
-        if not interests.interests:
-            return 0
+        # Pass 2's spawn runs on its own thread: the read..save is one locked step (no model call inside it).
+        with interests_lock(self.interests_path):
+            interests = InterestSet.load(self.interests_path, default_path=self.default_interests_path)
+            if not interests.interests:
+                return 0
 
-        all_convos = list_conversation_memories(self.store, active_only=True, limit=50)
-        recent = [m for m in all_convos if m.created_at >= state.last_tick_at]
-        if not recent:
-            return 0
+            all_convos = list_conversation_memories(self.store, active_only=True, limit=50)
+            recent = [m for m in all_convos if m.created_at >= state.last_tick_at]
+            if not recent:
+                return 0
 
-        touched: set[str] = set()
-        current = interests
-        for mem in recent:
-            content_lower = mem.content.lower()
-            for interest in current.interests:
-                if interest.topic in touched:
-                    continue
-                for kw in interest.related_keywords:
-                    if kw.lower() in content_lower:
-                        current = current.bump(
-                            interest.topic,
-                            amount=config.interest_bump_per_match,
-                            now=now,
-                        )
-                        touched.add(interest.topic)
-                        break
+            touched: set[str] = set()
+            current = interests
+            for mem in recent:
+                content_lower = mem.content.lower()
+                for interest in current.interests:
+                    if interest.topic in touched:
+                        continue
+                    for kw in interest.related_keywords:
+                        if kw.lower() in content_lower:
+                            current = current.bump(
+                                interest.topic,
+                                amount=config.interest_bump_per_match,
+                                now=now,
+                            )
+                            touched.add(interest.topic)
+                            break
 
-        if touched:
-            current.save(self.interests_path)
-        return len(touched)
+            if touched:
+                current.save(self.interests_path)
+            return len(touched)
 
     def _try_run_growth(
         self,
