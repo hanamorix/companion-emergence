@@ -1391,7 +1391,11 @@ def test_the_cadence_job_runs_through_the_in_flight_slot(
     computes, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     from brain.bridge import supervisor
-    from tests.unit.brain.bridge.test_central_cadence import _granting_slot, _persona, run_cosine_retry_inline
+    from tests.unit.brain.bridge.test_central_cadence import (
+        _granting_slot,
+        _persona,
+        run_cosine_retry_inline,
+    )
 
     monkeypatch.setattr(supervisor.cli_throttle, "background_slot", _granting_slot)
     run_cosine_retry_inline(monkeypatch)  # the job only starts the background thread (#833)

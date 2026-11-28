@@ -33,8 +33,9 @@ no median, the turn takes the NO-RERANK path: the coarse cut's candidates are
 ranked by cosine and gated by a COSINE floor (`MemoryStore.get_cosine_floor`,
 its own table, bootstrapped from the same bundled pairs until the daily tick
 calibrates it; the bootstrap is computed once per process at process start,
-never on the reply path, and a failed one is retried at the next lull by the
-central cadence job: until a cosine floor exists this path renders keyword
+never on the reply path, and a failed one is retried in the background (on each
+new message, at the next lull, or when a caller finds the model not built):
+until a cosine floor exists this path renders keyword
 results only, S85). A reranker failure therefore no longer demotes the turn to
 keyword-only. The two scales never mix: a reranked candidate is gated by the
 normalized rerank floor, a cosine-path candidate by the cosine floor, and each

@@ -214,6 +214,7 @@ def test_the_lull_job_starts_the_background_thread_and_never_builds_itself(
 
     started: list[Path] = []
     monkeypatch.setattr(floor_startup, "start_cosine_retry", lambda d: started.append(d) or object())
+    monkeypatch.setattr(floor_startup, "run_cosine_floor", lambda **k: pytest.fail("the lull job ran the floor itself"))
     persona_dir = _persona(tmp_path)
     job = _job(persona_dir, "cosine_floor_bootstrap")
     assert job.run() is JobOutcome.COMPLETED

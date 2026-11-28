@@ -14,7 +14,7 @@ F1 (#259) increment 8: the old SQLite content-hash cache (`EmbeddingCache`,
 `embeddings.db`) that used to sit in front of this provider abstraction is
 REMOVED — every memory's embedding now lives on its own `memories` row
 (`embedding`/`embedding_model_id` columns), and the one remaining transient
-use (the per-recall query embed) calls `build_embedding_provider().embed()`
+use (the per-recall query embed) calls `get_ready_embedding_provider().embed()`
 directly. The content-hash keying it used (`hash_content`) is removed too —
 nothing keys off content-hash anymore (memories are keyed by row id); the
 one other consumer, clustering's content-hash-keyed `MemoryClusterStore`,
