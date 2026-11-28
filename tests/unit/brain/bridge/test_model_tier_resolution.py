@@ -50,8 +50,8 @@ _DEFAULTS = {
 
 # `--model` values captured on origin/main (4d5a9381) with the same capture (a fake `claude` answering a clean frame),
 # recorded once for C27: the four Haiku jobs below must run exactly what they ran there (the detector ran a dated id there,
-# see below, and now runs the alias). The chat and
-# background-generative jobs ran the alias "sonnet" there and run the pinned Sonnet id now (D1, on purpose).
+# see below, and now runs the alias).
+# The chat and background-generative jobs ran the alias "sonnet" there and run the pinned Sonnet id now (D1, on purpose).
 _ORIGIN_MAIN_UNCHANGED = {
     TIER_BACKGROUND_CLASSIFIER: "haiku",
     TIER_BACKGROUND_HOUSEKEEPING: "haiku",
