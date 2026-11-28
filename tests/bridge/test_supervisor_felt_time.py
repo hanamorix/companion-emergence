@@ -466,6 +466,7 @@ def test_the_energy_step_applies_the_engines_queued_changes_before_it_reads_the_
     assert saved["energy_feelings"] == {"joy": 4.0}, "the queued change reached the step's saved feelings"
 
 
+@pytest.mark.no_base_failure(reason="the base never applied queued changes in the energy step, so it passes there; this pins the reply-in-flight rule of the new apply (the control is the test above)")
 def test_the_energy_step_does_not_apply_queued_changes_while_a_reply_is_in_flight(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
